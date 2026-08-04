@@ -5,3 +5,4 @@
 //! `data` (Linear data fetching for the plugin).
 
 pub mod config;
+pub mod launch;
