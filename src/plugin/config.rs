@@ -16,14 +16,26 @@ pub fn resolve_api_key(config_dir: Option<&Path>, env_api_key: Option<&str>) -> 
     if let Some(dir) = config_dir {
         let config_path = dir.join("config.toml");
         if let Ok(contents) = std::fs::read_to_string(&config_path) {
-            if let Ok(parsed) = toml::from_str::<ConfigFile>(&contents) {
-                if let Some(key) = parsed.api_key {
-                    if !key.is_empty() {
-                        return Ok(key);
+            match toml::from_str::<ConfigFile>(&contents) {
+                Ok(parsed) => {
+                    if let Some(key) = parsed.api_key {
+                        if !key.is_empty() {
+                            return Ok(key);
+                        }
                     }
+                    // File parsed fine but no api_key, fall through to env var
+                }
+                Err(e) => {
+                    // File exists but failed to parse - return error immediately
+                    return Err(Error::ConfigError(format!(
+                        "{} is not valid TOML: {}",
+                        config_path.display(),
+                        e
+                    )));
                 }
             }
         }
+        // If read_to_string failed, file doesn't exist - fall through to env var
     }
 
     if let Some(key) = env_api_key {
@@ -103,5 +115,19 @@ mod tests {
         let err = resolve_api_key(None, None).unwrap_err();
 
         assert!(err.to_string().contains("LINEAR_API_KEY"));
+    }
+
+    #[test]
+    fn errors_immediately_on_malformed_toml_without_falling_through_to_env() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.toml"), "this is [invalid toml\n").unwrap();
+
+        let err = resolve_api_key(Some(dir.path()), Some("lin_api_from_env")).unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("not valid TOML"));
+        assert!(message.contains(dir.path().to_str().unwrap()));
+        // Verify it's not just the generic "no key found" message
+        assert!(!message.contains("No Linear API key found"));
     }
 }
