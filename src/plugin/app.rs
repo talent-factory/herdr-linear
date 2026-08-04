@@ -99,6 +99,44 @@ impl Default for App {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum Action {
+    Quit,
+    OpenInBrowser(String),
+    Retry,
+}
+
+/// Map a key press to an [`Action`], applying any state change (navigation, retry)
+/// directly to `app`. Returns `None` when the key had no effect or only changed
+/// navigation state in place.
+pub fn handle_key(app: &mut App, key: crossterm::event::KeyCode) -> Option<Action> {
+    use crossterm::event::KeyCode;
+
+    match key {
+        KeyCode::Char('q') | KeyCode::Esc => Some(Action::Quit),
+        KeyCode::Down => {
+            app.move_selection_down();
+            None
+        }
+        KeyCode::Up => {
+            app.move_selection_up();
+            None
+        }
+        KeyCode::Char('o') => app
+            .selected_issue()
+            .map(|issue| Action::OpenInBrowser(issue.url.clone())),
+        KeyCode::Char('r') => {
+            if matches!(app.state, AppState::Error { .. }) {
+                app.retry();
+                Some(Action::Retry)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,7 +180,7 @@ mod tests {
             cycle: None,
             project: None,
             labels: vec![],
-            url: format!("https://linear.app/eng/{}", identifier),
+            url: format!("https://linear.app/team/issue/{}", identifier),
         }
     }
 
@@ -228,5 +266,86 @@ mod tests {
         app.retry();
 
         assert!(matches!(app.state, AppState::Loading));
+    }
+
+    use crossterm::event::KeyCode;
+
+    #[test]
+    fn down_key_moves_selection_and_returns_no_action() {
+        let mut app = App::new();
+        app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
+
+        let action = handle_key(&mut app, KeyCode::Down);
+
+        assert_eq!(action, None);
+        assert_eq!(app.selected_issue().unwrap().identifier, "ENG-2");
+    }
+
+    #[test]
+    fn up_key_moves_selection_and_returns_no_action() {
+        let mut app = App::new();
+        app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
+        app.move_selection_down();
+
+        let action = handle_key(&mut app, KeyCode::Up);
+
+        assert_eq!(action, None);
+        assert_eq!(app.selected_issue().unwrap().identifier, "ENG-1");
+    }
+
+    #[test]
+    fn o_key_returns_open_in_browser_with_the_selected_issue_url() {
+        let mut app = App::new();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+
+        let action = handle_key(&mut app, KeyCode::Char('o'));
+
+        assert_eq!(
+            action,
+            Some(Action::OpenInBrowser(
+                "https://linear.app/team/issue/ENG-1".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn o_key_on_an_empty_list_returns_no_action() {
+        let mut app = App::new();
+        app.set_issues(vec![]);
+
+        assert_eq!(handle_key(&mut app, KeyCode::Char('o')), None);
+    }
+
+    #[test]
+    fn q_key_returns_quit() {
+        let mut app = App::new();
+
+        assert_eq!(handle_key(&mut app, KeyCode::Char('q')), Some(Action::Quit));
+    }
+
+    #[test]
+    fn esc_key_returns_quit() {
+        let mut app = App::new();
+
+        assert_eq!(handle_key(&mut app, KeyCode::Esc), Some(Action::Quit));
+    }
+
+    #[test]
+    fn r_key_in_error_state_retries_and_returns_retry_action() {
+        let mut app = App::new();
+        app.set_error("boom".to_string());
+
+        let action = handle_key(&mut app, KeyCode::Char('r'));
+
+        assert_eq!(action, Some(Action::Retry));
+        assert!(matches!(app.state, AppState::Loading));
+    }
+
+    #[test]
+    fn r_key_outside_error_state_does_nothing() {
+        let mut app = App::new();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+
+        assert_eq!(handle_key(&mut app, KeyCode::Char('r')), None);
     }
 }
