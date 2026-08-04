@@ -1,15 +1,14 @@
 //! Example: Working with issues
-//! 
+//!
 //! Run with: cargo run --example issue_operations -- lin_api_YOUR_KEY TEAM_ID
 
-use herdr_linear::{LinearClient, Error};
-use serde_json::json;
+use herdr_linear::{Error, LinearClient};
 use std::env;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
-    
+
     let api_key = args
         .get(1)
         .cloned()
@@ -56,8 +55,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!("   ID: {}", issue.id);
                         println!("   Identifier: {}", issue.identifier);
                         println!("   Title: {}", issue.title);
-                        println!("   Description: {}", 
-                            issue.description.as_ref().unwrap_or(&"None".to_string()));
+                        println!(
+                            "   Description: {}",
+                            issue.description.as_ref().unwrap_or(&"None".to_string())
+                        );
                         println!("   Priority: {}", issue.priority);
                         println!("   Estimate: {:?} pts", issue.estimate);
                         println!("   State: {}", issue.state.name);
@@ -77,7 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // Example 3: Add a comment
                         let comment_body = "Automated comment from herdr-linear example";
                         println!("\n💬 Adding comment...");
-                        match client.add_comment(&first_issue.id, &comment_body).await {
+                        match client.add_comment(&first_issue.id, comment_body).await {
                             Ok(comment) => {
                                 println!("✅ Comment added:");
                                 println!("   By: {}", comment.user.name);
@@ -90,12 +91,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Err(e) => {
-            match e {
-                Error::AuthenticationFailed(msg) => println!("❌ Auth failed: {}", msg),
-                _ => println!("❌ Error: {}", e),
-            }
-        }
+        Err(e) => match e {
+            Error::AuthenticationFailed(msg) => println!("❌ Auth failed: {}", msg),
+            _ => println!("❌ Error: {}", e),
+        },
     }
 
     println!("\n✨ Example completed!");

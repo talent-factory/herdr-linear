@@ -1,5 +1,5 @@
 //! Basic usage example
-//! 
+//!
 //! Run with: cargo run --example basic_usage -- lin_api_YOUR_KEY
 
 use herdr_linear::LinearClient;
