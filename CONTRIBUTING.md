@@ -28,7 +28,7 @@ cargo test
 
 # Run with logging
 export RUST_LOG=debug
-cargo run --bin herdr-linear
+cargo run --example tracing_demo
 ```
 
 ## Development Workflow

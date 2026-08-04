@@ -26,6 +26,9 @@ pub mod error;
 pub mod models;
 pub mod queries;
 
+#[cfg(feature = "plugin")]
+pub mod plugin;
+
 pub use client::LinearClient;
 pub use error::{Error, Result};
 pub use models::*;

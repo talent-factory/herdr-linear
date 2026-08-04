@@ -166,7 +166,7 @@ cargo build
 export LINEAR_API_KEY=lin_api_your_key
 export RUST_LOG=debug
 
-cargo run --bin herdr-linear
+cargo run --example tracing_demo
 ```
 
 ### Running Tests
@@ -187,7 +187,7 @@ export RUST_LOG=herdr_linear=debug
 export RUST_LOG=debug
 
 # JSON output
-RUST_LOG=info cargo run --bin herdr-linear 2>&1 | jq
+RUST_LOG=info cargo run --example tracing_demo 2>&1 | jq
 ```
 
 ## Error Handling
