@@ -4,5 +4,6 @@
 //! (open/focus/close/switch decision logic), `app` (TUI state), `ui` (rendering),
 //! `data` (Linear data fetching for the plugin).
 
+pub mod app;
 pub mod config;
 pub mod launch;
