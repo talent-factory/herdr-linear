@@ -10,7 +10,7 @@ use crate::Issue;
 ///
 /// Note: `AppState` deliberately does NOT derive `PartialEq` because `Issue`
 /// doesn't derive it either. Tests use `matches!` for state comparisons instead.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum AppState {
     /// The application is loading issues.
     Loading,
