@@ -127,6 +127,7 @@ pub struct PageInfo {
 
 /// Generic connection response for paginated results
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Connection<T> {
     pub nodes: Vec<T>,
     pub page_info: PageInfo,
@@ -164,4 +165,109 @@ pub struct Workspace {
     pub name: String,
     pub url_key: String,
     pub created_at: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn sample_user() -> serde_json::Value {
+        json!({
+            "id": "user-1",
+            "email": "alice@example.com",
+            "name": "Alice",
+            "avatarUrl": null,
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:00:00Z"
+        })
+    }
+
+    fn sample_team() -> serde_json::Value {
+        json!({
+            "id": "team-1",
+            "key": "ENG",
+            "name": "Engineering",
+            "description": null,
+            "avatarUrl": null,
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:00:00Z"
+        })
+    }
+
+    fn sample_issue() -> serde_json::Value {
+        json!({
+            "id": "issue-1",
+            "identifier": "ENG-123",
+            "title": "Fix bug",
+            "description": null,
+            "state": {"id": "state-1", "name": "In Progress", "type": "started"},
+            "priority": 2,
+            "estimate": null,
+            "team": sample_team(),
+            "assignee": null,
+            "creator": sample_user(),
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:00:00Z",
+            "startedAt": null,
+            "completedAt": null,
+            "cycle": null,
+            "project": null,
+            "labels": [],
+            "url": "https://linear.app/team/issue/ENG-123"
+        })
+    }
+
+    #[test]
+    fn deserializes_issue_with_nested_team_and_creator() {
+        let issue: Issue = serde_json::from_value(sample_issue()).expect("valid issue payload");
+
+        assert_eq!(issue.identifier, "ENG-123");
+        assert_eq!(issue.team.key, "ENG");
+        assert_eq!(issue.creator.name, "Alice");
+        assert_eq!(issue.state.r#type, "started");
+    }
+
+    #[test]
+    fn deserializes_connection_from_linear_camel_case_payload() {
+        // Regression test: Connection<T> previously lacked `rename_all = "camelCase"`,
+        // so Linear's `pageInfo`/`totalCount` keys silently failed to deserialize and
+        // every paginated call (get_teams, get_issues, get_projects, get_cycles)
+        // returned a generic "Failed to parse ... data" error.
+        let payload = json!({
+            "nodes": [sample_issue()],
+            "pageInfo": {
+                "hasNextPage": true,
+                "hasPreviousPage": false,
+                "startCursor": "cursor-1",
+                "endCursor": "cursor-2"
+            },
+            "totalCount": 1
+        });
+
+        let connection: Connection<Issue> =
+            serde_json::from_value(payload).expect("valid connection payload");
+
+        assert_eq!(connection.total_count, 1);
+        assert!(connection.page_info.has_next_page);
+        assert_eq!(connection.nodes[0].identifier, "ENG-123");
+    }
+
+    #[test]
+    fn graphql_response_deserializes_data_and_errors() {
+        let success: GraphQLResponse<serde_json::Value> =
+            serde_json::from_value(json!({"data": {"ok": true}, "errors": null}))
+                .expect("valid response");
+        assert!(success.data.is_some());
+        assert!(success.errors.is_none());
+
+        let failure: GraphQLResponse<serde_json::Value> = serde_json::from_value(json!({
+            "data": null,
+            "errors": [{"message": "Team not found"}]
+        }))
+        .expect("valid error response");
+
+        assert!(failure.data.is_none());
+        assert_eq!(failure.errors.unwrap()[0].message, "Team not found");
+    }
 }
