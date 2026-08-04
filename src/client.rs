@@ -15,6 +15,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct LinearClient {
     http_client: HttpClient,
     api_key: String,
+    endpoint: String,
 }
 
 impl LinearClient {
@@ -40,13 +41,24 @@ impl LinearClient {
         Ok(Self {
             http_client,
             api_key,
+            endpoint: LINEAR_API_ENDPOINT.to_string(),
         })
+    }
+
+    /// Create a client pointed at a custom endpoint (used by tests to target a mock server)
+    #[cfg(test)]
+    fn with_endpoint<S: Into<String>>(api_key: S, endpoint: String) -> Result<Self> {
+        let mut client = Self::new(api_key)?;
+        client.endpoint = endpoint;
+        Ok(client)
     }
 
     /// Get the authenticated user (viewer)
     pub async fn get_viewer(&self) -> Result<User> {
         debug!("Fetching viewer");
-        let response = self.query::<serde_json::Value>(QUERY_VIEWER, json!({})).await?;
+        let response = self
+            .query::<serde_json::Value>(QUERY_VIEWER, json!({}))
+            .await?;
 
         response
             .get("viewer")
@@ -55,14 +67,20 @@ impl LinearClient {
     }
 
     /// Get all teams
-    pub async fn get_teams(&self, limit: Option<i32>, after: Option<String>) -> Result<Connection<Team>> {
+    pub async fn get_teams(
+        &self,
+        limit: Option<i32>,
+        after: Option<String>,
+    ) -> Result<Connection<Team>> {
         debug!("Fetching teams");
         let variables = json!({
             "first": limit.unwrap_or(50),
             "after": after
         });
 
-        let response = self.query::<serde_json::Value>(QUERY_TEAMS, variables).await?;
+        let response = self
+            .query::<serde_json::Value>(QUERY_TEAMS, variables)
+            .await?;
 
         response
             .get("teams")
@@ -74,7 +92,9 @@ impl LinearClient {
     pub async fn get_team(&self, team_id: &str) -> Result<Team> {
         debug!("Fetching team: {}", team_id);
         let variables = json!({"id": team_id});
-        let response = self.query::<serde_json::Value>(QUERY_TEAM, variables).await?;
+        let response = self
+            .query::<serde_json::Value>(QUERY_TEAM, variables)
+            .await?;
 
         response
             .get("team")
@@ -101,7 +121,9 @@ impl LinearClient {
             "filter": filter.unwrap_or(Value::Null)
         });
 
-        let response = self.query::<serde_json::Value>(QUERY_ISSUES, variables).await?;
+        let response = self
+            .query::<serde_json::Value>(QUERY_ISSUES, variables)
+            .await?;
 
         response
             .get("issues")
@@ -113,7 +135,9 @@ impl LinearClient {
     pub async fn get_issue(&self, issue_id: &str) -> Result<Issue> {
         debug!("Fetching issue: {}", issue_id);
         let variables = json!({"id": issue_id});
-        let response = self.query::<serde_json::Value>(QUERY_ISSUE, variables).await?;
+        let response = self
+            .query::<serde_json::Value>(QUERY_ISSUE, variables)
+            .await?;
 
         response
             .get("issue")
@@ -168,7 +192,9 @@ impl LinearClient {
         }
 
         let variables = json!({"input": input});
-        let response = self.mutate::<serde_json::Value>(MUTATION_CREATE_ISSUE, variables).await?;
+        let response = self
+            .mutate::<serde_json::Value>(MUTATION_CREATE_ISSUE, variables)
+            .await?;
 
         response
             .get("issueCreate")
@@ -186,7 +212,9 @@ impl LinearClient {
             "input": updates
         });
 
-        let response = self.mutate::<serde_json::Value>(MUTATION_UPDATE_ISSUE, variables).await?;
+        let response = self
+            .mutate::<serde_json::Value>(MUTATION_UPDATE_ISSUE, variables)
+            .await?;
 
         response
             .get("issueUpdate")
@@ -205,7 +233,9 @@ impl LinearClient {
         });
 
         let variables = json!({"input": input});
-        let response = self.mutate::<serde_json::Value>(MUTATION_ADD_COMMENT, variables).await?;
+        let response = self
+            .mutate::<serde_json::Value>(MUTATION_ADD_COMMENT, variables)
+            .await?;
 
         response
             .get("commentCreate")
@@ -226,7 +256,9 @@ impl LinearClient {
             "filter": filter.unwrap_or(Value::Null)
         });
 
-        let response = self.query::<serde_json::Value>(QUERY_PROJECTS, variables).await?;
+        let response = self
+            .query::<serde_json::Value>(QUERY_PROJECTS, variables)
+            .await?;
 
         response
             .get("projects")
@@ -235,18 +267,16 @@ impl LinearClient {
     }
 
     /// Get cycles for a team
-    pub async fn get_cycles(
-        &self,
-        team_id: &str,
-        limit: Option<i32>,
-    ) -> Result<Connection<Cycle>> {
+    pub async fn get_cycles(&self, team_id: &str, limit: Option<i32>) -> Result<Connection<Cycle>> {
         debug!("Fetching cycles for team: {}", team_id);
         let variables = json!({
             "teamId": team_id,
             "first": limit.unwrap_or(50)
         });
 
-        let response = self.query::<serde_json::Value>(QUERY_CYCLES, variables).await?;
+        let response = self
+            .query::<serde_json::Value>(QUERY_CYCLES, variables)
+            .await?;
 
         response
             .get("cycles")
@@ -258,7 +288,9 @@ impl LinearClient {
     pub async fn get_workflow_states(&self, team_id: &str) -> Result<Vec<IssueState>> {
         debug!("Fetching workflow states for team: {}", team_id);
         let variables = json!({"teamId": team_id, "first": 100});
-        let response = self.query::<serde_json::Value>(QUERY_WORKFLOW_STATES, variables).await?;
+        let response = self
+            .query::<serde_json::Value>(QUERY_WORKFLOW_STATES, variables)
+            .await?;
 
         response
             .get("workflowStates")
@@ -305,7 +337,7 @@ impl LinearClient {
 
         let response = self
             .http_client
-            .post(LINEAR_API_ENDPOINT)
+            .post(&self.endpoint)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
             .json(&payload)
@@ -340,7 +372,9 @@ impl LinearClient {
             }
             StatusCode::TOO_MANY_REQUESTS => {
                 warn!("Rate limited by Linear API");
-                Err(Error::RateLimitExceeded { retry_after_ms: 60000 })
+                Err(Error::RateLimitExceeded {
+                    retry_after_ms: 60000,
+                })
             }
             _ => {
                 let body = response.text().await.unwrap_or_default();
@@ -365,5 +399,100 @@ mod tests {
     fn test_invalid_api_key() {
         let result = LinearClient::new("");
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn get_viewer_parses_successful_response() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "data": {
+                        "viewer": {
+                            "id": "user-1",
+                            "email": "alice@example.com",
+                            "name": "Alice",
+                            "avatarUrl": null,
+                            "createdAt": "2026-01-01T00:00:00Z",
+                            "updatedAt": "2026-01-01T00:00:00Z"
+                        }
+                    },
+                    "errors": null
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let viewer = client.get_viewer().await.unwrap();
+
+        assert_eq!(viewer.name, "Alice");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn graphql_errors_in_200_response_surface_as_graphql_error() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(json!({"data": null, "errors": [{"message": "Team not found"}]}).to_string())
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let err = client.get_team("missing").await.unwrap_err();
+
+        match err {
+            Error::GraphQLError(msg) => assert!(msg.contains("Team not found")),
+            other => panic!("expected GraphQLError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unauthorized_response_maps_to_authentication_failed() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/graphql")
+            .with_status(401)
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let err = client.get_viewer().await.unwrap_err();
+
+        assert!(matches!(err, Error::AuthenticationFailed(_)));
+    }
+
+    #[tokio::test]
+    async fn rate_limited_response_maps_to_rate_limit_exceeded() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/graphql")
+            .with_status(429)
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let err = client.get_viewer().await.unwrap_err();
+
+        assert!(matches!(err, Error::RateLimitExceeded { .. }));
     }
 }

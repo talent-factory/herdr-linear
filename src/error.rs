@@ -53,3 +53,28 @@ pub fn api_error<S: Into<String>>(msg: S) -> Error {
         message: msg.into(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn graphql_error_wraps_message_in_graphql_error_variant() {
+        let err = graphql_error("boom");
+        assert!(matches!(err, Error::GraphQLError(msg) if msg == "boom"));
+    }
+
+    #[test]
+    fn api_error_wraps_message_in_api_error_variant() {
+        let err = api_error("boom");
+        assert!(matches!(err, Error::ApiError { message } if message == "boom"));
+    }
+
+    #[test]
+    fn rate_limit_exceeded_display_includes_retry_after() {
+        let err = Error::RateLimitExceeded {
+            retry_after_ms: 5000,
+        };
+        assert_eq!(err.to_string(), "Rate limit exceeded: 5000ms");
+    }
+}
