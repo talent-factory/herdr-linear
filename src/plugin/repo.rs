@@ -100,6 +100,26 @@ pub fn resolve_project_id(
     match_project(repo_name, projects).map(|p| p.id.clone())
 }
 
+/// Derive the repo name from the real environment: `git remote get-url origin` in the
+/// current working directory, falling back to the cwd's directory name. Thin wrapper
+/// around [`derive_repo_name`] used by the binary.
+pub fn detect_repo_name() -> String {
+    let remote_url = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|s| s.trim().to_string());
+
+    let cwd_dir_name = std::env::current_dir()
+        .ok()
+        .and_then(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_default();
+
+    derive_repo_name(remote_url.as_deref(), &cwd_dir_name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
