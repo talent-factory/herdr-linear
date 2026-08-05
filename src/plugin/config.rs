@@ -93,7 +93,7 @@ pub fn load() -> Result<String> {
 
 /// Resolve the `project_id` override from the real environment:
 /// `$HERDR_PLUGIN_CONFIG_DIR/config.toml`. Thin wrapper around
-/// [`resolve_project_id_override`]; not yet called from the binary (see TF-578).
+/// [`resolve_project_id_override`]; called from [`crate::plugin::data::fetch_current_project_issues`].
 pub fn load_project_id_override() -> Result<Option<String>> {
     let config_dir = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR").map(std::path::PathBuf::from);
     resolve_project_id_override(config_dir.as_deref())

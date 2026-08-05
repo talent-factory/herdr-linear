@@ -13,7 +13,7 @@ use crate::Issue;
 pub enum ViewKind {
     /// Issues assigned to the authenticated user.
     MyIssues,
-    /// All open issues in the current project (not yet implemented — see TF-577/TF-578).
+    /// All open issues in the current project.
     ProjectIssues,
     /// All open issues in a team (not yet implemented — see TF-579).
     TeamIssues,
@@ -39,9 +39,8 @@ pub struct MenuOption {
     pub available: bool,
 }
 
-/// The menu options in display order. `ProjectIssues`/`TeamIssues` become
-/// available once TF-578/TF-579 implement their data fetching — until then the
-/// menu shows but disables them.
+/// The menu options in display order. `TeamIssues` becomes available once TF-579
+/// implements its data fetching — until then the menu shows but disables it.
 pub const MENU_OPTIONS: [MenuOption; 3] = [
     MenuOption {
         kind: ViewKind::MyIssues,
@@ -49,7 +48,7 @@ pub const MENU_OPTIONS: [MenuOption; 3] = [
     },
     MenuOption {
         kind: ViewKind::ProjectIssues,
-        available: false,
+        available: true,
     },
     MenuOption {
         kind: ViewKind::TeamIssues,
@@ -404,18 +403,22 @@ mod tests {
     }
 
     #[test]
-    fn entering_an_unavailable_option_does_nothing() {
+    fn entering_the_project_issues_option_transitions_to_loading_and_returns_enter_view() {
         let mut app = App::new();
-        app.move_menu_selection_down(); // -> Project Issues, unavailable
+        app.move_menu_selection_down(); // -> Project Issues, available
 
         let action = app.enter_selected_menu_option();
 
-        assert_eq!(action, None);
-        assert!(matches!(app.screen, Screen::Menu { selected: 1 }));
+        assert_eq!(action, Some(Action::EnterView));
+        assert!(matches!(
+            app.screen,
+            Screen::View(ViewKind::ProjectIssues, ViewState::Loading)
+        ));
+        assert_eq!(app.current_view(), Some(ViewKind::ProjectIssues));
     }
 
     #[test]
-    fn entering_the_last_menu_option_does_nothing_while_unavailable() {
+    fn entering_an_unavailable_option_does_nothing() {
         let mut app = App::new();
         app.move_menu_selection_down();
         app.move_menu_selection_down(); // -> Team Issues, unavailable
@@ -613,12 +616,13 @@ mod tests {
     #[test]
     fn enter_key_on_an_unavailable_menu_option_does_nothing() {
         let mut app = App::new();
-        handle_key(&mut app, KeyCode::Down); // -> Project Issues, unavailable
+        handle_key(&mut app, KeyCode::Down);
+        handle_key(&mut app, KeyCode::Down); // -> Team Issues, unavailable
 
         let action = handle_key(&mut app, KeyCode::Enter);
 
         assert_eq!(action, None);
-        assert!(matches!(app.screen, Screen::Menu { selected: 1 }));
+        assert!(matches!(app.screen, Screen::Menu { selected: 2 }));
     }
 
     #[test]

@@ -245,14 +245,21 @@ impl LinearClient {
     }
 
     /// Get all projects
+    ///
+    /// # Arguments
+    /// * `filter` - Optional filter criteria (JSON value)
+    /// * `limit` - Max number of projects to return (default: 50)
+    /// * `after` - Cursor for pagination
     pub async fn get_projects(
         &self,
         filter: Option<Value>,
         limit: Option<i32>,
+        after: Option<String>,
     ) -> Result<Connection<Project>> {
         debug!("Fetching projects");
         let variables = json!({
             "first": limit.unwrap_or(50),
+            "after": after,
             "filter": filter.unwrap_or(Value::Null)
         });
 

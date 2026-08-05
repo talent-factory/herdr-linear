@@ -111,7 +111,7 @@ client.add_comment("issue_id", "body").await?   // Add comment to issue
 ### Projects & Cycles
 
 ```rust
-client.get_projects(filter, limit).await?       // List projects
+client.get_projects(filter, limit, after).await? // List projects
 client.get_cycles("team_id", limit).await?      // Get team's cycles
 client.get_workflow_states("team_id").await?    // Get team's workflow states
 ```
