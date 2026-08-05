@@ -168,9 +168,13 @@ call site.
 - No handling for a team with *zero* workflow states of any kind (`get_workflow_states` returning
   empty) beyond `pick_in_progress_state` returning `None`, which is folded into the same "state
   update failed" warning path as any other lookup miss.
-- `cwd = std::env::current_dir()` (data flow step 7) is only correct when the panel was opened
+- `cwd = std::env::current_dir()` (data flow step 7) was only correct when the panel was opened
   via the split action — herdr seeds a split pane's cwd from the pane it was split from, but a
-  fresh tab starts in the plugin's own install directory. Fixing this for the tab-opened case
-  needs herdr itself to thread the invoking pane's cwd through `plugin pane open`, which this
-  plugin can't do unilaterally; documented as a user-facing caveat in README.md instead
-  (`start_implementation`'s doc comment in `main.rs` carries the same note).
+  fresh tab started in the plugin's own install directory instead.
+  **Resolved** (see the cwd-linear-project-detection follow-up): herdr already threads the
+  invoking pane's directory through as the `HERDR_PLUGIN_CONTEXT_JSON` env var it injects at
+  launch — this plugin just wasn't reading it. `plugin::host::resolve_cwd()` now parses that
+  context (`focused_pane_cwd` > `workspace_cwd` > `cwd`, mirroring `herdr-file-viewer`'s
+  `src/host.rs` adapter for the same problem) and both `repo::detect_repo_name` and
+  `start_implementation` use it instead of the bare process cwd. Split and tab placement now
+  behave identically; the README/`main.rs` caveats were updated accordingly.

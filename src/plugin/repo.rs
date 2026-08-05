@@ -2,7 +2,13 @@
 //! repo name from `git remote`/the working directory, then matches it against Linear
 //! projects fetched via [`crate::client::LinearClient::get_projects`]. A `project_id`
 //! override in config.toml (see `crate::plugin::config`) always wins over name matching.
+//!
+//! "Current working directory" here means [`crate::plugin::host::resolve_cwd`]'s result, not a
+//! bare `std::env::current_dir()` — the plugin process itself always runs from its own install
+//! directory (see `host`'s module doc), so `detect_repo_name` asks the herdr-injected launch
+//! context for the directory the user is actually working in.
 
+use crate::plugin::host;
 use crate::{Error, Project, Result};
 
 /// Derive a repo name to match against Linear project names: parses the last path segment
@@ -108,12 +114,17 @@ pub fn resolve_project_id(
     match_project(repo_name, projects).map(|p| p.id.clone())
 }
 
-/// Derive the repo name from the real environment: `git remote get-url origin` in the
-/// current working directory, falling back to the cwd's directory name. Thin wrapper
-/// around [`derive_repo_name`]; called from [`crate::plugin::data::fetch_current_project_issues`].
+/// Derive the repo name from the real environment: `git remote get-url origin` run in
+/// [`host::resolve_cwd`]'s directory (the herdr-reported working directory, not the plugin
+/// process's own cwd — see the module doc), falling back to that directory's name. Thin
+/// wrapper around [`derive_repo_name`]; called from
+/// [`crate::plugin::data::fetch_current_project_issues`].
 pub fn detect_repo_name() -> String {
+    let cwd = host::resolve_cwd();
+
     let remote_url = match std::process::Command::new("git")
         .args(["remote", "get-url", "origin"])
+        .current_dir(&cwd)
         .output()
     {
         Ok(output) if output.status.success() => match String::from_utf8(output.stdout) {
@@ -136,9 +147,9 @@ pub fn detect_repo_name() -> String {
         }
     };
 
-    let cwd_dir_name = std::env::current_dir()
-        .ok()
-        .and_then(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()))
+    let cwd_dir_name = cwd
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
 
     derive_repo_name(remote_url.as_deref(), &cwd_dir_name)

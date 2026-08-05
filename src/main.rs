@@ -130,14 +130,13 @@ async fn ensure_loaded(
 /// propagating — mirrors `ensure_loaded`'s "inline error instead of crashing" philosophy. See
 /// docs/superpowers/specs/2026-08-05-implement-on-enter-design.md for the full data flow.
 ///
-/// Caveat: the agent is spawned in `std::env::current_dir()` — herdr sets a pane's initial cwd
-/// to the invoking pane's directory for `placement = "split"`, but NOT for `placement = "tab"`,
-/// where a fresh pane starts in the plugin's own install directory instead. Opening this panel
-/// via `scripts/open-tab.sh` (rather than `open-split.sh`) before using `<Enter>` will therefore
-/// start the agent in the wrong directory. See README.md's "Use" section for the same caveat
-/// surfaced to users, and the design doc's "Out of scope / open items" for why this isn't fixed
-/// here: it needs herdr itself to thread the invoking pane's cwd through `plugin pane open`,
-/// which this plugin can't do on its own.
+/// The agent is spawned in [`plugin::host::resolve_cwd`]'s directory — the herdr-injected
+/// launch context's working directory, not the plugin process's own `std::env::current_dir()`
+/// (which is always the plugin's own install directory, split or tab placement alike; see
+/// `host`'s module doc). This resolves correctly regardless of whether the panel was opened via
+/// `open-split.sh` or `open-tab.sh`, as long as herdr reports a launch context — see
+/// README.md's "Use" section and the design doc's "Out of scope / open items" for the prior
+/// split-only caveat this replaces.
 async fn start_implementation(
     app: &mut plugin::app::App,
     client: &herdr_linear::LinearClient,
@@ -179,16 +178,7 @@ async fn start_implementation(
     }
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
     let argv = plugin::implement::build_shell_argv(&shell, &command);
-    let cwd = match std::env::current_dir() {
-        Ok(cwd) => cwd,
-        Err(err) => {
-            app.set_status(plugin::app::Status::Error(format!(
-                "{}: failed to determine working directory: {err}",
-                issue.identifier
-            )));
-            return;
-        }
-    };
+    let cwd = plugin::host::resolve_cwd();
 
     let started = match plugin::herdr_cli::agent_start(&herdr_bin, &command, &cwd, &argv).await {
         Ok(started) => started,

@@ -274,13 +274,14 @@ the issue to "In Progress", and injects an implement prompt once the agent is re
 panel from anywhere (menu or view). Pressing the key again focuses the panel if it's
 open elsewhere, or closes it if it's already focused.
 
-> [!WARNING]
-> If you plan to use `<Enter>`, open the panel with the **split** action
-> (`herdr-linear.open-split`), not the tab one. A split pane inherits the directory of
-> the pane you split from; a fresh tab does not — it starts in the plugin's own install
-> directory. Since `<Enter>` starts the coding agent (and its new git worktree) in the
-> panel's own working directory, opening via `open-tab` will start it in the wrong
-> place. Read-only browsing (`o` to open in browser) is unaffected either way.
+> [!NOTE]
+> `<Enter>` starts the coding agent in the directory herdr reports as your currently
+> focused pane/workspace (via its injected launch context), not the plugin process's
+> own working directory — so it resolves correctly whether you opened the panel via
+> the **split** action (`herdr-linear.open-split`) or the **tab** one
+> (`herdr-linear.open-tab`). This requires herdr ≥ 0.7.0 (see `min_herdr_version` in
+> `herdr-plugin.toml`); on an older/misbehaving herdr that omits the launch context,
+> it falls back to the plugin's own install directory, same as before.
 
 ## License
 
