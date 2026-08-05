@@ -93,7 +93,8 @@ fn ambiguous_error(repo_name: &str, candidates: &[&Project]) -> Error {
 
 /// Composition entry point for project ID resolution: returns a project_id from either
 /// an override (which short-circuits outright if provided and non-empty), or by delegating
-/// to `match_project` to find a project by name. Callers: TF-578.
+/// to `match_project` to find a project by name. Called from
+/// [`crate::plugin::data::fetch_current_project_issues`].
 pub fn resolve_project_id(
     project_id_override: Option<&str>,
     repo_name: &str,
@@ -109,7 +110,7 @@ pub fn resolve_project_id(
 
 /// Derive the repo name from the real environment: `git remote get-url origin` in the
 /// current working directory, falling back to the cwd's directory name. Thin wrapper
-/// around [`derive_repo_name`]; not yet called from the binary (see TF-578).
+/// around [`derive_repo_name`]; called from [`crate::plugin::data::fetch_current_project_issues`].
 pub fn detect_repo_name() -> String {
     let remote_url = match std::process::Command::new("git")
         .args(["remote", "get-url", "origin"])

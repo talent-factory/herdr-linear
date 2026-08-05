@@ -167,9 +167,9 @@ mod tests {
         let app = App::new();
         let text = rendered_text(&app);
 
-        assert!(text.contains("Project Issues (coming soon)"));
         assert!(text.contains("Team Issues (coming soon)"));
         assert!(!text.contains("My Issues (coming soon)"));
+        assert!(!text.contains("Project Issues (coming soon)"));
     }
 
     #[test]
