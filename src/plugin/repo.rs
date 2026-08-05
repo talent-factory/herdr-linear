@@ -3,6 +3,8 @@
 //! projects fetched via `LinearClient::get_projects`. A `project_id` override in
 //! config.toml (see `crate::plugin::config`) always wins over name matching.
 
+use crate::{Error, Project, Result};
+
 /// Derive a repo name to match against Linear project names: parses the last path segment
 /// off `remote_url` (handling both `git@host:org/repo.git` SSH and
 /// `https://host/org/repo.git` HTTPS forms, stripping a trailing `.git`), falling back to
@@ -29,9 +31,83 @@ fn parse_repo_name_from_remote(remote_url: &str) -> Option<String> {
     }
 }
 
+/// Match `repo_name` against `projects` by name: case-insensitive exact match first — if
+/// exactly one project matches, it wins outright even when other projects would also
+/// substring-match. Otherwise falls back to a case-insensitive substring match (either
+/// direction), which only resolves when it narrows to exactly one project — zero or
+/// multiple candidates at either stage are both errors, never a "best guess". Pure
+/// function — takes an already-fetched project list, no network access, so it's
+/// deterministic and safe to unit test (see [`resolve_project_id`] for the override-aware
+/// entry point callers should use).
+pub fn match_project<'a>(repo_name: &str, projects: &'a [Project]) -> Result<&'a Project> {
+    let repo_lower = repo_name.to_lowercase();
+
+    let exact: Vec<&Project> = projects
+        .iter()
+        .filter(|p| p.name.to_lowercase() == repo_lower)
+        .collect();
+    if exact.len() == 1 {
+        return Ok(exact[0]);
+    }
+    if exact.len() > 1 {
+        return Err(ambiguous_error(repo_name, &exact));
+    }
+
+    let substring: Vec<&Project> = projects
+        .iter()
+        .filter(|p| {
+            let name_lower = p.name.to_lowercase();
+            name_lower.contains(&repo_lower) || repo_lower.contains(&name_lower)
+        })
+        .collect();
+    match substring.len() {
+        1 => Ok(substring[0]),
+        0 => Err(no_match_error(repo_name)),
+        _ => Err(ambiguous_error(repo_name, &substring)),
+    }
+}
+
+fn no_match_error(repo_name: &str) -> Error {
+    Error::ConfigError(format!(
+        "No Linear project matches repo \"{repo_name}\". Set `project_id` in config.toml to override."
+    ))
+}
+
+fn ambiguous_error(repo_name: &str, candidates: &[&Project]) -> Error {
+    let names = candidates
+        .iter()
+        .map(|p| p.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Error::ConfigError(format!(
+        "Multiple Linear projects match repo \"{repo_name}\": {names}. Set `project_id` in config.toml to disambiguate."
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ProjectStatus;
+
+    fn test_project(id: &str, name: &str) -> Project {
+        Project {
+            id: id.to_string(),
+            name: name.to_string(),
+            description: None,
+            url: format!("https://linear.app/talent-factory/project/{id}"),
+            lead_id: None,
+            lead: None,
+            status: ProjectStatus {
+                id: "status-1".to_string(),
+                name: "Started".to_string(),
+                r#type: "started".to_string(),
+            },
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            start_date: None,
+            target_date: None,
+        }
+    }
 
     #[test]
     fn ssh_remote_yields_repo_name() {
@@ -70,5 +146,73 @@ mod tests {
     fn empty_remote_falls_back_to_cwd_dir_name() {
         let name = derive_repo_name(Some(""), "my-local-repo");
         assert_eq!(name, "my-local-repo");
+    }
+
+    #[test]
+    fn exact_match_wins_over_substring_collision() {
+        let projects = vec![
+            test_project("p1", "herdr-linear"),
+            test_project("p2", "herdr-linear-docs"),
+        ];
+
+        let matched = match_project("Herdr-Linear", &projects).unwrap();
+
+        assert_eq!(matched.id, "p1");
+    }
+
+    #[test]
+    fn exact_match_ambiguous_when_multiple_case_variants() {
+        let projects = vec![
+            test_project("p1", "Herdr-Linear"),
+            test_project("p2", "herdr-linear"),
+        ];
+
+        let err = match_project("herdr-linear", &projects).unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("Multiple Linear projects"));
+        assert!(message.contains("herdr-linear"));
+    }
+
+    #[test]
+    fn substring_match_resolves_when_unique() {
+        let projects = vec![test_project("p1", "herdr-linear-plugin")];
+
+        let matched = match_project("herdr-linear", &projects).unwrap();
+
+        assert_eq!(matched.id, "p1");
+    }
+
+    #[test]
+    fn no_match_errors_and_mentions_project_id_override() {
+        let projects = vec![test_project("p1", "totally-unrelated")];
+
+        let err = match_project("herdr-linear", &projects).unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("No Linear project matches"));
+        assert!(message.contains("project_id"));
+    }
+
+    #[test]
+    fn substring_match_ambiguous_with_multiple_candidates() {
+        let projects = vec![
+            test_project("p1", "herdr-linear-app"),
+            test_project("p2", "herdr-linear-docs"),
+        ];
+
+        let err = match_project("herdr-linear", &projects).unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("Multiple Linear projects"));
+        assert!(message.contains("herdr-linear-app"));
+        assert!(message.contains("herdr-linear-docs"));
+    }
+
+    #[test]
+    fn no_projects_at_all_errors() {
+        let err = match_project("herdr-linear", &[]).unwrap_err();
+
+        assert!(err.to_string().contains("No Linear project matches"));
     }
 }
