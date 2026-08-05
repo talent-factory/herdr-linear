@@ -159,7 +159,7 @@ cargo run --example issue_operations -- lin_api_YOUR_KEY TEAM_ID
 RUST_LOG=debug cargo run --example basic_usage
 
 # JSON output
-RUST_LOG=info cargo run --bin herdr-linear 2>&1 | jq
+RUST_LOG=info cargo run --example tracing_demo 2>&1 | jq
 ```
 
 ---

@@ -270,7 +270,7 @@ impl LinearClient {
     pub async fn get_cycles(&self, team_id: &str, limit: Option<i32>) -> Result<Connection<Cycle>> {
         debug!("Fetching cycles for team: {}", team_id);
         let variables = json!({
-            "teamId": team_id,
+            "filter": {"team": {"id": {"eq": team_id}}},
             "first": limit.unwrap_or(50)
         });
 
@@ -287,7 +287,7 @@ impl LinearClient {
     /// Get workflow states for a team
     pub async fn get_workflow_states(&self, team_id: &str) -> Result<Vec<IssueState>> {
         debug!("Fetching workflow states for team: {}", team_id);
-        let variables = json!({"teamId": team_id, "first": 100});
+        let variables = json!({"filter": {"team": {"id": {"eq": team_id}}}, "first": 100});
         let response = self
             .query::<serde_json::Value>(QUERY_WORKFLOW_STATES, variables)
             .await?;
@@ -338,7 +338,7 @@ impl LinearClient {
         let response = self
             .http_client
             .post(&self.endpoint)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Authorization", &self.api_key)
             .header("Content-Type", "application/json")
             .json(&payload)
             .send()

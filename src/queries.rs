@@ -23,7 +23,6 @@ query Teams($first: Int, $after: String) {
       key
       name
       description
-      avatarUrl
       createdAt
       updatedAt
     }
@@ -33,7 +32,6 @@ query Teams($first: Int, $after: String) {
       startCursor
       endCursor
     }
-    totalCount
   }
 }
 "#;
@@ -46,7 +44,6 @@ query Team($id: String!) {
     key
     name
     description
-    avatarUrl
     createdAt
     updatedAt
   }
@@ -58,14 +55,12 @@ pub const QUERY_ISSUES: &str = r#"
 query Issues(
   $first: Int,
   $after: String,
-  $filter: IssueFilter,
-  $orderBy: IssueOrderByInput
+  $filter: IssueFilter
 ) {
   issues(
     first: $first,
     after: $after,
-    filter: $filter,
-    orderBy: $orderBy
+    filter: $filter
   ) {
     nodes {
       id
@@ -89,7 +84,6 @@ query Issues(
         key
         name
         description
-        avatarUrl
         createdAt
         updatedAt
       }
@@ -112,10 +106,10 @@ query Issues(
       cycle {
         id
         number
-        title
+        name
         createdAt
         updatedAt
-        startedAt
+        startsAt
         endsAt
         completedAt
       }
@@ -124,7 +118,11 @@ query Issues(
         name
         description
         url
-        state
+        status {
+          id
+          name
+          type
+        }
         createdAt
         updatedAt
         startDate
@@ -147,7 +145,6 @@ query Issues(
       startCursor
       endCursor
     }
-    totalCount
   }
 }
 "#;
@@ -177,7 +174,6 @@ query Issue($id: String!) {
       key
       name
       description
-      avatarUrl
       createdAt
       updatedAt
     }
@@ -200,10 +196,10 @@ query Issue($id: String!) {
     cycle {
       id
       number
-      title
+      name
       createdAt
       updatedAt
-      startedAt
+      startsAt
       endsAt
       completedAt
     }
@@ -212,7 +208,11 @@ query Issue($id: String!) {
       name
       description
       url
-      state
+      status {
+        id
+        name
+        type
+      }
       createdAt
       updatedAt
       startDate
@@ -332,7 +332,11 @@ query Projects($first: Int, $after: String, $filter: ProjectFilter) {
       name
       description
       url
-      state
+      status {
+        id
+        name
+        type
+      }
       createdAt
       updatedAt
       startDate
@@ -349,20 +353,19 @@ query Projects($first: Int, $after: String, $filter: ProjectFilter) {
       startCursor
       endCursor
     }
-    totalCount
   }
 }
 "#;
 
 /// Get cycles for a team
 pub const QUERY_CYCLES: &str = r#"
-query Cycles($teamId: String!, $first: Int, $after: String) {
-  cycles(teamId: $teamId, first: $first, after: $after) {
+query Cycles($filter: CycleFilter, $first: Int, $after: String) {
+  cycles(filter: $filter, first: $first, after: $after) {
     nodes {
       id
       number
-      title
-      startedAt
+      name
+      startsAt
       endsAt
       completedAt
       createdAt
@@ -379,15 +382,14 @@ query Cycles($teamId: String!, $first: Int, $after: String) {
       startCursor
       endCursor
     }
-    totalCount
   }
 }
 "#;
 
 /// Get workflow states for a team
 pub const QUERY_WORKFLOW_STATES: &str = r#"
-query WorkflowStates($teamId: String!, $first: Int) {
-  workflowStates(teamId: $teamId, first: $first) {
+query WorkflowStates($filter: WorkflowStateFilter, $first: Int) {
+  workflowStates(filter: $filter, first: $first) {
     nodes {
       id
       name

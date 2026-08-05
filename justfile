@@ -69,6 +69,32 @@ run:
     fi
     RUST_LOG=debug cargo run --bin herdr-linear
 
+# ─── Herdr plugin ─────────────────────────────────────────────────────────────
+
+# Uninstall the herdr-linear plugin (if present), rebuild, then link this checkout.
+# NOTE: `herdr plugin link` only registers the manifest path — it does NOT run the
+# manifest's [[build]] step. The release binary must be rebuilt explicitly, or herdr
+# will keep exec'ing whatever stale ./target/release/herdr-linear already exists.
+[group('plugin')]
+plugin-reinstall:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    existing=$(herdr plugin list --json | jq -r '.result.plugins[] | select(.plugin_id == "herdr-linear") | .source.kind')
+    if [ "$existing" = "local" ]; then
+        echo "Unlinking existing local herdr-linear plugin..."
+        herdr plugin unlink herdr-linear
+    elif [ -n "$existing" ]; then
+        echo "Uninstalling existing herdr-linear plugin ($existing)..."
+        herdr plugin uninstall herdr-linear
+    else
+        echo "No existing herdr-linear plugin found."
+    fi
+    echo "Rebuilding release binary (cargo build --release --features plugin)..."
+    cargo build --release --features plugin
+    echo "Linking herdr-linear plugin from $(pwd)..."
+    herdr plugin link .
+    echo "✅ Plugin reinstalled"
+
 # ─── Docs ─────────────────────────────────────────────────────────────────────
 
 # Generate and open documentation

@@ -22,7 +22,6 @@ pub struct Team {
     pub key: String,
     pub name: String,
     pub description: Option<String>,
-    pub avatar_url: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -40,14 +39,14 @@ pub struct Issue {
     pub estimate: Option<i32>,
     pub team: Team,
     pub assignee: Option<User>,
-    pub creator: User,
+    pub creator: Option<User>,
     pub created_at: String,
     pub updated_at: String,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
     pub cycle: Option<Cycle>,
     pub project: Option<Project>,
-    pub labels: Vec<Label>,
+    pub labels: LabelConnection,
     pub url: String,
 }
 
@@ -70,11 +69,20 @@ pub struct Project {
     pub url: String,
     pub lead_id: Option<String>,
     pub lead: Option<User>,
-    pub state: String, // "planned", "started", "completed", "canceled"
+    pub status: ProjectStatus,
     pub created_at: String,
     pub updated_at: String,
     pub start_date: Option<String>,
     pub target_date: Option<String>,
+}
+
+/// Represents a Linear project's status
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectStatus {
+    pub id: String,
+    pub name: String,
+    pub r#type: String, // "planned", "started", "completed", "canceled"
 }
 
 /// Represents a Linear cycle (sprint)
@@ -83,9 +91,9 @@ pub struct Project {
 pub struct Cycle {
     pub id: String,
     pub number: i32,
-    pub title: String,
+    pub name: Option<String>,
     pub team: Team,
-    pub started_at: Option<String>,
+    pub starts_at: Option<String>,
     pub ends_at: Option<String>,
     pub completed_at: Option<String>,
     pub created_at: String,
@@ -102,6 +110,14 @@ pub struct Label {
     pub description: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// Wraps an issue's `labels(first: N) { nodes { ... } }` selection, which the
+/// Linear API returns as a connection object rather than a bare array.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LabelConnection {
+    pub nodes: Vec<Label>,
 }
 
 /// Represents a Linear comment
@@ -131,7 +147,6 @@ pub struct PageInfo {
 pub struct Connection<T> {
     pub nodes: Vec<T>,
     pub page_info: PageInfo,
-    pub total_count: i32,
 }
 
 /// GraphQL error response
@@ -189,7 +204,6 @@ mod tests {
             "key": "ENG",
             "name": "Engineering",
             "description": null,
-            "avatarUrl": null,
             "createdAt": "2026-01-01T00:00:00Z",
             "updatedAt": "2026-01-01T00:00:00Z"
         })
@@ -213,7 +227,7 @@ mod tests {
             "completedAt": null,
             "cycle": null,
             "project": null,
-            "labels": [],
+            "labels": {"nodes": []},
             "url": "https://linear.app/team/issue/ENG-123"
         })
     }
@@ -224,15 +238,15 @@ mod tests {
 
         assert_eq!(issue.identifier, "ENG-123");
         assert_eq!(issue.team.key, "ENG");
-        assert_eq!(issue.creator.name, "Alice");
+        assert_eq!(issue.creator.unwrap().name, "Alice");
         assert_eq!(issue.state.r#type, "started");
     }
 
     #[test]
     fn deserializes_connection_from_linear_camel_case_payload() {
         // Regression test: Connection<T> previously lacked `rename_all = "camelCase"`,
-        // so Linear's `pageInfo`/`totalCount` keys silently failed to deserialize and
-        // every paginated call (get_teams, get_issues, get_projects, get_cycles)
+        // so Linear's `pageInfo` keys silently failed to deserialize and every
+        // paginated call (get_teams, get_issues, get_projects, get_cycles)
         // returned a generic "Failed to parse ... data" error.
         let payload = json!({
             "nodes": [sample_issue()],
@@ -241,14 +255,12 @@ mod tests {
                 "hasPreviousPage": false,
                 "startCursor": "cursor-1",
                 "endCursor": "cursor-2"
-            },
-            "totalCount": 1
+            }
         });
 
         let connection: Connection<Issue> =
             serde_json::from_value(payload).expect("valid connection payload");
 
-        assert_eq!(connection.total_count, 1);
         assert!(connection.page_info.has_next_page);
         assert_eq!(connection.nodes[0].identifier, "ENG-123");
     }

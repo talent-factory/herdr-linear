@@ -1,0 +1,38 @@
+# herdr-plugin.toml — manifest for the herdr-linear plugin.
+#
+# A read-only "My Issues" panel for Linear: lists the authenticated user's assigned
+# issues in a herdr split pane or tab, with view details / open-in-browser. See
+# docs/superpowers/specs/2026-08-04-herdr-plugin-layer-design.md for the full design.
+#
+# v1 targets linux/macos only. The [[build]] step is a plain `cargo build`, so
+# installing requires a Rust toolchain (no prebuilt-binary download yet).
+
+id = "herdr-linear"
+name = "herdr-linear"
+version = "0.1.0"
+description = "A read-only Linear issues panel for Herdr."
+min_herdr_version = "0.7.0"
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["cargo", "build", "--release", "--features", "plugin"]
+
+# The Linear panel. herdr performs the split/tab placement on open; the [[actions]]
+# below summon it via the idempotent launcher scripts.
+[[panes]]
+id = "linear-panel"
+title = "Linear"
+placement = "split"
+command = ["./target/release/herdr-linear"]
+
+[[actions]]
+id = "open-split"
+title = "Open Linear panel"
+description = "Open the Linear issues panel in a split pane beside the current work."
+command = ["bash", "scripts/open-split.sh"]
+
+[[actions]]
+id = "open-tab"
+title = "Open Linear panel (tab)"
+description = "Open the Linear issues panel in its own tab (switch to it if already open)."
+command = ["bash", "scripts/open-tab.sh"]
