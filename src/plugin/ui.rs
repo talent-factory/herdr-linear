@@ -1,7 +1,7 @@
 //! Rendering for the plugin TUI: a view-selection menu, a loading message, an error
 //! message with a retry hint, or a two-pane issue list + detail view.
 
-use crate::plugin::app::{App, Screen, ViewState, MENU_OPTIONS};
+use crate::plugin::app::{App, Screen, ViewKind, ViewState, MENU_OPTIONS};
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Modifier, Style},
@@ -10,22 +10,22 @@ use ratatui::{
 };
 
 pub fn draw(frame: &mut Frame, app: &App) {
-    match &app.screen {
+    match app.screen() {
         Screen::Menu { selected } => draw_menu(frame, *selected),
-        Screen::View(_, view_state) => draw_view(frame, view_state),
+        Screen::View(kind, view_state) => draw_view(frame, *kind, view_state),
     }
 }
 
 fn draw_menu(frame: &mut Frame, selected: usize) {
     let items: Vec<ListItem> = MENU_OPTIONS
         .iter()
-        .map(|(kind, available)| {
-            let label = if *available {
-                kind.label().to_string()
+        .map(|option| {
+            let label = if option.available {
+                option.kind.label().to_string()
             } else {
-                format!("{} (coming soon)", kind.label())
+                format!("{} (coming soon)", option.kind.label())
             };
-            let style = if *available {
+            let style = if option.available {
                 Style::default()
             } else {
                 Style::default().add_modifier(Modifier::DIM)
@@ -41,7 +41,7 @@ fn draw_menu(frame: &mut Frame, selected: usize) {
     frame.render_stateful_widget(list, frame.area(), &mut list_state);
 }
 
-fn draw_view(frame: &mut Frame, view_state: &ViewState) {
+fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState) {
     match view_state {
         ViewState::Loading => {
             let paragraph = Paragraph::new("Loading issues...")
@@ -69,7 +69,7 @@ fn draw_view(frame: &mut Frame, view_state: &ViewState) {
                 .map(|issue| ListItem::new(format!("{} {}", issue.identifier, issue.title)))
                 .collect();
             let list = List::new(items)
-                .block(Block::default().borders(Borders::ALL).title("My Issues"))
+                .block(Block::default().borders(Borders::ALL).title(kind.label()))
                 .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
             let mut list_state = ListState::default();
             list_state.select(Some(*selected));

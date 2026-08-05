@@ -79,8 +79,13 @@ async fn load_issues(app: &mut plugin::app::App, client: &herdr_linear::LinearCl
                 Err(err) => app.set_error(err.to_string()),
             }
         }
-        Some(plugin::app::ViewKind::ProjectIssues) | Some(plugin::app::ViewKind::TeamIssues) => {
-            unreachable!("the menu does not allow selecting an unavailable view yet")
+        Some(kind) => {
+            // The menu only lets an `available` `MENU_OPTIONS` entry be entered, so
+            // this arm should be unreachable today — but it's one flipped `bool`
+            // away from becoming reachable the moment TF-578/TF-579 land without
+            // this match also being updated. Degrade to the same error screen a
+            // fetch failure would produce rather than panicking the whole TUI.
+            app.set_error(format!("{} isn't available yet.", kind.label()));
         }
         None => {}
     }

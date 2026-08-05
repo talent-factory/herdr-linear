@@ -1,9 +1,10 @@
 //! TUI application state and navigation.
 //!
 //! Provides pure state management for the terminal UI without any rendering logic.
-//! The app starts on a menu (`Screen::Menu`) offering the available issue views, then
-//! moves into `Screen::View` once one is selected — tracking that view's own display
-//! state (loading, loaded issues, error) and navigation within its issue list.
+//! The app starts on a menu (`Screen::Menu`) listing the configured issue views —
+//! unavailable ones are shown but disabled — then moves into `Screen::View` once an
+//! available one is selected, tracking that view's own display state (loading,
+//! loaded issues, error) and navigation within its issue list.
 
 use crate::Issue;
 
@@ -29,13 +30,31 @@ impl ViewKind {
     }
 }
 
-/// The menu options in display order, paired with whether they're selectable yet.
-/// `ProjectIssues`/`TeamIssues` become available once TF-578/TF-579 implement their
-/// data fetching — until then the menu shows but disables them.
-pub const MENU_OPTIONS: [(ViewKind, bool); 3] = [
-    (ViewKind::MyIssues, true),
-    (ViewKind::ProjectIssues, false),
-    (ViewKind::TeamIssues, false),
+/// A single entry in the view-selection menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MenuOption {
+    /// The view this entry selects.
+    pub kind: ViewKind,
+    /// Whether this entry is selectable yet.
+    pub available: bool,
+}
+
+/// The menu options in display order. `ProjectIssues`/`TeamIssues` become
+/// available once TF-578/TF-579 implement their data fetching — until then the
+/// menu shows but disables them.
+pub const MENU_OPTIONS: [MenuOption; 3] = [
+    MenuOption {
+        kind: ViewKind::MyIssues,
+        available: true,
+    },
+    MenuOption {
+        kind: ViewKind::ProjectIssues,
+        available: false,
+    },
+    MenuOption {
+        kind: ViewKind::TeamIssues,
+        available: false,
+    },
 ];
 
 /// The state of a single view once entered from the menu.
@@ -78,7 +97,7 @@ pub enum Screen {
 /// view's issues.
 pub struct App {
     /// The current screen.
-    pub screen: Screen,
+    screen: Screen,
 }
 
 impl App {
@@ -87,6 +106,11 @@ impl App {
         Self {
             screen: Screen::Menu { selected: 0 },
         }
+    }
+
+    /// The screen currently being displayed.
+    pub fn screen(&self) -> &Screen {
+        &self.screen
     }
 
     /// Moves the menu selection down one position, clamped at the last option.
@@ -117,11 +141,11 @@ impl App {
         let Screen::Menu { selected } = &self.screen else {
             return None;
         };
-        let (kind, available) = MENU_OPTIONS[*selected];
-        if !available {
+        let option = MENU_OPTIONS.get(*selected)?;
+        if !option.available {
             return None;
         }
-        self.screen = Screen::View(kind, ViewState::Loading);
+        self.screen = Screen::View(option.kind, ViewState::Loading);
         Some(Action::EnterView)
     }
 
@@ -391,6 +415,40 @@ mod tests {
     }
 
     #[test]
+    fn entering_the_last_menu_option_does_nothing_while_unavailable() {
+        let mut app = App::new();
+        app.move_menu_selection_down();
+        app.move_menu_selection_down(); // -> Team Issues, unavailable
+
+        let action = app.enter_selected_menu_option();
+
+        assert_eq!(action, None);
+        assert!(matches!(app.screen, Screen::Menu { selected: 2 }));
+    }
+
+    #[test]
+    fn menu_options_covers_every_view_kind() {
+        fn assert_present(kind: ViewKind) {
+            assert!(
+                MENU_OPTIONS.iter().any(|option| option.kind == kind),
+                "{kind:?} is missing from MENU_OPTIONS"
+            );
+        }
+
+        // Exhaustive match over `ViewKind`: adding a variant without a matching
+        // arm here fails to compile, forcing this test (and MENU_OPTIONS) to be
+        // kept in sync.
+        match ViewKind::MyIssues {
+            ViewKind::MyIssues => {}
+            ViewKind::ProjectIssues => {}
+            ViewKind::TeamIssues => {}
+        }
+        assert_present(ViewKind::MyIssues);
+        assert_present(ViewKind::ProjectIssues);
+        assert_present(ViewKind::TeamIssues);
+    }
+
+    #[test]
     fn set_issues_transitions_to_loaded_with_first_selected() {
         let mut app = app_in_my_issues_view();
         app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
@@ -564,6 +622,17 @@ mod tests {
     }
 
     #[test]
+    fn up_key_from_the_menu_moves_selection_and_returns_no_action() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Down);
+
+        let action = handle_key(&mut app, KeyCode::Up);
+
+        assert_eq!(action, None);
+        assert!(matches!(app.screen, Screen::Menu { selected: 0 }));
+    }
+
+    #[test]
     fn q_key_from_a_view_returns_quit() {
         let mut app = app_in_my_issues_view();
 
@@ -590,6 +659,21 @@ mod tests {
 
         assert_eq!(action, None);
         assert!(matches!(app.screen, Screen::Menu { selected: 0 }));
+    }
+
+    #[test]
+    fn reentering_a_view_after_esc_starts_a_fresh_loading_state() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        handle_key(&mut app, KeyCode::Esc);
+
+        let action = handle_key(&mut app, KeyCode::Enter);
+
+        assert_eq!(action, Some(Action::EnterView));
+        assert!(matches!(
+            app.screen,
+            Screen::View(ViewKind::MyIssues, ViewState::Loading)
+        ));
     }
 
     #[test]
