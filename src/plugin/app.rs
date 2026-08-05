@@ -1,18 +1,50 @@
 //! TUI application state and navigation.
 //!
 //! Provides pure state management for the terminal UI without any rendering logic.
-//! Tracks the current display state (loading, loaded issues, error) and handles
-//! navigation between issues in the list.
+//! The app starts on a menu (`Screen::Menu`) offering the available issue views, then
+//! moves into `Screen::View` once one is selected — tracking that view's own display
+//! state (loading, loaded issues, error) and navigation within its issue list.
 
 use crate::Issue;
 
-/// The application state, representing what the UI should currently display.
+/// The views selectable from the menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewKind {
+    /// Issues assigned to the authenticated user.
+    MyIssues,
+    /// All open issues in the current project (not yet implemented — see TF-577/TF-578).
+    ProjectIssues,
+    /// All open issues in a team (not yet implemented — see TF-579).
+    TeamIssues,
+}
+
+impl ViewKind {
+    /// The label shown for this view in the menu.
+    pub fn label(self) -> &'static str {
+        match self {
+            ViewKind::MyIssues => "My Issues",
+            ViewKind::ProjectIssues => "Project Issues",
+            ViewKind::TeamIssues => "Team Issues",
+        }
+    }
+}
+
+/// The menu options in display order, paired with whether they're selectable yet.
+/// `ProjectIssues`/`TeamIssues` become available once TF-578/TF-579 implement their
+/// data fetching — until then the menu shows but disables them.
+pub const MENU_OPTIONS: [(ViewKind, bool); 3] = [
+    (ViewKind::MyIssues, true),
+    (ViewKind::ProjectIssues, false),
+    (ViewKind::TeamIssues, false),
+];
+
+/// The state of a single view once entered from the menu.
 ///
-/// Note: `AppState` deliberately does NOT derive `PartialEq` because `Issue`
+/// Note: `ViewState` deliberately does NOT derive `PartialEq` because `Issue`
 /// doesn't derive it either. Tests use `matches!` for state comparisons instead.
 #[derive(Debug, Clone)]
-pub enum AppState {
-    /// The application is loading issues.
+pub enum ViewState {
+    /// The view is loading its issues.
     Loading,
     /// Issues have been loaded successfully.
     Loaded {
@@ -28,55 +60,139 @@ pub enum AppState {
     },
 }
 
+/// What the UI should currently display: the view-selection menu, or an entered view.
+#[derive(Debug, Clone)]
+pub enum Screen {
+    /// The view-selection menu. `selected` indexes into [`MENU_OPTIONS`].
+    Menu {
+        /// The index of the currently highlighted menu option.
+        selected: usize,
+    },
+    /// A view has been entered from the menu.
+    View(ViewKind, ViewState),
+}
+
 /// The main application state container.
 ///
-/// Manages transitions between states and navigation within the loaded issues.
+/// Manages transitions between the menu and views, and navigation within a loaded
+/// view's issues.
 pub struct App {
-    /// The current application state.
-    pub state: AppState,
+    /// The current screen.
+    pub screen: Screen,
 }
 
 impl App {
-    /// Creates a new application in the loading state.
+    /// Creates a new application on the menu, first option highlighted.
     pub fn new() -> Self {
         Self {
-            state: AppState::Loading,
+            screen: Screen::Menu { selected: 0 },
         }
     }
 
-    /// Sets the loaded issues and resets selection to the first issue.
-    pub fn set_issues(&mut self, issues: Vec<Issue>) {
-        self.state = AppState::Loaded {
-            issues,
-            selected: 0,
+    /// Moves the menu selection down one position, clamped at the last option.
+    /// No-op outside the menu.
+    pub fn move_menu_selection_down(&mut self) {
+        if let Screen::Menu { selected } = &mut self.screen {
+            if *selected + 1 < MENU_OPTIONS.len() {
+                *selected += 1;
+            }
+        }
+    }
+
+    /// Moves the menu selection up one position, clamped at the first option.
+    /// No-op outside the menu.
+    pub fn move_menu_selection_up(&mut self) {
+        if let Screen::Menu { selected } = &mut self.screen {
+            if *selected > 0 {
+                *selected -= 1;
+            }
+        }
+    }
+
+    /// Enters the currently highlighted menu option if it's available, transitioning
+    /// to `Screen::View(kind, ViewState::Loading)`. Returns `Action::EnterView` on
+    /// success so the caller knows to trigger a data fetch, or `None` if the option
+    /// is unavailable or the app isn't currently on the menu.
+    pub fn enter_selected_menu_option(&mut self) -> Option<Action> {
+        let Screen::Menu { selected } = &self.screen else {
+            return None;
         };
+        let (kind, available) = MENU_OPTIONS[*selected];
+        if !available {
+            return None;
+        }
+        self.screen = Screen::View(kind, ViewState::Loading);
+        Some(Action::EnterView)
     }
 
-    /// Transitions to an error state with the given message.
+    /// Returns to the menu, selection reset to the first option.
+    pub fn return_to_menu(&mut self) {
+        self.screen = Screen::Menu { selected: 0 };
+    }
+
+    /// The kind of the currently entered view, or `None` if on the menu.
+    pub fn current_view(&self) -> Option<ViewKind> {
+        match &self.screen {
+            Screen::View(kind, _) => Some(*kind),
+            Screen::Menu { .. } => None,
+        }
+    }
+
+    /// True if the current view is in an error state. False on the menu.
+    fn is_view_error(&self) -> bool {
+        matches!(self.screen, Screen::View(_, ViewState::Error { .. }))
+    }
+
+    /// Sets the loaded issues on the current view and resets selection to the first
+    /// issue. No-op if not currently in a view.
+    pub fn set_issues(&mut self, issues: Vec<Issue>) {
+        if let Some(kind) = self.current_view() {
+            self.screen = Screen::View(
+                kind,
+                ViewState::Loaded {
+                    issues,
+                    selected: 0,
+                },
+            );
+        }
+    }
+
+    /// Transitions the current view to an error state with the given message.
+    /// No-op if not currently in a view.
     pub fn set_error(&mut self, message: String) {
-        self.state = AppState::Error { message };
+        if let Some(kind) = self.current_view() {
+            self.screen = Screen::View(kind, ViewState::Error { message });
+        }
     }
 
-    /// Transitions back to the loading state.
+    /// Transitions the current view back to its loading state. No-op if not
+    /// currently in a view.
     pub fn retry(&mut self) {
-        self.state = AppState::Loading;
+        if let Some(kind) = self.current_view() {
+            self.screen = Screen::View(kind, ViewState::Loading);
+        }
     }
 
     /// Moves the selection down one position if there are more issues below.
+    /// No-op outside a loaded view.
     pub fn move_selection_down(&mut self) {
-        if let AppState::Loaded { issues, selected } = &mut self.state {
+        if let Screen::View(_, ViewState::Loaded { issues, selected }) = &mut self.screen {
             if !issues.is_empty() && *selected + 1 < issues.len() {
                 *selected += 1;
             }
         }
     }
 
-    /// Moves the selection up one position if there are issues above.
+    /// Moves the selection up one position if there are issues above. No-op
+    /// outside a loaded view.
     pub fn move_selection_up(&mut self) {
-        if let AppState::Loaded {
-            issues: _,
-            selected,
-        } = &mut self.state
+        if let Screen::View(
+            _,
+            ViewState::Loaded {
+                issues: _,
+                selected,
+            },
+        ) = &mut self.screen
         {
             if *selected > 0 {
                 *selected -= 1;
@@ -86,8 +202,8 @@ impl App {
 
     /// Returns a reference to the currently selected issue, if any.
     pub fn selected_issue(&self) -> Option<&Issue> {
-        match &self.state {
-            AppState::Loaded { issues, selected } => issues.get(*selected),
+        match &self.screen {
+            Screen::View(_, ViewState::Loaded { issues, selected }) => issues.get(*selected),
             _ => None,
         }
     }
@@ -104,16 +220,41 @@ pub enum Action {
     Quit,
     OpenInBrowser(String),
     Retry,
+    /// A menu option was entered; the caller should trigger a data fetch for the
+    /// now-current view (see [`App::current_view`]).
+    EnterView,
 }
 
-/// Map a key press to an [`Action`], applying any state change (navigation, retry)
-/// directly to `app`. Returns `None` when the key had no effect or only changed
-/// navigation state in place.
+/// Map a key press to an [`Action`], applying any state change (menu navigation,
+/// entering a view, list navigation, retry, returning to the menu) directly to
+/// `app`. Returns `None` when the key had no effect or only changed state in place.
 pub fn handle_key(app: &mut App, key: crossterm::event::KeyCode) -> Option<Action> {
     use crossterm::event::KeyCode;
 
+    let in_menu = matches!(app.screen, Screen::Menu { .. });
+
+    if in_menu {
+        return match key {
+            KeyCode::Char('q') | KeyCode::Esc => Some(Action::Quit),
+            KeyCode::Down => {
+                app.move_menu_selection_down();
+                None
+            }
+            KeyCode::Up => {
+                app.move_menu_selection_up();
+                None
+            }
+            KeyCode::Enter => app.enter_selected_menu_option(),
+            _ => None,
+        };
+    }
+
     match key {
-        KeyCode::Char('q') | KeyCode::Esc => Some(Action::Quit),
+        KeyCode::Char('q') => Some(Action::Quit),
+        KeyCode::Esc => {
+            app.return_to_menu();
+            None
+        }
         KeyCode::Down => {
             app.move_selection_down();
             None
@@ -126,7 +267,7 @@ pub fn handle_key(app: &mut App, key: crossterm::event::KeyCode) -> Option<Actio
             .selected_issue()
             .map(|issue| Action::OpenInBrowser(issue.url.clone())),
         KeyCode::Char('r') => {
-            if matches!(app.state, AppState::Error { .. }) {
+            if app.is_view_error() {
                 app.retry();
                 Some(Action::Retry)
             } else {
@@ -183,24 +324,87 @@ mod tests {
         }
     }
 
+    /// An `App` that has already entered the "My Issues" view (still `Loading`),
+    /// for tests that exercise view-level behavior without re-navigating the menu
+    /// each time.
+    fn app_in_my_issues_view() -> App {
+        let mut app = App::new();
+        app.enter_selected_menu_option();
+        app
+    }
+
     #[test]
-    fn app_starts_in_loading_state() {
+    fn app_starts_at_the_menu() {
         let app = App::new();
-        assert!(matches!(app.state, AppState::Loading));
+        assert!(matches!(app.screen, Screen::Menu { selected: 0 }));
+    }
+
+    #[test]
+    fn menu_selection_moves_down_and_clamps_at_the_last_option() {
+        let mut app = App::new();
+
+        app.move_menu_selection_down();
+        assert!(matches!(app.screen, Screen::Menu { selected: 1 }));
+
+        app.move_menu_selection_down();
+        assert!(matches!(app.screen, Screen::Menu { selected: 2 }));
+
+        app.move_menu_selection_down();
+        assert!(matches!(app.screen, Screen::Menu { selected: 2 }));
+    }
+
+    #[test]
+    fn menu_selection_moves_up_and_clamps_at_the_first_option() {
+        let mut app = App::new();
+        app.move_menu_selection_down();
+
+        app.move_menu_selection_up();
+        assert!(matches!(app.screen, Screen::Menu { selected: 0 }));
+
+        app.move_menu_selection_up();
+        assert!(matches!(app.screen, Screen::Menu { selected: 0 }));
+    }
+
+    #[test]
+    fn entering_the_available_option_transitions_to_loading_and_returns_enter_view() {
+        let mut app = App::new();
+
+        let action = app.enter_selected_menu_option();
+
+        assert_eq!(action, Some(Action::EnterView));
+        assert!(matches!(
+            app.screen,
+            Screen::View(ViewKind::MyIssues, ViewState::Loading)
+        ));
+        assert_eq!(app.current_view(), Some(ViewKind::MyIssues));
+    }
+
+    #[test]
+    fn entering_an_unavailable_option_does_nothing() {
+        let mut app = App::new();
+        app.move_menu_selection_down(); // -> Project Issues, unavailable
+
+        let action = app.enter_selected_menu_option();
+
+        assert_eq!(action, None);
+        assert!(matches!(app.screen, Screen::Menu { selected: 1 }));
     }
 
     #[test]
     fn set_issues_transitions_to_loaded_with_first_selected() {
-        let mut app = App::new();
+        let mut app = app_in_my_issues_view();
         app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
 
-        assert!(matches!(&app.state, AppState::Loaded { .. }));
+        assert!(matches!(
+            &app.screen,
+            Screen::View(ViewKind::MyIssues, ViewState::Loaded { .. })
+        ));
         assert_eq!(app.selected_issue().unwrap().identifier, "ENG-1");
     }
 
     #[test]
     fn move_selection_down_advances_through_issues() {
-        let mut app = App::new();
+        let mut app = app_in_my_issues_view();
         app.set_issues(vec![
             sample_issue("ENG-1"),
             sample_issue("ENG-2"),
@@ -216,7 +420,7 @@ mod tests {
 
     #[test]
     fn move_selection_down_clamps_at_the_end() {
-        let mut app = App::new();
+        let mut app = app_in_my_issues_view();
         app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
 
         app.move_selection_down();
@@ -227,7 +431,7 @@ mod tests {
 
     #[test]
     fn move_selection_up_retreats_and_clamps_at_the_start() {
-        let mut app = App::new();
+        let mut app = app_in_my_issues_view();
         app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
         app.move_selection_down();
 
@@ -240,7 +444,7 @@ mod tests {
 
     #[test]
     fn navigation_on_an_empty_list_does_not_panic() {
-        let mut app = App::new();
+        let mut app = app_in_my_issues_view();
         app.set_issues(vec![]);
 
         app.move_selection_down();
@@ -251,27 +455,33 @@ mod tests {
 
     #[test]
     fn set_error_moves_to_error_state() {
-        let mut app = App::new();
+        let mut app = app_in_my_issues_view();
         app.set_error("boom".to_string());
 
-        assert!(matches!(&app.state, AppState::Error { message } if message == "boom"));
+        assert!(matches!(
+            &app.screen,
+            Screen::View(ViewKind::MyIssues, ViewState::Error { message }) if message == "boom"
+        ));
     }
 
     #[test]
     fn retry_moves_back_to_loading() {
-        let mut app = App::new();
+        let mut app = app_in_my_issues_view();
         app.set_error("boom".to_string());
 
         app.retry();
 
-        assert!(matches!(app.state, AppState::Loading));
+        assert!(matches!(
+            app.screen,
+            Screen::View(ViewKind::MyIssues, ViewState::Loading)
+        ));
     }
 
     use crossterm::event::KeyCode;
 
     #[test]
     fn down_key_moves_selection_and_returns_no_action() {
-        let mut app = App::new();
+        let mut app = app_in_my_issues_view();
         app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
 
         let action = handle_key(&mut app, KeyCode::Down);
@@ -282,7 +492,7 @@ mod tests {
 
     #[test]
     fn up_key_moves_selection_and_returns_no_action() {
-        let mut app = App::new();
+        let mut app = app_in_my_issues_view();
         app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
         app.move_selection_down();
 
@@ -294,7 +504,7 @@ mod tests {
 
     #[test]
     fn o_key_returns_open_in_browser_with_the_selected_issue_url() {
-        let mut app = App::new();
+        let mut app = app_in_my_issues_view();
         app.set_issues(vec![sample_issue("ENG-1")]);
 
         let action = handle_key(&mut app, KeyCode::Char('o'));
@@ -309,40 +519,96 @@ mod tests {
 
     #[test]
     fn o_key_on_an_empty_list_returns_no_action() {
-        let mut app = App::new();
+        let mut app = app_in_my_issues_view();
         app.set_issues(vec![]);
 
         assert_eq!(handle_key(&mut app, KeyCode::Char('o')), None);
     }
 
     #[test]
-    fn q_key_returns_quit() {
+    fn q_key_from_the_menu_returns_quit() {
         let mut app = App::new();
 
         assert_eq!(handle_key(&mut app, KeyCode::Char('q')), Some(Action::Quit));
     }
 
     #[test]
-    fn esc_key_returns_quit() {
+    fn esc_key_from_the_menu_returns_quit() {
         let mut app = App::new();
 
         assert_eq!(handle_key(&mut app, KeyCode::Esc), Some(Action::Quit));
     }
 
     #[test]
-    fn r_key_in_error_state_retries_and_returns_retry_action() {
+    fn enter_key_on_the_default_menu_selection_enters_my_issues() {
         let mut app = App::new();
+
+        let action = handle_key(&mut app, KeyCode::Enter);
+
+        assert_eq!(action, Some(Action::EnterView));
+        assert!(matches!(
+            app.screen,
+            Screen::View(ViewKind::MyIssues, ViewState::Loading)
+        ));
+    }
+
+    #[test]
+    fn enter_key_on_an_unavailable_menu_option_does_nothing() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Down); // -> Project Issues, unavailable
+
+        let action = handle_key(&mut app, KeyCode::Enter);
+
+        assert_eq!(action, None);
+        assert!(matches!(app.screen, Screen::Menu { selected: 1 }));
+    }
+
+    #[test]
+    fn q_key_from_a_view_returns_quit() {
+        let mut app = app_in_my_issues_view();
+
+        assert_eq!(handle_key(&mut app, KeyCode::Char('q')), Some(Action::Quit));
+    }
+
+    #[test]
+    fn esc_key_from_a_loaded_view_returns_to_the_menu() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+
+        let action = handle_key(&mut app, KeyCode::Esc);
+
+        assert_eq!(action, None);
+        assert!(matches!(app.screen, Screen::Menu { selected: 0 }));
+    }
+
+    #[test]
+    fn esc_key_from_an_error_view_returns_to_the_menu() {
+        let mut app = app_in_my_issues_view();
+        app.set_error("boom".to_string());
+
+        let action = handle_key(&mut app, KeyCode::Esc);
+
+        assert_eq!(action, None);
+        assert!(matches!(app.screen, Screen::Menu { selected: 0 }));
+    }
+
+    #[test]
+    fn r_key_in_error_state_retries_and_returns_retry_action() {
+        let mut app = app_in_my_issues_view();
         app.set_error("boom".to_string());
 
         let action = handle_key(&mut app, KeyCode::Char('r'));
 
         assert_eq!(action, Some(Action::Retry));
-        assert!(matches!(app.state, AppState::Loading));
+        assert!(matches!(
+            app.screen,
+            Screen::View(ViewKind::MyIssues, ViewState::Loading)
+        ));
     }
 
     #[test]
     fn r_key_outside_error_state_does_nothing() {
-        let mut app = App::new();
+        let mut app = app_in_my_issues_view();
         app.set_issues(vec![sample_issue("ENG-1")]);
 
         assert_eq!(handle_key(&mut app, KeyCode::Char('r')), None);

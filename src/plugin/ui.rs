@@ -1,7 +1,7 @@
-//! Rendering for the plugin TUI: a loading message, an error message with a retry
-//! hint, or a two-pane issue list + detail view.
+//! Rendering for the plugin TUI: a view-selection menu, a loading message, an error
+//! message with a retry hint, or a two-pane issue list + detail view.
 
-use crate::plugin::app::{App, AppState};
+use crate::plugin::app::{App, Screen, ViewState, MENU_OPTIONS};
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Modifier, Style},
@@ -10,13 +10,45 @@ use ratatui::{
 };
 
 pub fn draw(frame: &mut Frame, app: &App) {
-    match &app.state {
-        AppState::Loading => {
+    match &app.screen {
+        Screen::Menu { selected } => draw_menu(frame, *selected),
+        Screen::View(_, view_state) => draw_view(frame, view_state),
+    }
+}
+
+fn draw_menu(frame: &mut Frame, selected: usize) {
+    let items: Vec<ListItem> = MENU_OPTIONS
+        .iter()
+        .map(|(kind, available)| {
+            let label = if *available {
+                kind.label().to_string()
+            } else {
+                format!("{} (coming soon)", kind.label())
+            };
+            let style = if *available {
+                Style::default()
+            } else {
+                Style::default().add_modifier(Modifier::DIM)
+            };
+            ListItem::new(label).style(style)
+        })
+        .collect();
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title("Linear"))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let mut list_state = ListState::default();
+    list_state.select(Some(selected));
+    frame.render_stateful_widget(list, frame.area(), &mut list_state);
+}
+
+fn draw_view(frame: &mut Frame, view_state: &ViewState) {
+    match view_state {
+        ViewState::Loading => {
             let paragraph = Paragraph::new("Loading issues...")
                 .block(Block::default().borders(Borders::ALL).title("Linear"));
             frame.render_widget(paragraph, frame.area());
         }
-        AppState::Error { message } => {
+        ViewState::Error { message } => {
             let paragraph = Paragraph::new(format!("{message}\n\nPress r to retry."))
                 .wrap(Wrap { trim: true })
                 .block(
@@ -26,7 +58,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 );
             frame.render_widget(paragraph, frame.area());
         }
-        AppState::Loaded { issues, selected } => {
+        ViewState::Loaded { issues, selected } => {
             let chunks = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -113,15 +145,42 @@ mod tests {
             .collect()
     }
 
+    /// An `App` that has already entered the "My Issues" view (still `Loading`).
+    fn app_in_my_issues_view() -> App {
+        let mut app = App::new();
+        app.enter_selected_menu_option();
+        app
+    }
+
+    #[test]
+    fn renders_all_three_menu_options_on_start() {
+        let app = App::new();
+        let text = rendered_text(&app);
+
+        assert!(text.contains("My Issues"));
+        assert!(text.contains("Project Issues"));
+        assert!(text.contains("Team Issues"));
+    }
+
+    #[test]
+    fn marks_unavailable_menu_options_as_coming_soon() {
+        let app = App::new();
+        let text = rendered_text(&app);
+
+        assert!(text.contains("Project Issues (coming soon)"));
+        assert!(text.contains("Team Issues (coming soon)"));
+        assert!(!text.contains("My Issues (coming soon)"));
+    }
+
     #[test]
     fn renders_loading_message() {
-        let app = App::new();
+        let app = app_in_my_issues_view();
         assert!(rendered_text(&app).contains("Loading"));
     }
 
     #[test]
     fn renders_error_message_with_retry_hint() {
-        let mut app = App::new();
+        let mut app = app_in_my_issues_view();
         app.set_error("Authentication failed".to_string());
 
         let text = rendered_text(&app);
@@ -131,7 +190,7 @@ mod tests {
 
     #[test]
     fn renders_issue_identifier_and_title_in_the_list() {
-        let mut app = App::new();
+        let mut app = app_in_my_issues_view();
         app.set_issues(vec![sample_issue("ENG-1")]);
 
         let text = rendered_text(&app);
