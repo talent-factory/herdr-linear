@@ -1,12 +1,12 @@
 //! Composes existing `LinearClient` calls into what the plugin needs: the
-//! authenticated viewer's assigned issues, and the current project's open issues.
+//! authenticated viewer's open assigned issues, and the current project's open issues.
 
 use crate::plugin::{config, repo};
 use crate::{Issue, LinearClient, Project, Result};
 use serde_json::{json, Value};
 
 /// Page size used when paginating `get_issues`/`get_projects` to completion (see
-/// [`fetch_project_issues`]/[`fetch_all_projects`]). 50 matches `LinearClient`'s own
+/// [`fetch_issues_paginated`]/[`fetch_all_projects`]). 50 matches `LinearClient`'s own
 /// default; Linear's API caps a single page at 250 regardless of what's requested.
 const ISSUE_PAGE_SIZE: i32 = 50;
 const PROJECT_PAGE_SIZE: i32 = 250;
@@ -20,9 +20,10 @@ const MAX_PAGES: u32 = 20;
 
 /// A Linear issue filter matching open (not completed, not canceled) issues assigned to
 /// `user_id`. "Open" is expressed as an exclusion (`nin`) rather than an allowlist of the
-/// non-terminal state types (`backlog`/`unstarted`/`started`), so it stays correct if
-/// Linear ever adds another non-terminal state type — mirrors [`project_open_filter`].
-pub fn my_open_issues_filter(user_id: &str) -> Value {
+/// non-terminal state types (`triage`/`backlog`/`unstarted`/`started`), so it can't
+/// silently drop issues in a state type this code doesn't know about — mirrors
+/// [`project_open_filter`].
+pub fn assignee_open_filter(user_id: &str) -> Value {
     json!({
         "assignee": { "id": { "eq": user_id } },
         "state": { "type": { "nin": ["completed", "canceled"] } }
@@ -31,8 +32,9 @@ pub fn my_open_issues_filter(user_id: &str) -> Value {
 
 /// A Linear issue filter matching open (not completed, not canceled) issues in
 /// `project_id`. "Open" is expressed as an exclusion (`nin`) rather than an allowlist
-/// of the non-terminal state types (`backlog`/`unstarted`/`started`), so it stays
-/// correct if Linear ever adds another non-terminal state type.
+/// of the non-terminal state types (`triage`/`backlog`/`unstarted`/`started`), so it
+/// can't silently drop issues in a state type this code doesn't know about — mirrors
+/// [`assignee_open_filter`].
 pub fn project_open_filter(project_id: &str) -> Value {
     json!({
         "project": { "id": { "eq": project_id } },
@@ -40,27 +42,15 @@ pub fn project_open_filter(project_id: &str) -> Value {
     })
 }
 
-/// Fetch the open (not completed, not canceled) issues assigned to the currently
-/// authenticated user.
-///
-/// `LinearClient` has no dedicated "my issues" call, so this composes
-/// `get_viewer()` (to find the current user id) with `get_issues()` filtered
-/// to that id as assignee, excluding terminal-state issues so completed/canceled
-/// work doesn't clutter the daily list. Both underlying calls are already covered by
-/// `LinearClient`'s own tests; this function is thin composition on top.
-pub async fn fetch_my_issues(client: &LinearClient) -> Result<Vec<Issue>> {
-    let viewer = client.get_viewer().await?;
-    let connection = client
-        .get_issues(Some(my_open_issues_filter(&viewer.id)), Some(50), None)
-        .await?;
-    Ok(connection.nodes)
-}
-
-/// Fetch every open issue of `project_id`, following `pageInfo.hasNextPage` past a single
+/// Fetch every issue matching `filter`, following `pageInfo.hasNextPage` past a single
 /// `get_issues` page (a single page previously silently truncated an active project's
-/// backlog at 50 issues — see `MAX_PAGES` for the fetch's own upper bound).
-pub async fn fetch_project_issues(client: &LinearClient, project_id: &str) -> Result<Vec<Issue>> {
-    let filter = project_open_filter(project_id);
+/// backlog at 50 issues — see `MAX_PAGES` for the fetch's own upper bound). `warn_context`
+/// is folded into the truncation warning so callers stay distinguishable in logs.
+async fn fetch_issues_paginated(
+    client: &LinearClient,
+    filter: &Value,
+    warn_context: &str,
+) -> Result<Vec<Issue>> {
     let mut issues = Vec::new();
     let mut after: Option<String> = None;
     let mut page = 0u32;
@@ -79,7 +69,7 @@ pub async fn fetch_project_issues(client: &LinearClient, project_id: &str) -> Re
         }
         if page >= MAX_PAGES {
             tracing::warn!(
-                "Project {project_id} still has more open issues after {page} pages of \
+                "{warn_context}: still more open issues after {page} pages of \
                  {ISSUE_PAGE_SIZE} — showing the first {} only.",
                 issues.len()
             );
@@ -88,6 +78,31 @@ pub async fn fetch_project_issues(client: &LinearClient, project_id: &str) -> Re
     }
 
     Ok(issues)
+}
+
+/// Fetch the open (not completed, not canceled) issues assigned to the currently
+/// authenticated user, paginating past a single page the same way
+/// [`fetch_project_issues`] does (see [`fetch_issues_paginated`]) so a user with more
+/// than one page of open issues doesn't see a silently truncated list.
+///
+/// `LinearClient` has no dedicated "my issues" call, so this composes
+/// `get_viewer()` (to find the current user id) with `get_issues()` filtered
+/// to that id as assignee, excluding terminal-state issues so completed/canceled
+/// work doesn't clutter the daily list. `get_viewer()` is already covered by
+/// `LinearClient`'s own tests; this function is thin composition on top.
+pub async fn fetch_my_issues(client: &LinearClient) -> Result<Vec<Issue>> {
+    let viewer = client.get_viewer().await?;
+    let filter = assignee_open_filter(&viewer.id);
+    fetch_issues_paginated(client, &filter, "Your assigned issues").await
+}
+
+/// Fetch every open issue of `project_id`, following `pageInfo.hasNextPage` past a single
+/// `get_issues` page via [`fetch_issues_paginated`] (a single page previously silently
+/// truncated an active project's backlog at 50 issues — see `MAX_PAGES` for the fetch's
+/// own upper bound).
+pub async fn fetch_project_issues(client: &LinearClient, project_id: &str) -> Result<Vec<Issue>> {
+    let filter = project_open_filter(project_id);
+    fetch_issues_paginated(client, &filter, &format!("Project {project_id}")).await
 }
 
 /// Fetch every project in the workspace, following `pageInfo.hasNextPage` past a single
@@ -161,8 +176,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn my_open_issues_filter_matches_assignee_and_excludes_terminal_states() {
-        let filter = my_open_issues_filter("user-123");
+    fn assignee_open_filter_matches_assignee_and_excludes_terminal_states() {
+        let filter = assignee_open_filter("user-123");
 
         assert_eq!(filter["assignee"]["id"]["eq"], "user-123");
         assert_eq!(
