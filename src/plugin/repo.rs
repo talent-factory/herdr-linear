@@ -40,6 +40,10 @@ fn parse_repo_name_from_remote(remote_url: &str) -> Option<String> {
 /// deterministic and safe to unit test (see [`resolve_project_id`] for the override-aware
 /// entry point callers should use).
 pub fn match_project<'a>(repo_name: &str, projects: &'a [Project]) -> Result<&'a Project> {
+    if repo_name.trim().is_empty() {
+        return Err(no_match_error(repo_name));
+    }
+
     let repo_lower = repo_name.to_lowercase();
 
     let exact: Vec<&Project> = projects
@@ -248,6 +252,18 @@ mod tests {
     #[test]
     fn no_projects_at_all_errors() {
         let err = match_project("herdr-linear", &[]).unwrap_err();
+
+        assert!(err.to_string().contains("No Linear project matches"));
+    }
+
+    #[test]
+    fn empty_repo_name_never_matches_even_with_projects_present() {
+        let projects = vec![
+            test_project("p1", "some-project"),
+            test_project("p2", "another-project"),
+        ];
+
+        let err = match_project("", &projects).unwrap_err();
 
         assert!(err.to_string().contains("No Linear project matches"));
     }
