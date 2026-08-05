@@ -19,7 +19,12 @@ fn dispatch_launch_decision(args: &[String], stdin_content: &str) -> Option<Stri
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    if !args.is_empty() {
+    let is_recognized_flag = matches!(
+        args.first().map(String::as_str),
+        Some("--launch-decision") | Some("--launch-decision-tab")
+    );
+
+    if is_recognized_flag {
         let mut stdin_content = String::new();
         std::io::stdin().read_to_string(&mut stdin_content)?;
         if let Some(decision) = dispatch_launch_decision(&args, &stdin_content) {
