@@ -2,6 +2,7 @@
 //! Linear issues. See docs/superpowers/specs/2026-08-04-herdr-plugin-layer-design.md.
 
 use herdr_linear::plugin;
+use serde_json::json;
 use std::io::Read;
 
 /// Dispatch `--launch-decision` / `--launch-decision-tab` to the pure decision
@@ -122,6 +123,116 @@ async fn ensure_loaded(
     }
 }
 
+/// Runs the full "implement this issue" flow triggered by `<Enter>` on a selected issue:
+/// resolve the preferred coding agent, open a herdr tab running it, set the issue to its
+/// team's "In Progress" state, wait for the agent to become ready, then inject the implement
+/// prompt. Every failure sets a specific, actionable status banner on `app` instead of
+/// propagating — mirrors `ensure_loaded`'s "inline error instead of crashing" philosophy. See
+/// docs/superpowers/specs/2026-08-05-implement-on-enter-design.md for the full data flow.
+async fn start_implementation(
+    app: &mut plugin::app::App,
+    client: &herdr_linear::LinearClient,
+    issue: herdr_linear::Issue,
+) {
+    let herdr_bin = plugin::herdr_cli::herdr_bin();
+
+    let agent_list_json = match plugin::herdr_cli::agent_list(&herdr_bin).await {
+        Ok(json) => json,
+        Err(err) => {
+            app.set_status(format!("{}: {err}", issue.identifier), true);
+            return;
+        }
+    };
+    let derived = plugin::implement::resolve_preferred_agent(&agent_list_json);
+
+    let config_override = match plugin::config::load_agent_command_override() {
+        Ok(value) => value,
+        Err(err) => {
+            app.set_status(format!("{}: {err}", issue.identifier), true);
+            return;
+        }
+    };
+
+    let command =
+        plugin::implement::resolve_agent_command(derived.as_deref(), config_override.as_deref());
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+    let argv = plugin::implement::build_shell_argv(&shell, &command);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+    let started = match plugin::herdr_cli::agent_start(&herdr_bin, &command, &cwd, &argv).await {
+        Ok(started) => started,
+        Err(err) => {
+            app.set_status(
+                format!("{}: failed to start agent tab: {err}", issue.identifier),
+                true,
+            );
+            return;
+        }
+    };
+
+    let mut warnings = Vec::new();
+
+    if let Err(err) =
+        plugin::herdr_cli::tab_rename(&herdr_bin, &started.tab_id, &issue.identifier).await
+    {
+        warnings.push(format!("failed to rename tab: {err}"));
+    }
+
+    match client.get_workflow_states(&issue.team.id).await {
+        Ok(states) => match plugin::implement::pick_in_progress_state(&states) {
+            Some(state) => {
+                let updates = json!({ "stateId": state.id });
+                if let Err(err) = client.update_issue(&issue.id, updates).await {
+                    warnings.push(format!("failed to set state to In Progress: {err}"));
+                }
+            }
+            None => warnings.push("no \"In Progress\"-equivalent workflow state found".to_string()),
+        },
+        Err(err) => warnings.push(format!("failed to load workflow states: {err}")),
+    }
+
+    let prompt = plugin::implement::build_implement_prompt(&issue.identifier);
+
+    if let Err(err) =
+        plugin::herdr_cli::agent_wait(&herdr_bin, &started.pane_id, "idle", 30_000).await
+    {
+        app.set_status(
+            format!(
+                "{}: agent didn't become ready ({err}) — run manually: {prompt}",
+                issue.identifier
+            ),
+            true,
+        );
+        return;
+    }
+
+    if let Err(err) = plugin::herdr_cli::agent_send(&herdr_bin, &started.pane_id, &prompt).await {
+        app.set_status(
+            format!(
+                "{}: failed to send implement command ({err}) — run manually: {prompt}",
+                issue.identifier
+            ),
+            true,
+        );
+        return;
+    }
+
+    if warnings.is_empty() {
+        app.set_status(
+            format!(
+                "{}: tab opened, agent started, set to In Progress.",
+                issue.identifier
+            ),
+            false,
+        );
+    } else {
+        app.set_status(
+            format!("{}: started, but {}", issue.identifier, warnings.join("; ")),
+            true,
+        );
+    }
+}
+
 async fn event_loop(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     app: &mut plugin::app::App,
@@ -145,6 +256,23 @@ async fn event_loop(
                             // it's visible instead of leaving the stale previous frame.
                             terminal.draw(|frame| plugin::ui::draw(frame, app))?;
                             ensure_loaded(app, client).await;
+                        }
+                        plugin::app::Action::Implement(issue) => {
+                            app.set_status(
+                                format!("Starting implementation for {}…", issue.identifier),
+                                false,
+                            );
+                            terminal.draw(|frame| plugin::ui::draw(frame, app))?;
+                            match client.as_ref() {
+                                Some(c) => start_implementation(app, c, issue).await,
+                                None => app.set_status(
+                                    format!(
+                                        "{}: not connected to Linear yet — try again.",
+                                        issue.identifier
+                                    ),
+                                    true,
+                                ),
+                            }
                         }
                     }
                 }
