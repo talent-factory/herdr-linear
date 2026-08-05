@@ -237,11 +237,13 @@ echo 'api_key = "lin_api_your_key_here"' > "$(herdr plugin config-dir herdr-line
 
 Or export `LINEAR_API_KEY` in the environment Herdr runs in.
 
-Optionally set `agent_command` in the same `config.toml` to override the coding agent
-started when you implement an issue (see "Use" below). It defaults to `"hr"`, a
-personal shell alias — it won't exist for other users, so if you have no other herdr
-agent tabs open and don't set `agent_command`, either set it yourself or define an
-`hr` alias/function in your shell.
+Optionally set `agent_command` in the same `config.toml` as a **fallback** coding agent
+for when you implement an issue (see "Use" below). It is not the first choice: if any
+other herdr tab is already running a recognized coding agent, that agent is preferred
+over `agent_command` every time — the setting only takes effect when no other agent tab
+is open. It defaults to `"hr"`, a personal shell alias — it won't exist for other users,
+so if you have no other herdr agent tabs open and don't set `agent_command`, either set
+it yourself or define an `hr` alias/function in your shell.
 
 ### Use
 
@@ -271,6 +273,14 @@ the issue to "In Progress", and injects an implement prompt once the agent is re
 `r` to retry after an error, and `Esc` to return to the menu. Press `q` to quit the
 panel from anywhere (menu or view). Pressing the key again focuses the panel if it's
 open elsewhere, or closes it if it's already focused.
+
+> [!WARNING]
+> If you plan to use `<Enter>`, open the panel with the **split** action
+> (`herdr-linear.open-split`), not the tab one. A split pane inherits the directory of
+> the pane you split from; a fresh tab does not — it starts in the plugin's own install
+> directory. Since `<Enter>` starts the coding agent (and its new git worktree) in the
+> panel's own working directory, opening via `open-tab` will start it in the wrong
+> place. Read-only browsing (`o` to open in browser) is unaffected either way.
 
 ## License
 

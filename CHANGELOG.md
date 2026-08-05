@@ -38,6 +38,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - My Issues no longer lists completed/canceled issues (TF-582)
+- Implement-on-`<Enter>`: no longer silently falls back to `.` when the working
+  directory can't be determined — aborts with an actionable status instead, and the
+  README now documents that `<Enter>` needs the panel opened via the split action
+  (not the tab action), since only a split pane inherits the invoking pane's cwd
+  (TF-584)
+- Implement-on-`<Enter>`: a `q` pressed while the flow is blocking is now honored
+  (quits) instead of being silently discarded along with buffered input (TF-584)
+- `herdr_cli`'s response parsing now treats a top-level `{"error": ...}` body as a
+  failure even on a zero exit code, matching its own documented contract (TF-584)
 
 ### Removed
 - Unused `cli` Cargo feature (and its `clap` dependency), superseded by the `plugin` feature
