@@ -30,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("📋 Fetching issues...");
     match client.get_team_issues(&team_id, Some(5)).await {
         Ok(issues) => {
-            println!("✅ Found {} issues:\n", issues.total_count);
+            println!("✅ Found {} issues:\n", issues.nodes.len());
             for (i, issue) in issues.nodes.iter().take(3).enumerate() {
                 println!(
                     "  {}. {} [{}]\n     Title: {}\n     Assigned to: {}\n",
@@ -67,9 +67,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         println!("   Created: {}", issue.created_at);
                         println!("   Updated: {}", issue.updated_at);
-                        if !issue.labels.is_empty() {
+                        if !issue.labels.nodes.is_empty() {
                             print!("   Labels: ");
-                            for label in &issue.labels {
+                            for label in &issue.labels.nodes {
                                 print!("{} ", label.name);
                             }
                             println!();

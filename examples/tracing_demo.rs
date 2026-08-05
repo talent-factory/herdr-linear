@@ -43,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Example 2: Get teams
     match client.get_teams(Some(10), None).await {
         Ok(teams_conn) => {
-            info!("Found {} teams", teams_conn.total_count);
+            info!("Found {} teams", teams_conn.nodes.len());
             for team in teams_conn.nodes {
                 info!("  - {} ({})", team.name, team.key);
             }
@@ -56,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Example 3: Get issues (if teams exist)
     match client.get_issues(None, Some(5), None).await {
         Ok(issues_conn) => {
-            info!("Found {} issues", issues_conn.total_count);
+            info!("Found {} issues", issues_conn.nodes.len());
             for issue in issues_conn.nodes.iter().take(3) {
                 info!(
                     "  - {} [{}] ({})",

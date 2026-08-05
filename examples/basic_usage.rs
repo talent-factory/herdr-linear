@@ -20,7 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("📋 Fetching teams...");
     let teams = client.get_teams(Some(10), None).await?;
-    println!("✅ Found {} teams:\n", teams.total_count);
+    println!("✅ Found {} teams:\n", teams.nodes.len());
     for team in teams.nodes.iter().take(5) {
         println!("   • {} ({})", team.name, team.key);
     }
@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         match client.get_team_issues(&first_team.id, Some(5)).await {
             Ok(issues) => {
-                println!("   Found {} issues:", issues.total_count);
+                println!("   Found {} issues:", issues.nodes.len());
                 for issue in issues.nodes.iter().take(3) {
                     println!(
                         "     • {} [{}] - {}",

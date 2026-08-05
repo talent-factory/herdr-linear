@@ -79,7 +79,7 @@ mod tests {
             "estimate": null,
             "team": {
                 "id": "team-1", "key": "ENG", "name": "Engineering",
-                "description": null, "avatarUrl": null,
+                "description": null,
                 "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z"
             },
             "assignee": null,
@@ -94,7 +94,7 @@ mod tests {
             "completedAt": null,
             "cycle": null,
             "project": null,
-            "labels": [],
+            "labels": {"nodes": []},
             "url": format!("https://linear.app/team/issue/{identifier}")
         }))
         .expect("valid issue payload")
