@@ -1,8 +1,8 @@
 # herdr-plugin.toml — manifest for the herdr-linear plugin.
 #
-# A read-only "My Issues" panel for Linear: lists the authenticated user's assigned
-# issues in a herdr split pane or tab, with view details / open-in-browser. See
-# docs/superpowers/specs/2026-08-04-herdr-plugin-layer-design.md for the full design.
+# A "My Issues" panel for Linear: lists the authenticated user's assigned issues in a
+# herdr split pane or tab, with view details / open-in-browser / implement-on-Enter.
+# See docs/superpowers/specs/2026-08-04-herdr-plugin-layer-design.md for the full design.
 #
 # v1 targets linux/macos only. The [[build]] step is a plain `cargo build`, so
 # installing requires a Rust toolchain (no prebuilt-binary download yet).
@@ -10,7 +10,7 @@
 id = "herdr-linear"
 name = "herdr-linear"
 version = "0.1.0"
-description = "A read-only Linear issues panel for Herdr."
+description = "A Linear issues panel for Herdr, with implement-on-Enter."
 min_herdr_version = "0.7.0"
 platforms = ["linux", "macos"]
 

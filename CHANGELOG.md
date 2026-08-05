@@ -31,6 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   idempotent launcher scripts
 - Herdr plugin view switcher: menu-first interface allowing users to choose between
   My Issues and Project Issues (both implemented) and Team Issues (not yet available)
+- Implement-on-`<Enter>`: pressing Enter on a selected issue opens a herdr tab, starts
+  the preferred coding agent, sets the issue to "In Progress" via a real GraphQL
+  mutation, and injects an implement prompt once the agent is ready; configurable
+  `agent_command` fallback in `config.toml` (TF-584)
 
 ### Fixed
 - My Issues no longer lists completed/canceled issues (TF-582)

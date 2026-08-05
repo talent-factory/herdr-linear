@@ -214,8 +214,9 @@ https://linear.app/talent-factory/project/herdr-linear-10dca51ea35b/overview
 
 ## Herdr Plugin
 
-`herdr-linear` also ships as a [Herdr](https://herdr.dev) plugin: a read-only "My
-Issues" panel you can open as a split pane or a tab from inside a Herdr session.
+`herdr-linear` also ships as a [Herdr](https://herdr.dev) plugin: a "My Issues"
+panel you can open as a split pane or a tab from inside a Herdr session. Browsing
+issues is read-only; pressing `<Enter>` on a selected issue is not — see "Use" below.
 
 ### Install
 
@@ -235,6 +236,12 @@ echo 'api_key = "lin_api_your_key_here"' > "$(herdr plugin config-dir herdr-line
 ```
 
 Or export `LINEAR_API_KEY` in the environment Herdr runs in.
+
+Optionally set `agent_command` in the same `config.toml` to override the coding agent
+started when you implement an issue (see "Use" below). It defaults to `"hr"`, a
+personal shell alias — it won't exist for other users, so if you have no other herdr
+agent tabs open and don't set `agent_command`, either set it yourself or define an
+`hr` alias/function in your shell.
 
 ### Use
 
@@ -259,6 +266,8 @@ menu with three options: "My Issues" (available), "Project Issues" (coming soon)
 and "Team Issues" (coming soon). From the menu, use `↑`/`↓` to navigate options,
 `Enter` to open the highlighted view, and `q` or `Esc` to quit. Once inside a view,
 use `↑`/`↓` to navigate the issue list, `o` to open the selected issue in your browser,
+`<Enter>` to implement it (opens a herdr tab, starts the preferred coding agent, sets
+the issue to "In Progress", and injects an implement prompt once the agent is ready),
 `r` to retry after an error, and `Esc` to return to the menu. Press `q` to quit the
 panel from anywhere (menu or view). Pressing the key again focuses the panel if it's
 open elsewhere, or closes it if it's already focused.
