@@ -3,7 +3,7 @@
 
 use crate::plugin::app::{App, Screen, ViewKind, ViewState, MENU_OPTIONS};
 use ratatui::{
-    buffer::Buffer,
+    buffer::{Buffer, CellDiffOption},
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::Line,
@@ -69,15 +69,30 @@ struct Hyperlink<'a> {
 
 impl<'a> Hyperlink<'a> {
     fn new(text: Line<'a>, url: impl Into<String>) -> Self {
-        Self {
-            text,
-            url: url.into(),
-        }
+        // `url` ends up interpolated verbatim into a live OSC 8 escape
+        // sequence (`\x1b]8;;{url}\x1b\`). It's server-controlled (a Linear
+        // issue URL) rather than user-typed, but stripping ASCII control
+        // bytes (ESC, BEL, ...) before embedding avoids any chance of a
+        // malformed/compromised value prematurely terminating the escape
+        // sequence and injecting arbitrary bytes into the terminal — the
+        // same hardening `bat`/`eza --hyperlink` apply to hyperlink targets.
+        let url = url.into().chars().filter(|c| !c.is_control()).collect();
+        Self { text, url }
     }
 }
 
 impl Widget for &Hyperlink<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        if area.is_empty() {
+            // Guards against a squeezed layout (e.g. a very short terminal)
+            // handing us a zero-height area: `Paragraph::render` already
+            // no-ops on that, but the manual cell-overlay loop below does
+            // not check `area.height` and would otherwise write into
+            // `area.y`, which — for a zero-height area — is a real row
+            // belonging to whatever widget is rendered next to/around it.
+            return;
+        }
+
         Paragraph::new(self.text.clone()).render(area, buf);
 
         let link_width = self.url.chars().count();
@@ -99,6 +114,18 @@ impl Widget for &Hyperlink<'_> {
                 (false, false) => symbol,
             };
             cell.set_symbol(&wrapped);
+            // Without this, `Buffer::diff` computes this cell's display
+            // width from the raw symbol string via `unicode-width`, which
+            // has no concept of ANSI/OSC escape framing — every printable
+            // byte in the embedded OSC 8 sequence (the URL target, "]8;;",
+            // etc.) counts toward the computed width, making a single
+            // wrapped cell look tens of columns wide. `Terminal::draw` then
+            // treats that as one wide glyph and silently drops (skips) the
+            // following cells from the update it sends to the backend,
+            // blanking out the rest of the visible link text. Forcing the
+            // width back to 1 — this cell always represents exactly one
+            // visible terminal column — fixes that.
+            cell.set_diff_option(CellDiffOption::ForcedWidth(std::num::NonZeroU16::MIN));
         }
     }
 }
@@ -238,6 +265,36 @@ mod tests {
         rendered_text_with_size(app, 60, 15)
     }
 
+    /// Removes OSC 8 hyperlink escape sequences from `text`, leaving only
+    /// what a terminal would actually display. Without this, a naive
+    /// `contains(url)` check on `Hyperlink`-rendered text passes trivially
+    /// because the escape *open* sequence embeds the URL as its target
+    /// parameter (`\x1b]8;;{url}\x1b\`), regardless of whether the visible
+    /// characters that follow are correctly placed. Stripping escapes first
+    /// means assertions only pass if the reconstructed visible text is
+    /// actually correct.
+    fn strip_osc8_escapes(text: &str) -> String {
+        let mut result = String::new();
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c != '\x1b' {
+                result.push(c);
+                continue;
+            }
+            // Consume the rest of the escape sequence up to and including
+            // its ST terminator (`\x1b\`), dropping it entirely.
+            let mut prev = c;
+            for next in chars.by_ref() {
+                let terminated = prev == '\x1b' && next == '\\';
+                prev = next;
+                if terminated {
+                    break;
+                }
+            }
+        }
+        result
+    }
+
     /// An `App` that has already entered the "My Issues" view (still `Loading`).
     fn app_in_my_issues_view() -> App {
         let mut app = App::new();
@@ -361,10 +418,52 @@ mod tests {
         app.set_issues(vec![sample_issue("ENG-3")]);
 
         let text = rendered_text_with_size(&app, 100, 20);
-        // The URL is OSC 8-wrapped by `Hyperlink` (covered separately by the
-        // `hyperlink_*` tests above), so "URL: " and the URL text are no
-        // longer one contiguous substring — check both are present instead.
-        assert!(text.contains("URL: "));
-        assert!(text.contains("https://linear.app/team/issue/ENG-3"));
+        // The URL is OSC 8-wrapped by `Hyperlink`, so strip escapes first —
+        // otherwise this would pass trivially off the escape sequence's
+        // target parameter alone, without actually checking that the
+        // visible characters are placed correctly (that placement math is
+        // exercised directly by the `hyperlink_*` tests above; this test's
+        // job is to confirm `draw_view` wires the footer up at all).
+        let visible = strip_osc8_escapes(&text);
+        assert!(visible.contains("URL: https://linear.app/team/issue/ENG-3"));
+    }
+
+    #[test]
+    fn hyperlink_renders_nothing_on_a_zero_height_area() {
+        let hyperlink = Hyperlink::new(
+            Line::from("URL: https://example.com"),
+            "https://example.com",
+        );
+        let area = Rect::new(0, 0, 30, 0);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 30, 1));
+
+        // Render into a zero-height sub-area of a 1-row buffer; the row
+        // must be left completely untouched (regression test for a bug
+        // where the manual cell-overlay loop ignored `area.height` and
+        // wrote into `area.y` regardless).
+        Widget::render(&hyperlink, area, &mut buf);
+
+        for x in 0..30 {
+            assert_eq!(buf.cell((x, 0)).unwrap().symbol(), " ");
+        }
+    }
+
+    #[test]
+    fn hyperlink_stays_within_bounds_when_the_area_is_narrower_than_the_label() {
+        let url = "https://example.com";
+        let hyperlink = Hyperlink::new(Line::from(format!("URL: {url}")), url);
+        // "URL: " is 5 visible chars; a 4-wide area clips before the link
+        // portion of the line would even start (link start = 25 - 20 = 5,
+        // clamped to the 4-wide area — so the overlay range collapses to
+        // empty and nothing beyond column 3 is ever touched).
+        let area = Rect::new(0, 0, 4, 1);
+        let mut buf = Buffer::empty(area);
+
+        Widget::render(&hyperlink, area, &mut buf);
+
+        for x in 0..4 {
+            let symbol = buf.cell((x, 0)).unwrap().symbol();
+            assert!(!symbol.contains('\x1b'), "cell {x} was {symbol:?}");
+        }
     }
 }
