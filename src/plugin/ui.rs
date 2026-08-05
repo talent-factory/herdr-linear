@@ -43,6 +43,20 @@ fn draw_menu(frame: &mut Frame, selected: usize) {
     frame.render_stateful_widget(list, frame.area(), &mut list_state);
 }
 
+/// `tui-markdown`'s default `StyleSheet` renders heading markers literally
+/// (e.g. `"# Heading"`), which reads as raw Markdown syntax rather than a
+/// distinctly-formatted heading. This override drops the marker; the heading
+/// is still visually distinct via `StyleSheet::heading`'s bold/underline
+/// style (unchanged from the default).
+#[derive(Clone)]
+struct MarkdownStyleSheet;
+
+impl tui_markdown::StyleSheet for MarkdownStyleSheet {
+    fn heading_marker(&self, _level: u8) -> &str {
+        ""
+    }
+}
+
 /// A single-line widget that renders `text` normally, then wraps the trailing
 /// `url.chars().count()` cells — the URL substring at the end of `text`, e.g.
 /// `"URL: {url}"` — in an OSC 8 terminal hyperlink escape sequence. The escape
@@ -123,19 +137,40 @@ fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState) {
             list_state.select(Some(*selected));
             frame.render_stateful_widget(list, chunks[0], &mut list_state);
 
-            let detail = issues
-                .get(*selected)
-                .map(|issue| {
-                    format!(
-                        "{}\n\n{}\n\nState: {}\nURL: {}",
-                        issue.identifier, issue.title, issue.state.name, issue.url
-                    )
-                })
-                .unwrap_or_default();
-            let detail_widget = Paragraph::new(detail)
-                .wrap(Wrap { trim: true })
-                .block(Block::default().borders(Borders::ALL).title("Detail"));
-            frame.render_widget(detail_widget, chunks[1]);
+            let detail_block = Block::default().borders(Borders::ALL).title("Detail");
+            let detail_area = detail_block.inner(chunks[1]);
+            frame.render_widget(detail_block, chunks[1]);
+
+            if let Some(issue) = issues.get(*selected) {
+                let sections = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(5),
+                        Constraint::Min(0),
+                        Constraint::Length(1),
+                    ])
+                    .split(detail_area);
+
+                let header = Paragraph::new(format!(
+                    "{}\n\n{}\n\nState: {}",
+                    issue.identifier, issue.title, issue.state.name
+                ))
+                .wrap(Wrap { trim: true });
+                frame.render_widget(header, sections[0]);
+
+                let description = issue.description.as_deref().unwrap_or_default();
+                let options = tui_markdown::Options::new(MarkdownStyleSheet);
+                let body = Paragraph::new(tui_markdown::from_str_with_options(
+                    description,
+                    &options,
+                ))
+                .wrap(Wrap { trim: true });
+                frame.render_widget(body, sections[1]);
+
+                let hyperlink =
+                    Hyperlink::new(Line::from(format!("URL: {}", issue.url)), issue.url.clone());
+                frame.render_widget(&hyperlink, sections[2]);
+            }
         }
     }
 }
@@ -148,12 +183,12 @@ mod tests {
     use ratatui::{backend::TestBackend, Terminal};
     use serde_json::json;
 
-    fn sample_issue(identifier: &str) -> Issue {
-        serde_json::from_value(json!({
+    fn sample_issue_json(identifier: &str, description: Option<&str>) -> serde_json::Value {
+        json!({
             "id": format!("issue-{identifier}"),
             "identifier": identifier,
             "title": format!("Title for {identifier}"),
-            "description": null,
+            "description": description,
             "state": {"id": "state-1", "name": "In Progress", "type": "started"},
             "priority": 2,
             "estimate": null,
@@ -176,12 +211,20 @@ mod tests {
             "project": null,
             "labels": {"nodes": []},
             "url": format!("https://linear.app/team/issue/{identifier}")
-        }))
-        .expect("valid issue payload")
+        })
     }
 
-    fn rendered_text(app: &App) -> String {
-        let backend = TestBackend::new(60, 15);
+    fn sample_issue(identifier: &str) -> Issue {
+        serde_json::from_value(sample_issue_json(identifier, None)).expect("valid issue payload")
+    }
+
+    fn sample_issue_with_description(identifier: &str, description: &str) -> Issue {
+        serde_json::from_value(sample_issue_json(identifier, Some(description)))
+            .expect("valid issue payload")
+    }
+
+    fn rendered_text_with_size(app: &App, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, app)).unwrap();
         terminal
@@ -191,6 +234,10 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    fn rendered_text(app: &App) -> String {
+        rendered_text_with_size(app, 60, 15)
     }
 
     /// An `App` that has already entered the "My Issues" view (still `Loading`).
@@ -289,5 +336,37 @@ mod tests {
 
         let cell = buf.cell((0, 0)).unwrap().symbol().to_string();
         assert_eq!(cell, "\x1b]8;;x\x1b\\x\x1b]8;;\x1b\\");
+    }
+
+    #[test]
+    fn renders_issue_description_as_formatted_markdown() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue_with_description(
+            "ENG-2",
+            "# Heading\n\n- item one\n- item two\n\n**bold** and `code`",
+        )]);
+
+        let text = rendered_text(&app);
+        assert!(text.contains("Heading"));
+        assert!(!text.contains("# Heading"));
+        assert!(text.contains("item one"));
+        assert!(text.contains("item two"));
+        assert!(text.contains("bold"));
+        assert!(!text.contains("**bold**"));
+        assert!(text.contains("code"));
+        assert!(!text.contains("`code`"));
+    }
+
+    #[test]
+    fn renders_issue_url_in_the_detail_footer() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-3")]);
+
+        let text = rendered_text_with_size(&app, 100, 20);
+        // The URL is OSC 8-wrapped by `Hyperlink` (covered separately by the
+        // `hyperlink_*` tests above), so "URL: " and the URL text are no
+        // longer one contiguous substring — check both are present instead.
+        assert!(text.contains("URL: "));
+        assert!(text.contains("https://linear.app/team/issue/ENG-3"));
     }
 }
