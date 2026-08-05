@@ -23,7 +23,7 @@ struct AgentEntry {
 /// already-unwrapped `result` value — see [`crate::plugin::herdr_cli::agent_list`]): the most
 /// frequent non-null `agent` value across all reported agent panes, ties broken by first-seen
 /// order. Returns `None` on unparseable JSON, an empty agent list, or when every entry's
-/// `agent` is null/absent — all of which fall through to [`resolve_agent_command`]'s
+/// `agent` is null/absent/blank — all of which fall through to [`resolve_agent_command`]'s
 /// config/default path.
 pub fn resolve_preferred_agent(agent_list_json: &str) -> Option<String> {
     let parsed: AgentListResult = serde_json::from_str(agent_list_json).ok()?;
@@ -35,6 +35,9 @@ pub fn resolve_preferred_agent(agent_list_json: &str) -> Option<String> {
         let Some(agent) = entry.agent.as_deref() else {
             continue;
         };
+        if agent.trim().is_empty() {
+            continue;
+        }
 
         *counts.entry(agent).or_insert(0) += 1;
         if !order.contains(&agent) {
@@ -47,7 +50,7 @@ pub fn resolve_preferred_agent(agent_list_json: &str) -> Option<String> {
     }
 
     // `max_by_key` returns the *last* element among ties, so iterate in reverse to make the
-    // *first*-seen agent win ties (see the `_breaks_ties_by_first_seen_order` test above).
+    // *first*-seen agent win ties (see the `_breaks_ties_by_first_seen_order` test below).
     order
         .iter()
         .rev()
@@ -58,10 +61,7 @@ pub fn resolve_preferred_agent(agent_list_json: &str) -> Option<String> {
 /// Resolve the final agent command: `derived` (from other open tabs) wins, then
 /// `config_override` (`agent_command` in `config.toml`), then the `"hr"` default.
 pub fn resolve_agent_command(derived: Option<&str>, config_override: Option<&str>) -> String {
-    derived
-        .or(config_override)
-        .unwrap_or("hr")
-        .to_string()
+    derived.or(config_override).unwrap_or("hr").to_string()
 }
 
 /// Build the argv to run `command` through an interactive instance of `shell`, so both a bare
@@ -137,16 +137,20 @@ mod tests {
     }
 
     #[test]
+    fn resolve_preferred_agent_returns_none_when_every_agent_is_blank() {
+        let json = r#"{"agents":[{"agent":""},{"agent":"   "}]}"#;
+
+        assert_eq!(resolve_preferred_agent(json), None);
+    }
+
+    #[test]
     fn resolve_preferred_agent_returns_none_for_malformed_json() {
         assert_eq!(resolve_preferred_agent("not json"), None);
     }
 
     #[test]
     fn resolve_agent_command_prefers_the_derived_agent() {
-        assert_eq!(
-            resolve_agent_command(Some("claude"), Some("hr")),
-            "claude"
-        );
+        assert_eq!(resolve_agent_command(Some("claude"), Some("hr")), "claude");
     }
 
     #[test]
@@ -208,7 +212,10 @@ mod tests {
 
     #[test]
     fn pick_in_progress_state_returns_none_when_no_state_matches() {
-        let states = vec![state("s1", "Backlog", "backlog"), state("s2", "Done", "completed")];
+        let states = vec![
+            state("s1", "Backlog", "backlog"),
+            state("s2", "Done", "completed"),
+        ];
 
         assert_eq!(pick_in_progress_state(&states), None);
     }

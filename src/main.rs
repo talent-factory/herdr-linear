@@ -273,6 +273,14 @@ async fn event_loop(
                                     true,
                                 ),
                             }
+
+                            // Flush any input that arrived while the flow above was
+                            // blocking (up to ~31s) — a buffered keypress (e.g. a second
+                            // <Enter>) must not replay as a fresh action once we're back
+                            // to polling.
+                            while crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                                crossterm::event::read()?;
+                            }
                         }
                     }
                 }

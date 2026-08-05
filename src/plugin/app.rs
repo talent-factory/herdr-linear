@@ -151,14 +151,14 @@ impl App {
             return None;
         }
         self.screen = Screen::View(option.kind, ViewState::Loading);
-        self.status = None;
+        self.clear_status();
         Some(Action::EnterView)
     }
 
     /// Returns to the menu, selection reset to the first option.
     pub fn return_to_menu(&mut self) {
         self.screen = Screen::Menu { selected: 0 };
-        self.status = None;
+        self.clear_status();
     }
 
     /// The kind of the currently entered view, or `None` if on the menu.
