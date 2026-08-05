@@ -254,10 +254,14 @@ command = "herdr-linear.open-tab"
 description = "Open Linear panel (tab)"
 ```
 
-Reload the config, then press the bound key: `↑`/`↓` to navigate issues, `o` to
-open the selected issue in your browser, `r` to retry after an error, `q`/`Esc` to
-quit. Pressing the key again focuses the panel if it's open elsewhere, or closes it
-if it's already focused.
+Reload the config, then press the bound key to open the plugin. The panel opens on a
+menu with three options: "My Issues" (available), "Project Issues" (coming soon),
+and "Team Issues" (coming soon). Use `↑`/`↓` to navigate the menu, `Enter` to open
+the highlighted view. Once inside a view, use `↑`/`↓` to navigate the issue list,
+`o` to open the selected issue in your browser, `r` to retry after an error, and
+`Esc` to return to the menu. Press `q` to quit from anywhere (menu or view).
+Pressing the key again focuses the panel if it's open elsewhere, or closes it if
+it's already focused.
 
 ## License
 
