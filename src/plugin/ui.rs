@@ -12,7 +12,7 @@ use ratatui::{
 pub fn draw(frame: &mut Frame, app: &App) {
     match app.screen() {
         Screen::Menu { selected } => draw_menu(frame, *selected),
-        Screen::View(kind, view_state) => draw_view(frame, *kind, view_state),
+        Screen::View(kind, view_state) => draw_view(frame, *kind, view_state, app.status()),
     }
 }
 
@@ -41,7 +41,12 @@ fn draw_menu(frame: &mut Frame, selected: usize) {
     frame.render_stateful_widget(list, frame.area(), &mut list_state);
 }
 
-fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState) {
+fn draw_view(
+    frame: &mut Frame,
+    kind: ViewKind,
+    view_state: &ViewState,
+    status: Option<(&str, bool)>,
+) {
     match view_state {
         ViewState::Loading => {
             let paragraph = Paragraph::new("Loading issues...")
@@ -59,10 +64,26 @@ fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState) {
             frame.render_widget(paragraph, frame.area());
         }
         ViewState::Loaded { issues, selected } => {
+            let area = if let Some((text, is_error)) = status {
+                let outer = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(3), Constraint::Length(1)])
+                    .split(frame.area());
+                let style = if is_error {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                frame.render_widget(Paragraph::new(text).style(style), outer[1]);
+                outer[0]
+            } else {
+                frame.area()
+            };
+
             let chunks = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(frame.area());
+                .split(area);
 
             let items: Vec<ListItem> = issues
                 .iter()
@@ -91,6 +112,7 @@ fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState) {
         }
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -190,6 +212,36 @@ mod tests {
 
     #[test]
     fn renders_issue_identifier_and_title_in_the_list() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+
+        let text = rendered_text(&app);
+        assert!(text.contains("ENG-1"));
+        assert!(text.contains("Title for ENG-1"));
+    }
+
+    #[test]
+    fn renders_the_status_banner_when_present() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        app.set_status("ENG-1: tab opened, agent started, set to In Progress.".to_string(), false);
+
+        let text = rendered_text(&app);
+        assert!(text.contains("ENG-1: tab opened, agent started, set to In Progress."));
+    }
+
+    #[test]
+    fn renders_an_error_status_banner() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        app.set_status("ENG-1: failed to start agent tab: boom".to_string(), true);
+
+        let text = rendered_text(&app);
+        assert!(text.contains("ENG-1: failed to start agent tab: boom"));
+    }
+
+    #[test]
+    fn renders_without_a_status_banner_when_none_is_set() {
         let mut app = app_in_my_issues_view();
         app.set_issues(vec![sample_issue("ENG-1")]);
 
