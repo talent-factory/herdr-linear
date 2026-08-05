@@ -18,9 +18,15 @@ const PROJECT_PAGE_SIZE: i32 = 250;
 /// a few thousand records at worst, not an unbounded one.
 const MAX_PAGES: u32 = 20;
 
-/// A Linear issue filter matching issues assigned to `user_id`.
-pub fn assignee_filter(user_id: &str) -> Value {
-    json!({ "assignee": { "id": { "eq": user_id } } })
+/// A Linear issue filter matching open (not completed, not canceled) issues assigned to
+/// `user_id`. "Open" is expressed as an exclusion (`nin`) rather than an allowlist of the
+/// non-terminal state types (`backlog`/`unstarted`/`started`), so it stays correct if
+/// Linear ever adds another non-terminal state type — mirrors [`project_open_filter`].
+pub fn my_open_issues_filter(user_id: &str) -> Value {
+    json!({
+        "assignee": { "id": { "eq": user_id } },
+        "state": { "type": { "nin": ["completed", "canceled"] } }
+    })
 }
 
 /// A Linear issue filter matching open (not completed, not canceled) issues in
@@ -34,16 +40,18 @@ pub fn project_open_filter(project_id: &str) -> Value {
     })
 }
 
-/// Fetch the issues assigned to the currently authenticated user.
+/// Fetch the open (not completed, not canceled) issues assigned to the currently
+/// authenticated user.
 ///
 /// `LinearClient` has no dedicated "my issues" call, so this composes
 /// `get_viewer()` (to find the current user id) with `get_issues()` filtered
-/// to that id as assignee. Both underlying calls are already covered by
+/// to that id as assignee, excluding terminal-state issues so completed/canceled
+/// work doesn't clutter the daily list. Both underlying calls are already covered by
 /// `LinearClient`'s own tests; this function is thin composition on top.
 pub async fn fetch_my_issues(client: &LinearClient) -> Result<Vec<Issue>> {
     let viewer = client.get_viewer().await?;
     let connection = client
-        .get_issues(Some(assignee_filter(&viewer.id)), Some(50), None)
+        .get_issues(Some(my_open_issues_filter(&viewer.id)), Some(50), None)
         .await?;
     Ok(connection.nodes)
 }
@@ -153,10 +161,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn assignee_filter_matches_on_the_given_user_id() {
-        let filter = assignee_filter("user-123");
+    fn my_open_issues_filter_matches_assignee_and_excludes_terminal_states() {
+        let filter = my_open_issues_filter("user-123");
 
         assert_eq!(filter["assignee"]["id"]["eq"], "user-123");
+        assert_eq!(
+            filter["state"]["type"]["nin"],
+            json!(["completed", "canceled"])
+        );
     }
 
     #[test]
