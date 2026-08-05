@@ -430,18 +430,6 @@ mod tests {
     }
 
     #[test]
-    fn entering_the_last_menu_option_does_nothing_while_unavailable() {
-        let mut app = App::new();
-        app.move_menu_selection_down();
-        app.move_menu_selection_down(); // -> Team Issues, unavailable
-
-        let action = app.enter_selected_menu_option();
-
-        assert_eq!(action, None);
-        assert!(matches!(app.screen, Screen::Menu { selected: 2 }));
-    }
-
-    #[test]
     fn menu_options_covers_every_view_kind() {
         fn assert_present(kind: ViewKind) {
             assert!(

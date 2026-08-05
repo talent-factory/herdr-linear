@@ -2,8 +2,21 @@
 //! authenticated viewer's assigned issues, and the current project's open issues.
 
 use crate::plugin::{config, repo};
-use crate::{Issue, LinearClient, Result};
+use crate::{Issue, LinearClient, Project, Result};
 use serde_json::{json, Value};
+
+/// Page size used when paginating `get_issues`/`get_projects` to completion (see
+/// [`fetch_project_issues`]/[`fetch_all_projects`]). 50 matches `LinearClient`'s own
+/// default; Linear's API caps a single page at 250 regardless of what's requested.
+const ISSUE_PAGE_SIZE: i32 = 50;
+const PROJECT_PAGE_SIZE: i32 = 250;
+
+/// Hang/cost guard on the pagination loops below: stop after this many pages even if
+/// Linear still reports more, logging a warning rather than fetching indefinitely. Chosen
+/// generously above any real project's open-issue count or workspace's project count —
+/// hitting it means something (a filter bug, a runaway workspace) — but it's a fetch of
+/// a few thousand records at worst, not an unbounded one.
+const MAX_PAGES: u32 = 20;
 
 /// A Linear issue filter matching issues assigned to `user_id`.
 pub fn assignee_filter(user_id: &str) -> Value {
@@ -35,29 +48,103 @@ pub async fn fetch_my_issues(client: &LinearClient) -> Result<Vec<Issue>> {
     Ok(connection.nodes)
 }
 
-/// Fetch the open issues of `project_id`.
+/// Fetch every open issue of `project_id`, following `pageInfo.hasNextPage` past a single
+/// `get_issues` page (a single page previously silently truncated an active project's
+/// backlog at 50 issues — see `MAX_PAGES` for the fetch's own upper bound).
 pub async fn fetch_project_issues(client: &LinearClient, project_id: &str) -> Result<Vec<Issue>> {
-    let connection = client
-        .get_issues(Some(project_open_filter(project_id)), Some(50), None)
-        .await?;
-    Ok(connection.nodes)
+    let filter = project_open_filter(project_id);
+    let mut issues = Vec::new();
+    let mut after: Option<String> = None;
+    let mut page = 0u32;
+
+    loop {
+        page += 1;
+        let connection = client
+            .get_issues(Some(filter.clone()), Some(ISSUE_PAGE_SIZE), after.take())
+            .await?;
+        let has_next_page = connection.page_info.has_next_page;
+        after = connection.page_info.end_cursor.clone();
+        issues.extend(connection.nodes);
+
+        if !has_next_page || after.is_none() {
+            break;
+        }
+        if page >= MAX_PAGES {
+            tracing::warn!(
+                "Project {project_id} still has more open issues after {page} pages of \
+                 {ISSUE_PAGE_SIZE} — showing the first {} only.",
+                issues.len()
+            );
+            break;
+        }
+    }
+
+    Ok(issues)
+}
+
+/// Fetch every project in the workspace, following `pageInfo.hasNextPage` past a single
+/// `get_projects` page. Needed because [`fetch_current_project_issues`] must search the
+/// whole workspace by name — a single 250-project page previously made a project past
+/// that point silently unmatchable, surfacing as a misleading "no project matches" error
+/// instead of a pagination gap (see `MAX_PAGES` for the fetch's own upper bound).
+async fn fetch_all_projects(client: &LinearClient) -> Result<Vec<Project>> {
+    let mut projects = Vec::new();
+    let mut after: Option<String> = None;
+    let mut page = 0u32;
+
+    loop {
+        page += 1;
+        let connection = client
+            .get_projects(None, Some(PROJECT_PAGE_SIZE), after.take())
+            .await?;
+        let has_next_page = connection.page_info.has_next_page;
+        after = connection.page_info.end_cursor.clone();
+        projects.extend(connection.nodes);
+
+        if !has_next_page || after.is_none() {
+            break;
+        }
+        if page >= MAX_PAGES {
+            tracing::warn!(
+                "Workspace still has more projects after {page} pages of {PROJECT_PAGE_SIZE} \
+                 — project name matching may miss projects beyond the {} fetched. Set \
+                 `project_id` in config.toml to bypass name matching.",
+                projects.len()
+            );
+            break;
+        }
+    }
+
+    Ok(projects)
 }
 
 /// Resolve the Linear project matching the current working directory, then fetch its
 /// open issues.
 ///
-/// Composes `repo::detect_repo_name` (CWD/git remote), `config::load_project_id_override`
-/// (config.toml), `client.get_projects` (network), and `repo::resolve_project_id` (name
-/// matching or override short-circuit) to find the project id, then delegates to
-/// `fetch_project_issues`. Re-runs every step on each call — no caching — so a
-/// `config.toml` edit or a `git remote` change between calls (e.g. across a retry) is
-/// picked up rather than served stale.
+/// A configured `project_id` override short-circuits entirely: `resolve_project_id`
+/// returns it without ever consulting `repo_name`/`projects` (see its doc comment), so
+/// this skips `detect_repo_name`'s git subprocess and the `get_projects` network fetch in
+/// that case rather than paying for both only to discard the result — and, just as
+/// importantly, means a workspace-wide project fetch failing (bad scope, timeout) can't
+/// break a view whose project id was already known from config.
+///
+/// Without an override, this composes `repo::detect_repo_name` (CWD/git remote),
+/// `fetch_all_projects` (network, paginated), and `repo::resolve_project_id` (name
+/// matching) to find the project id, then delegates to `fetch_project_issues`. Re-runs
+/// every step on each call — no caching — so a `config.toml` edit or a `git remote`
+/// change between calls (e.g. across a retry) is picked up rather than served stale.
 pub async fn fetch_current_project_issues(client: &LinearClient) -> Result<Vec<Issue>> {
-    let repo_name = repo::detect_repo_name();
     let project_id_override = config::load_project_id_override()?;
-    let projects = client.get_projects(None, Some(250)).await?;
-    let project_id =
-        repo::resolve_project_id(project_id_override.as_deref(), &repo_name, &projects.nodes)?;
+
+    let project_id = match project_id_override {
+        Some(id) => id,
+        None => {
+            let repo_name = repo::detect_repo_name();
+            let projects = fetch_all_projects(client).await?;
+            repo::resolve_project_id(None, &repo_name, &projects)?
+        }
+    };
+
     fetch_project_issues(client, &project_id).await
 }
 
