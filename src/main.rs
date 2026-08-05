@@ -72,17 +72,31 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn load_issues(app: &mut plugin::app::App, client: &herdr_linear::LinearClient) {
-    match plugin::data::fetch_my_issues(client).await {
-        Ok(issues) => app.set_issues(issues),
-        Err(err) => app.set_error(err.to_string()),
+    match app.current_view() {
+        Some(plugin::app::ViewKind::MyIssues) => {
+            match plugin::data::fetch_my_issues(client).await {
+                Ok(issues) => app.set_issues(issues),
+                Err(err) => app.set_error(err.to_string()),
+            }
+        }
+        Some(kind) => {
+            // The menu only lets an `available` `MENU_OPTIONS` entry be entered, so
+            // this arm should be unreachable today — but it's one flipped `bool`
+            // away from becoming reachable the moment TF-578/TF-579 land without
+            // this match also being updated. Degrade to the same error screen a
+            // fetch failure would produce rather than panicking the whole TUI.
+            app.set_error(format!("{} isn't available yet.", kind.label()));
+        }
+        None => {}
     }
 }
 
 /// Build the `LinearClient` if it doesn't exist yet (resolving config, then
-/// constructing the client), then fetch issues through it. On a config/client
-/// failure, sets an inline error on `app` instead of propagating — this is what
-/// lets a missing/invalid API key show up in the TUI rather than crashing the
-/// process, and lets `r` (retry) recover from a config typo without a restart.
+/// constructing the client), then fetch issues for the currently entered view
+/// through it. On a config/client failure, sets an inline error on `app` instead of
+/// propagating — this is what lets a missing/invalid API key show up in the TUI
+/// rather than crashing the process, and lets `r` (retry) recover from a config
+/// typo without a restart.
 async fn ensure_loaded(
     app: &mut plugin::app::App,
     client: &mut Option<herdr_linear::LinearClient>,
@@ -107,12 +121,6 @@ async fn event_loop(
     app: &mut plugin::app::App,
     client: &mut Option<herdr_linear::LinearClient>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Draw the initial `Loading` state before the (possibly slow) config/client
-    // setup and network round-trip, so the user sees "Loading issues..." instead
-    // of a blank alternate screen while it's in flight.
-    terminal.draw(|frame| plugin::ui::draw(frame, app))?;
-    ensure_loaded(app, client).await;
-
     loop {
         terminal.draw(|frame| plugin::ui::draw(frame, app))?;
 
@@ -124,10 +132,11 @@ async fn event_loop(
                         plugin::app::Action::OpenInBrowser(url) => {
                             let _ = open::that(url);
                         }
-                        plugin::app::Action::Retry => {
-                            // `handle_key` already moved `app` back to `Loading`;
-                            // draw that before the retry's own round-trip so it's
-                            // visible instead of leaving the stale previous frame.
+                        plugin::app::Action::Retry | plugin::app::Action::EnterView => {
+                            // `handle_key` already moved `app` into `Loading` — either
+                            // retrying the current view or entering a newly selected
+                            // one; draw that before the fetch's own round-trip so
+                            // it's visible instead of leaving the stale previous frame.
                             terminal.draw(|frame| plugin::ui::draw(frame, app))?;
                             ensure_loaded(app, client).await;
                         }

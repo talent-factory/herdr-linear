@@ -29,6 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retry on error), API key resolution from the plugin config file or `LINEAR_API_KEY`,
   the `herdr-plugin.toml` manifest, and the `scripts/open-split.sh` / `scripts/open-tab.sh`
   idempotent launcher scripts
+- Herdr plugin view switcher: menu-first interface allowing users to choose between
+  My Issues (implemented), Project Issues, and Team Issues (both not yet available)
 
 ### Fixed
 - N/A
