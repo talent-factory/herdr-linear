@@ -46,9 +46,6 @@ fn install_panic_hook() {
 }
 
 async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
-    let api_key = plugin::config::load()?;
-    let client = herdr_linear::LinearClient::new(api_key)?;
-
     install_panic_hook();
 
     crossterm::terminal::enable_raw_mode()?;
@@ -58,14 +55,18 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = ratatui::Terminal::new(backend)?;
 
     let mut app = plugin::app::App::new();
-    let result = event_loop(&mut terminal, &mut app, &client).await;
+    let mut client: Option<herdr_linear::LinearClient> = None;
+    let result = event_loop(&mut terminal, &mut app, &mut client).await;
 
-    crossterm::terminal::disable_raw_mode()?;
-    crossterm::execute!(
+    // Always attempt full teardown, even if an earlier step in it failed, so a
+    // panic-free error path never leaves the terminal in raw mode / alternate
+    // screen / hidden-cursor. The event loop's actual `Result` is still returned.
+    let _ = crossterm::terminal::disable_raw_mode();
+    let _ = crossterm::execute!(
         terminal.backend_mut(),
         crossterm::terminal::LeaveAlternateScreen
-    )?;
-    terminal.show_cursor()?;
+    );
+    let _ = terminal.show_cursor();
 
     result
 }
@@ -77,12 +78,40 @@ async fn load_issues(app: &mut plugin::app::App, client: &herdr_linear::LinearCl
     }
 }
 
+/// Build the `LinearClient` if it doesn't exist yet (resolving config, then
+/// constructing the client), then fetch issues through it. On a config/client
+/// failure, sets an inline error on `app` instead of propagating — this is what
+/// lets a missing/invalid API key show up in the TUI rather than crashing the
+/// process, and lets `r` (retry) recover from a config typo without a restart.
+async fn ensure_loaded(
+    app: &mut plugin::app::App,
+    client: &mut Option<herdr_linear::LinearClient>,
+) {
+    if client.is_none() {
+        match plugin::config::load().and_then(herdr_linear::LinearClient::new) {
+            Ok(c) => *client = Some(c),
+            Err(err) => {
+                app.set_error(err.to_string());
+                return;
+            }
+        }
+    }
+
+    if let Some(c) = client.as_ref() {
+        load_issues(app, c).await;
+    }
+}
+
 async fn event_loop(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     app: &mut plugin::app::App,
-    client: &herdr_linear::LinearClient,
+    client: &mut Option<herdr_linear::LinearClient>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    load_issues(app, client).await;
+    // Draw the initial `Loading` state before the (possibly slow) config/client
+    // setup and network round-trip, so the user sees "Loading issues..." instead
+    // of a blank alternate screen while it's in flight.
+    terminal.draw(|frame| plugin::ui::draw(frame, app))?;
+    ensure_loaded(app, client).await;
 
     loop {
         terminal.draw(|frame| plugin::ui::draw(frame, app))?;
@@ -96,7 +125,11 @@ async fn event_loop(
                             let _ = open::that(url);
                         }
                         plugin::app::Action::Retry => {
-                            load_issues(app, client).await;
+                            // `handle_key` already moved `app` back to `Loading`;
+                            // draw that before the retry's own round-trip so it's
+                            // visible instead of leaving the stale previous frame.
+                            terminal.draw(|frame| plugin::ui::draw(frame, app))?;
+                            ensure_loaded(app, client).await;
                         }
                     }
                 }

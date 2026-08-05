@@ -5,8 +5,7 @@ use crate::plugin::app::{App, AppState};
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
 
@@ -18,11 +17,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
             frame.render_widget(paragraph, frame.area());
         }
         AppState::Error { message } => {
-            let paragraph = Paragraph::new(format!("{message}\n\nPress r to retry.")).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Linear - Error"),
-            );
+            let paragraph = Paragraph::new(format!("{message}\n\nPress r to retry."))
+                .wrap(Wrap { trim: true })
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Linear - Error"),
+                );
             frame.render_widget(paragraph, frame.area());
         }
         AppState::Loaded { issues, selected } => {
@@ -33,20 +34,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
             let items: Vec<ListItem> = issues
                 .iter()
-                .enumerate()
-                .map(|(i, issue)| {
-                    let text = format!("{} {}", issue.identifier, issue.title);
-                    let style = if i == *selected {
-                        Style::default().add_modifier(Modifier::REVERSED)
-                    } else {
-                        Style::default()
-                    };
-                    ListItem::new(Line::from(Span::styled(text, style)))
-                })
+                .map(|issue| ListItem::new(format!("{} {}", issue.identifier, issue.title)))
                 .collect();
-            let list =
-                List::new(items).block(Block::default().borders(Borders::ALL).title("My Issues"));
-            frame.render_widget(list, chunks[0]);
+            let list = List::new(items)
+                .block(Block::default().borders(Borders::ALL).title("My Issues"))
+                .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+            let mut list_state = ListState::default();
+            list_state.select(Some(*selected));
+            frame.render_stateful_widget(list, chunks[0], &mut list_state);
 
             let detail = issues
                 .get(*selected)
@@ -58,6 +53,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 })
                 .unwrap_or_default();
             let detail_widget = Paragraph::new(detail)
+                .wrap(Wrap { trim: true })
                 .block(Block::default().borders(Borders::ALL).title("Detail"));
             frame.render_widget(detail_widget, chunks[1]);
         }
