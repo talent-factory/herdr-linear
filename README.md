@@ -286,7 +286,18 @@ open elsewhere, or closes it if it's already focused.
 > the **split** action (`herdr-linear.open-split`) or the **tab** one
 > (`herdr-linear.open-tab`). This requires herdr ≥ 0.7.0 (see `min_herdr_version` in
 > `herdr-plugin.toml`); on an older/misbehaving herdr that omits the launch context,
-> it falls back to the plugin's own install directory, same as before.
+> it falls back to the plugin's own install directory. If that fallback also fails
+> (an unreadable process directory), `<Enter>` sets an actionable status instead of
+> silently starting the agent nowhere in particular.
+
+To see what the plugin is doing internally (e.g. while debugging a cwd-resolution or
+`herdr` CLI issue), set `HERDR_LINEAR_LOG_FILE` to a file path before launching herdr —
+the plugin writes its `tracing` diagnostics there instead of to stdout, which would
+otherwise corrupt the TUI:
+
+```bash
+export HERDR_LINEAR_LOG_FILE=/tmp/herdr-linear.log
+```
 
 ## License
 

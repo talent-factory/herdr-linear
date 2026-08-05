@@ -9,9 +9,11 @@
 //! (`main.rs`'s `start_implementation`) pick the wrong repo/directory.
 //!
 //! herdr instead threads the real directory through an injected `HERDR_PLUGIN_CONTEXT_JSON`
-//! env var. This mirrors `herdr-file-viewer`'s `src/host.rs` host adapter exactly — same env
-//! var, same field names, same fallback order — since that plugin solved the identical problem
-//! (see its `CHANGELOG.md`: "the viewed root follows the *focused herdr pane's* directory").
+//! env var. This is modeled on `herdr-file-viewer`'s `src/host.rs` host adapter — same env var,
+//! same field names, same fallback order — since that plugin solved the identical problem (see
+//! its `CHANGELOG.md`: "the viewed root follows the *focused herdr pane's* directory"). The two
+//! implementations aren't kept in sync automatically; treat this as a starting point, not a
+//! guarantee, if `herdr-file-viewer` changes its side later.
 
 use std::path::PathBuf;
 
@@ -48,8 +50,10 @@ pub fn parse_context_cwd(json: Option<&str>) -> Option<PathBuf> {
 /// first, falling back to the plugin process's own `std::env::current_dir()` when the env var
 /// is absent, malformed, or empty. Thin wrapper around [`parse_context_cwd`]; called from
 /// [`crate::plugin::repo::detect_repo_name`] and `main.rs`'s `start_implementation`. Never
-/// fails outright — an unreadable process cwd falls back to an empty path, same as
-/// `herdr-file-viewer`'s `host::from_env`.
+/// fails outright — an unreadable process cwd falls back to an empty [`PathBuf`], modeled on
+/// `herdr-file-viewer`'s `host::from_env`. Callers that need the working directory to actually
+/// be usable (not just non-panicking) are responsible for checking for that empty case
+/// themselves; `start_implementation` does.
 pub fn resolve_cwd() -> PathBuf {
     let json = std::env::var("HERDR_PLUGIN_CONTEXT_JSON").ok();
     parse_context_cwd(json.as_deref())

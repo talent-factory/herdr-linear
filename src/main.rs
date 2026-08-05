@@ -16,8 +16,34 @@ fn dispatch_launch_decision(args: &[String], stdin_content: &str) -> Option<Stri
     }
 }
 
+/// Wires up `tracing` output, but only when `$HERDR_LINEAR_LOG_FILE` is explicitly set —
+/// writing to stdout by default would corrupt the raw-mode/alternate-screen TUI, so the
+/// crate's existing `tracing::warn!`/`tracing::debug!` calls (e.g. in `repo.rs`,
+/// `implement.rs`) stay silent no-ops unless a log file destination is configured, same as
+/// before this function existed. Best-effort: any failure to open the file or install the
+/// subscriber is swallowed, since logging is a diagnostic aid, not something worth failing
+/// startup over.
+fn init_tracing() {
+    let Ok(path) = std::env::var("HERDR_LINEAR_LOG_FILE") else {
+        return;
+    };
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::sync::Mutex::new(file))
+        .with_ansi(false)
+        .try_init();
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
+
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     let is_recognized_flag = matches!(
@@ -127,7 +153,11 @@ async fn ensure_loaded(
 /// resolve the preferred coding agent, open a herdr tab running it, set the issue to its
 /// team's "In Progress" state, wait for the agent to become ready, then inject the implement
 /// prompt. Every failure sets a specific, actionable status banner on `app` instead of
-/// propagating — mirrors `ensure_loaded`'s "inline error instead of crashing" philosophy. See
+/// propagating — mirrors `ensure_loaded`'s "inline error instead of crashing" philosophy. Any
+/// non-fatal warnings collected along the way (tab rename, workflow-state lookup, the actual
+/// state transition) are preserved in *every* terminal status, not just the final success case
+/// — a failure late in the flow (e.g. `agent_wait` timing out) must not hide an earlier one
+/// (e.g. the issue never actually reaching "In Progress"). See
 /// docs/superpowers/specs/2026-08-05-implement-on-enter-design.md for the full data flow.
 ///
 /// The agent is spawned in [`plugin::host::resolve_cwd`]'s directory — the herdr-injected
@@ -136,7 +166,10 @@ async fn ensure_loaded(
 /// `host`'s module doc). This resolves correctly regardless of whether the panel was opened via
 /// `open-split.sh` or `open-tab.sh`, as long as herdr reports a launch context — see
 /// README.md's "Use" section and the design doc's "Out of scope / open items" for the prior
-/// split-only caveat this replaces.
+/// split-only caveat this replaces. `resolve_cwd` itself never fails outright (see its own
+/// doc), so this function separately guards against the one case that matters here: both its
+/// launch-context parse *and* its `current_dir()` fallback failing, which would otherwise pass
+/// an empty `--cwd` straight through to `agent_start`.
 async fn start_implementation(
     app: &mut plugin::app::App,
     client: &herdr_linear::LinearClient,
@@ -169,27 +202,40 @@ async fn start_implementation(
 
     let command =
         plugin::implement::resolve_agent_command(derived.as_deref(), config_override.as_deref());
-    if !plugin::implement::is_valid_agent_command(&command) {
-        app.set_status(plugin::app::Status::Error(format!(
-            "{}: agent command {command:?} contains unexpected characters — refusing to run it",
-            issue.identifier
-        )));
-        return;
-    }
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-    let argv = plugin::implement::build_shell_argv(&shell, &command);
-    let cwd = plugin::host::resolve_cwd();
-
-    let started = match plugin::herdr_cli::agent_start(&herdr_bin, &command, &cwd, &argv).await {
-        Ok(started) => started,
-        Err(err) => {
+    let command = match plugin::implement::ValidatedAgentCommand::parse(command) {
+        Ok(command) => command,
+        Err(command) => {
             app.set_status(plugin::app::Status::Error(format!(
-                "{}: failed to start agent tab: {err}",
+                "{}: agent command {command:?} contains unexpected characters — refusing to run it",
                 issue.identifier
             )));
             return;
         }
     };
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+    let argv = plugin::implement::build_shell_argv(&shell, &command);
+    let cwd = plugin::host::resolve_cwd();
+    if cwd.as_os_str().is_empty() {
+        app.set_status(plugin::app::Status::Error(format!(
+            "{}: couldn't determine your working directory (herdr's launch context is missing \
+             and the plugin's own process directory is unreadable) — see README.md's \"Use\" \
+             section",
+            issue.identifier
+        )));
+        return;
+    }
+
+    let started =
+        match plugin::herdr_cli::agent_start(&herdr_bin, command.as_str(), &cwd, &argv).await {
+            Ok(started) => started,
+            Err(err) => {
+                app.set_status(plugin::app::Status::Error(format!(
+                    "{}: failed to start agent tab: {err}",
+                    issue.identifier
+                )));
+                return;
+            }
+        };
 
     let mut warnings = Vec::new();
 
@@ -214,20 +260,28 @@ async fn start_implementation(
 
     let prompt = plugin::implement::build_implement_prompt(&issue.identifier);
 
+    // From here on, every early return must still report `warnings` — a failure below doesn't
+    // undo (or excuse hiding) a warning collected above it.
     if let Err(err) =
         plugin::herdr_cli::agent_wait(&herdr_bin, &started.pane_id, "idle", 30_000).await
     {
-        app.set_status(plugin::app::Status::Error(format!(
-            "{}: agent didn't become ready ({err}) — run manually: {prompt}",
-            issue.identifier
+        app.set_status(plugin::app::Status::Error(status_with_warnings(
+            format!(
+                "{}: agent didn't become ready ({err}) — run manually: {prompt}",
+                issue.identifier
+            ),
+            &warnings,
         )));
         return;
     }
 
     if let Err(err) = plugin::herdr_cli::agent_send(&herdr_bin, &started.pane_id, &prompt).await {
-        app.set_status(plugin::app::Status::Error(format!(
-            "{}: failed to send implement command ({err}) — run manually: {prompt}",
-            issue.identifier
+        app.set_status(plugin::app::Status::Error(status_with_warnings(
+            format!(
+                "{}: failed to send implement command ({err}) — run manually: {prompt}",
+                issue.identifier
+            ),
+            &warnings,
         )));
         return;
     }
@@ -243,6 +297,17 @@ async fn start_implementation(
             issue.identifier,
             warnings.join("; ")
         )));
+    }
+}
+
+/// Appends `warnings` (if any) to `message` as an `" (also: ...")` suffix. Used to make sure a
+/// late failure's status banner doesn't silently drop warnings collected earlier in
+/// [`start_implementation`].
+fn status_with_warnings(message: String, warnings: &[String]) -> String {
+    if warnings.is_empty() {
+        message
+    } else {
+        format!("{message} (also: {})", warnings.join("; "))
     }
 }
 
@@ -347,5 +412,26 @@ mod tests {
     fn returns_none_for_an_unknown_flag() {
         let args = vec!["--bogus".to_string()];
         assert_eq!(dispatch_launch_decision(&args, ""), None);
+    }
+
+    #[test]
+    fn status_with_warnings_leaves_the_message_alone_when_there_are_no_warnings() {
+        assert_eq!(
+            status_with_warnings("agent didn't become ready".to_string(), &[]),
+            "agent didn't become ready"
+        );
+    }
+
+    #[test]
+    fn status_with_warnings_appends_every_collected_warning() {
+        let warnings = vec![
+            "failed to rename tab: boom".to_string(),
+            "failed to set state to In Progress: boom".to_string(),
+        ];
+
+        assert_eq!(
+            status_with_warnings("agent didn't become ready".to_string(), &warnings),
+            "agent didn't become ready (also: failed to rename tab: boom; failed to set state to In Progress: boom)"
+        );
     }
 }

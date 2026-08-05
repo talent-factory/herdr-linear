@@ -38,11 +38,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - My Issues no longer lists completed/canceled issues (TF-582)
-- Implement-on-`<Enter>`: no longer silently falls back to `.` when the working
-  directory can't be determined — aborts with an actionable status instead, and the
-  README now documents that `<Enter>` needs the panel opened via the split action
-  (not the tab action), since only a split pane inherits the invoking pane's cwd
-  (TF-584)
+- Implement-on-`<Enter>` and Project Issues detection now resolve the working directory from
+  herdr's injected `HERDR_PLUGIN_CONTEXT_JSON` launch context instead of the plugin process's
+  own `std::env::current_dir()` (always the plugin's own install directory), so both now work
+  correctly whether the panel was opened via the split action or the tab action — previously
+  only a split pane happened to inherit the right cwd. If the working directory still can't be
+  determined either way, implement-on-`<Enter>` now sets an actionable status instead of
+  silently starting the agent with an empty `--cwd` (TF-577, TF-584)
 - Implement-on-`<Enter>`: a `q` pressed while the flow is blocking is now honored
   (quits) instead of being silently discarded along with buffered input (TF-584)
 - `herdr_cli`'s response parsing now treats a top-level `{"error": ...}` body as a
@@ -58,6 +60,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its wait stream closes as soon as the pane's agent identity is detected, well before the
   agent is actually idle. Previously this surfaced as an immediate "agent didn't become
   ready" error and the implement prompt was never injected (TF-584)
+- Implement-on-`<Enter>`: a status banner reported after `agent_wait`/`agent_send` fails no
+  longer discards warnings collected earlier in the same flow (e.g. a failed tab rename or a
+  failed "In Progress" transition) — every terminal status now includes every warning, not
+  just the one on the path that happened to finish last (TF-584)
+- `herdr` CLI calls other than `agent_wait` (`agent_list`, `agent_start`, `tab_rename`,
+  `agent_send`) are now individually timeout-bounded, so a hung `herdr` daemon can no longer
+  freeze the whole panel indefinitely (TF-584)
+- `agent_wait`'s missing-`result`-field retry is now detected via a dedicated error variant
+  instead of matching a substring of the formatted error message, and its retry budget can no
+  longer be silently overrun by one extra attempt once the caller's timeout is exhausted
+  (TF-584)
+- `is_valid_agent_command` now also rejects glob metacharacters (`* ? [ ] ~`) and `!` (bash
+  history expansion, live since the command runs through `sh -i`) (TF-584)
 
 ### Removed
 - Unused `cli` Cargo feature (and its `clap` dependency), superseded by the `plugin` feature

@@ -1,6 +1,7 @@
-//! Resolves the Linear API key and the Linear project override for the plugin: the
-//! plugin's own config file first, falling back to environment variables (API key only —
-//! there's no environment-variable form of the project override).
+//! Resolves the Linear API key, the Linear project override, and the `agent_command` override
+//! for the plugin: the plugin's own config file first, falling back to environment variables
+//! (API key only — there's no environment-variable form of the project or `agent_command`
+//! override).
 
 use crate::{Error, Result};
 use std::path::Path;

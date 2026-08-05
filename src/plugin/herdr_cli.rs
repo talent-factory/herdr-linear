@@ -15,7 +15,7 @@
 //! within ~200ms by `outcome="stream_closed"`, long before the agent could plausibly be idle.
 //! The CLI then exits 0 with valid JSON missing the `result` field its own schema (`herdr api
 //! schema --json`) declares `required`. `agent_wait` retries specifically on this response (see
-//! [`is_missing_result_response`]) — the identity-transition event fires at most once per pane,
+//! `is_missing_result_response`) — the identity-transition event fires at most once per pane,
 //! so a retried call reliably observes the real status change instead. Revisit/remove once
 //! herdr fixes this upstream.
 
@@ -23,6 +23,7 @@ use crate::error::Error;
 use crate::Result;
 use serde_json::Value;
 use std::path::Path;
+use std::time::Duration;
 use tokio::process::Command;
 
 /// A herdr pane identifier (e.g. `"wY:p3"`). A newtype rather than a bare `String` so it can't
@@ -118,33 +119,52 @@ fn interpret_output(
     parsed
         .get("result")
         .cloned()
-        .ok_or_else(|| Error::Internal(format!("`{command_desc}` had no `result` field")))
+        .ok_or_else(|| Error::MissingResultField(format!("`{command_desc}` had no `result` field")))
 }
 
 /// True if `error` is herdr's known "no `result` field" response — see the module docs for the
 /// underlying stream-close race this works around. Distinguishes this one retryable case from a
 /// genuine failure (a real timeout, no such pane, an actual protocol error), so `agent_wait`
-/// only retries the failure mode retrying is likely to fix.
+/// only retries the failure mode retrying is likely to fix. Matches on the dedicated
+/// [`Error::MissingResultField`] variant rather than a substring of the formatted message, so a
+/// future wording change in [`interpret_output`] can't silently disable the retry.
 fn is_missing_result_response(error: &Error) -> bool {
-    matches!(error, Error::Internal(msg) if msg.contains("had no `result` field"))
+    matches!(error, Error::MissingResultField(_))
 }
 
-/// Run a `herdr` CLI subcommand, returning the parsed `result` field on success. See
-/// [`interpret_output`] for the success/failure mapping.
-async fn run(herdr_bin: &str, args: &[&str]) -> Result<Value> {
-    let output = Command::new(herdr_bin)
-        .args(args)
-        .output()
+/// Wall-clock ceiling for `herdr` subprocess calls that don't carry their own `--timeout`
+/// argument (everything routed through [`run`]: `agent_list`, `agent_start`, `tab_rename`,
+/// `agent_send`). Without this, a hung `herdr` daemon blocks the single-threaded TUI's event
+/// loop indefinitely — `agent_wait` is the exception, since it computes its own call-specific
+/// bound in [`agent_wait`] instead of using this constant.
+const DEFAULT_CLI_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Run a `herdr` CLI subcommand, bounded by `call_timeout`, returning the parsed `result` field
+/// on success. See [`interpret_output`] for the success/failure mapping.
+async fn run_with_timeout(herdr_bin: &str, args: &[&str], call_timeout: Duration) -> Result<Value> {
+    let command_desc = format!("{herdr_bin} {}", args.join(" "));
+
+    let output = tokio::time::timeout(call_timeout, Command::new(herdr_bin).args(args).output())
         .await
+        .map_err(|_| {
+            Error::Internal(format!(
+                "`{command_desc}` timed out after {call_timeout:?} waiting for herdr"
+            ))
+        })?
         .map_err(|e| Error::Internal(format!("Failed to run `{herdr_bin}`: {e}")))?;
 
-    let command_desc = format!("{herdr_bin} {}", args.join(" "));
     interpret_output(
         &command_desc,
         output.status.success(),
         &String::from_utf8_lossy(&output.stdout),
         &String::from_utf8_lossy(&output.stderr),
     )
+}
+
+/// [`run_with_timeout`] bounded by [`DEFAULT_CLI_TIMEOUT`] — used by every `herdr` subcommand
+/// except `agent_wait`.
+async fn run(herdr_bin: &str, args: &[&str]) -> Result<Value> {
+    run_with_timeout(herdr_bin, args, DEFAULT_CLI_TIMEOUT).await
 }
 
 /// `herdr agent list` — the raw JSON text of the `result` field, for
@@ -154,21 +174,11 @@ pub async fn agent_list(herdr_bin: &str) -> Result<String> {
     Ok(result.to_string())
 }
 
-/// `herdr agent start <name> --cwd <cwd> --focus -- <argv...>` — starts `name` (used by herdr
-/// for its own agent-status tracking) running `argv` in a fresh, focused tab at `cwd`.
-pub async fn agent_start(
-    herdr_bin: &str,
-    name: &str,
-    cwd: &Path,
-    argv: &[String],
-) -> Result<AgentStarted> {
-    let cwd_str = cwd.to_string_lossy().to_string();
-    let mut args: Vec<&str> = vec!["agent", "start", name, "--cwd", &cwd_str, "--focus", "--"];
-    for a in argv {
-        args.push(a.as_str());
-    }
-    let result = run(herdr_bin, &args).await?;
-
+/// Extract [`AgentStarted`] from a `herdr agent start` call's already-unwrapped `result` value.
+/// Split out from [`agent_start`] so the part that can actually be wrong — a schema change or a
+/// herdr regression in the response shape — is unit-testable without spawning a process, the
+/// same way [`interpret_output`] is split out of [`run`].
+fn parse_agent_started(result: &Value) -> Result<AgentStarted> {
     let pane_id = result
         .get("agent")
         .and_then(|a| a.get("pane_id"))
@@ -188,6 +198,23 @@ pub async fn agent_start(
     })
 }
 
+/// `herdr agent start <name> --cwd <cwd> --focus -- <argv...>` — starts `name` (used by herdr
+/// for its own agent-status tracking) running `argv` in a fresh, focused tab at `cwd`.
+pub async fn agent_start(
+    herdr_bin: &str,
+    name: &str,
+    cwd: &Path,
+    argv: &[String],
+) -> Result<AgentStarted> {
+    let cwd_str = cwd.to_string_lossy().to_string();
+    let mut args: Vec<&str> = vec!["agent", "start", name, "--cwd", &cwd_str, "--focus", "--"];
+    for a in argv {
+        args.push(a.as_str());
+    }
+    let result = run(herdr_bin, &args).await?;
+    parse_agent_started(&result)
+}
+
 /// `herdr tab rename <tab_id> <label>`.
 pub async fn tab_rename(herdr_bin: &str, tab_id: &TabId, label: &str) -> Result<()> {
     run(herdr_bin, &["tab", "rename", tab_id.as_str(), label])
@@ -198,6 +225,35 @@ pub async fn tab_rename(herdr_bin: &str, tab_id: &TabId, label: &str) -> Result<
 /// Extra attempts `agent_wait` makes when herdr responds with the missing-`result` bug (see the
 /// module docs) before giving up and returning that error to the caller.
 const AGENT_WAIT_MAX_RETRIES: u32 = 2;
+
+/// Buffer added on top of the caller's remaining `--timeout` budget when bounding each
+/// `herdr agent wait` subprocess call, so the outer wall-clock guard ([`run_with_timeout`])
+/// doesn't race herdr's own internal timeout — herdr should always get the chance to return its
+/// own clean timeout response first.
+const AGENT_WAIT_CALL_TIMEOUT_BUFFER: Duration = Duration::from_secs(5);
+
+/// Decide whether `agent_wait`'s loop should retry after `err`, and if so, the timeout budget
+/// (in ms) remaining for the next attempt. Pure — no I/O — so the retry decision is
+/// unit-testable without mocking the `herdr` subprocess (the loop itself previously wasn't).
+/// Returns `None` (stop, return `err` to the caller) when `err` isn't the known retryable case,
+/// the retry budget ([`AGENT_WAIT_MAX_RETRIES`]) is exhausted, or there's no time left in the
+/// caller's budget to retry with — previously the loop clamped a fully-consumed budget to 1ms
+/// and fired one more subprocess call anyway, silently overrunning the caller's timeout.
+fn next_retry_budget_ms(
+    err: &Error,
+    attempt: u32,
+    elapsed_ms: u64,
+    timeout_ms: u64,
+) -> Option<u64> {
+    if attempt >= AGENT_WAIT_MAX_RETRIES || !is_missing_result_response(err) {
+        return None;
+    }
+    let remaining_ms = timeout_ms.saturating_sub(elapsed_ms);
+    if remaining_ms == 0 {
+        return None;
+    }
+    Some(remaining_ms)
+}
 
 /// `herdr agent wait <pane_id> --status <status> --timeout <timeout_ms>`. Retries, within the
 /// caller's original `timeout_ms` budget, when herdr responds with the missing-`result` bug
@@ -211,13 +267,13 @@ pub async fn agent_wait(
 ) -> Result<()> {
     let start = std::time::Instant::now();
     let mut attempt = 0;
+    let mut remaining_ms = timeout_ms;
 
     loop {
-        let elapsed_ms = start.elapsed().as_millis() as u64;
-        let remaining_ms = timeout_ms.saturating_sub(elapsed_ms).max(1);
         let timeout_str = remaining_ms.to_string();
+        let call_timeout = Duration::from_millis(remaining_ms) + AGENT_WAIT_CALL_TIMEOUT_BUFFER;
 
-        let result = run(
+        let result = run_with_timeout(
             herdr_bin,
             &[
                 "agent",
@@ -228,15 +284,22 @@ pub async fn agent_wait(
                 "--timeout",
                 &timeout_str,
             ],
+            call_timeout,
         )
         .await;
 
-        match result {
+        let err = match result {
             Ok(_) => return Ok(()),
-            Err(err) if attempt < AGENT_WAIT_MAX_RETRIES && is_missing_result_response(&err) => {
+            Err(err) => err,
+        };
+
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        match next_retry_budget_ms(&err, attempt, elapsed_ms, timeout_ms) {
+            Some(next_remaining_ms) => {
                 attempt += 1;
+                remaining_ms = next_remaining_ms;
             }
-            Err(err) => return Err(err),
+            None => return Err(err),
         }
     }
 }
@@ -360,5 +423,74 @@ mod tests {
         assert!(!is_missing_result_response(&failed));
         assert!(!is_missing_result_response(&unparseable));
         assert!(!is_missing_result_response(&spawn_failed));
+    }
+
+    #[test]
+    fn parse_agent_started_extracts_pane_id_and_tab_id() {
+        let result = serde_json::json!({"agent": {"pane_id": "wY:p3", "tab_id": "wY:tW"}});
+
+        let started = parse_agent_started(&result).unwrap();
+
+        assert_eq!(started.pane_id.as_str(), "wY:p3");
+        assert_eq!(started.tab_id.as_str(), "wY:tW");
+    }
+
+    #[test]
+    fn parse_agent_started_errors_when_pane_id_is_missing() {
+        let result = serde_json::json!({"agent": {"tab_id": "wY:tW"}});
+
+        let err = parse_agent_started(&result).unwrap_err().to_string();
+
+        assert!(err.contains("agent.pane_id"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn parse_agent_started_errors_when_tab_id_is_missing() {
+        let result = serde_json::json!({"agent": {"pane_id": "wY:p3"}});
+
+        let err = parse_agent_started(&result).unwrap_err().to_string();
+
+        assert!(err.contains("agent.tab_id"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn parse_agent_started_errors_when_the_agent_object_is_missing_entirely() {
+        let result = serde_json::json!({"id": "cli:agent:start"});
+
+        assert!(parse_agent_started(&result).is_err());
+    }
+
+    #[test]
+    fn next_retry_budget_ms_retries_a_missing_result_response_within_budget() {
+        let err = Error::MissingResultField("`herdr agent wait` had no `result` field".to_string());
+
+        assert_eq!(next_retry_budget_ms(&err, 0, 5_000, 30_000), Some(25_000));
+    }
+
+    #[test]
+    fn next_retry_budget_ms_stops_once_the_retry_cap_is_reached() {
+        let err = Error::MissingResultField("`herdr agent wait` had no `result` field".to_string());
+
+        assert_eq!(
+            next_retry_budget_ms(&err, AGENT_WAIT_MAX_RETRIES, 5_000, 30_000),
+            None
+        );
+    }
+
+    #[test]
+    fn next_retry_budget_ms_does_not_retry_a_non_retryable_error() {
+        let err = Error::Internal("no such pane".to_string());
+
+        assert_eq!(next_retry_budget_ms(&err, 0, 5_000, 30_000), None);
+    }
+
+    #[test]
+    fn next_retry_budget_ms_stops_instead_of_overrunning_an_exhausted_budget() {
+        // Regression guard: the loop used to clamp a fully-consumed budget to 1ms and fire one
+        // more subprocess call anyway, silently overrunning the caller's timeout.
+        let err = Error::MissingResultField("`herdr agent wait` had no `result` field".to_string());
+
+        assert_eq!(next_retry_budget_ms(&err, 0, 30_000, 30_000), None);
+        assert_eq!(next_retry_budget_ms(&err, 0, 40_000, 30_000), None);
     }
 }

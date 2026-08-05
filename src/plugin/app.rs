@@ -287,8 +287,9 @@ impl Default for App {
 
 #[derive(Debug, Clone, PartialEq)]
 // `Issue` is the largest variant by far; boxing it would ripple into every call site that
-// constructs or matches `Action::Implement`, and the plan locks this interface to a bare
-// `Issue` for Task 5/6 to consume.
+// constructs or matches `Action::Implement`, and the implement-on-Enter flow (`main.rs`'s
+// `start_implementation`) needs the full `Issue` — not just its id — to build the prompt and
+// resolve the in-progress workflow state, so a bare `Issue` is the right shape here.
 #[allow(clippy::large_enum_variant)]
 pub enum Action {
     Quit,
