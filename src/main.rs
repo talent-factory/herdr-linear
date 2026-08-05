@@ -33,7 +33,77 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("herdr-linear plugin scaffold — TUI not implemented yet (see Task 10)");
+    run_tui().await
+}
+
+fn install_panic_hook() {
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+        original_hook(panic_info);
+    }));
+}
+
+async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
+    let api_key = plugin::config::load()?;
+    let client = herdr_linear::LinearClient::new(api_key)?;
+
+    install_panic_hook();
+
+    crossterm::terminal::enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
+    let backend = ratatui::backend::CrosstermBackend::new(stdout);
+    let mut terminal = ratatui::Terminal::new(backend)?;
+
+    let mut app = plugin::app::App::new();
+    let result = event_loop(&mut terminal, &mut app, &client).await;
+
+    crossterm::terminal::disable_raw_mode()?;
+    crossterm::execute!(
+        terminal.backend_mut(),
+        crossterm::terminal::LeaveAlternateScreen
+    )?;
+    terminal.show_cursor()?;
+
+    result
+}
+
+async fn load_issues(app: &mut plugin::app::App, client: &herdr_linear::LinearClient) {
+    match plugin::data::fetch_my_issues(client).await {
+        Ok(issues) => app.set_issues(issues),
+        Err(err) => app.set_error(err.to_string()),
+    }
+}
+
+async fn event_loop(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    app: &mut plugin::app::App,
+    client: &herdr_linear::LinearClient,
+) -> Result<(), Box<dyn std::error::Error>> {
+    load_issues(app, client).await;
+
+    loop {
+        terminal.draw(|frame| plugin::ui::draw(frame, app))?;
+
+        if crossterm::event::poll(std::time::Duration::from_millis(200))? {
+            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+                if let Some(action) = plugin::app::handle_key(app, key.code) {
+                    match action {
+                        plugin::app::Action::Quit => break,
+                        plugin::app::Action::OpenInBrowser(url) => {
+                            let _ = open::that(url);
+                        }
+                        plugin::app::Action::Retry => {
+                            load_issues(app, client).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 

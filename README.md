@@ -212,6 +212,53 @@ match client.get_viewer().await {
 Issues are tracked in Linear at:
 https://linear.app/talent-factory/project/herdr-linear-10dca51ea35b/overview
 
+## Herdr Plugin
+
+`herdr-linear` also ships as a [Herdr](https://herdr.dev) plugin: a read-only "My
+Issues" panel you can open as a split pane or a tab from inside a Herdr session.
+
+### Install
+
+```bash
+herdr plugin install talent-factory/herdr-linear
+```
+
+For local development, use `herdr plugin link /path/to/herdr-linear` instead.
+
+### Configure
+
+Set your Linear API key in the plugin's config file:
+
+```bash
+mkdir -p "$(herdr plugin config-dir herdr-linear)"
+echo 'api_key = "lin_api_your_key_here"' > "$(herdr plugin config-dir herdr-linear)/config.toml"
+```
+
+Or export `LINEAR_API_KEY` in the environment Herdr runs in.
+
+### Use
+
+Bind keys to the plugin's actions in `~/.config/herdr/config.toml`:
+
+```toml
+[[keys.command]]
+key = "prefix+l"
+type = "plugin_action"
+command = "herdr-linear.open-split"
+description = "Open Linear panel"
+
+[[keys.command]]
+key = "prefix+shift+l"
+type = "plugin_action"
+command = "herdr-linear.open-tab"
+description = "Open Linear panel (tab)"
+```
+
+Reload the config, then press the bound key: `↑`/`↓` to navigate issues, `o` to
+open the selected issue in your browser, `r` to retry after an error, `q`/`Esc` to
+quit. Pressing the key again focuses the panel if it's open elsewhere, or closes it
+if it's already focused.
+
 ## License
 
 Dual-licensed under MIT OR Apache-2.0
