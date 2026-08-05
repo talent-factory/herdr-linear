@@ -3,9 +3,11 @@
 
 use crate::plugin::app::{App, Screen, ViewKind, ViewState, MENU_OPTIONS};
 use ratatui::{
-    layout::{Constraint, Direction, Layout},
+    buffer::Buffer,
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    text::Line,
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Widget, Wrap},
     Frame,
 };
 
@@ -39,6 +41,52 @@ fn draw_menu(frame: &mut Frame, selected: usize) {
     let mut list_state = ListState::default();
     list_state.select(Some(selected));
     frame.render_stateful_widget(list, frame.area(), &mut list_state);
+}
+
+/// A single-line widget that renders `text` normally, then wraps the trailing
+/// `url.chars().count()` cells — the URL substring at the end of `text`, e.g.
+/// `"URL: {url}"` — in an OSC 8 terminal hyperlink escape sequence. The escape
+/// bytes are zero-width to the terminal, so layout/wrapping is unaffected, and
+/// terminals without OSC 8 support just show the plain text.
+struct Hyperlink<'a> {
+    text: Line<'a>,
+    url: String,
+}
+
+impl<'a> Hyperlink<'a> {
+    fn new(text: Line<'a>, url: impl Into<String>) -> Self {
+        Self {
+            text,
+            url: url.into(),
+        }
+    }
+}
+
+impl Widget for &Hyperlink<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        Paragraph::new(self.text.clone()).render(area, buf);
+
+        let link_width = self.url.chars().count();
+        let total_width = self.text.width();
+        let start = total_width
+            .saturating_sub(link_width)
+            .min(area.width as usize);
+        let end = total_width.min(area.width as usize);
+
+        for x in start..end {
+            let Some(cell) = buf.cell_mut((area.x + x as u16, area.y)) else {
+                continue;
+            };
+            let symbol = cell.symbol().to_string();
+            let wrapped = match (x == start, x + 1 == end) {
+                (true, true) => format!("\x1b]8;;{}\x1b\\{symbol}\x1b]8;;\x1b\\", self.url),
+                (true, false) => format!("\x1b]8;;{}\x1b\\{symbol}", self.url),
+                (false, true) => format!("{symbol}\x1b]8;;\x1b\\"),
+                (false, false) => symbol,
+            };
+            cell.set_symbol(&wrapped);
+        }
+    }
 }
 
 fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState) {
@@ -196,5 +244,50 @@ mod tests {
         let text = rendered_text(&app);
         assert!(text.contains("ENG-1"));
         assert!(text.contains("Title for ENG-1"));
+    }
+
+    #[test]
+    fn hyperlink_wraps_the_trailing_url_portion_in_osc8_escapes() {
+        let url = "https://example.com";
+        let hyperlink = Hyperlink::new(Line::from(format!("URL: {url}")), url);
+        let area = Rect::new(0, 0, 30, 1);
+        let mut buf = Buffer::empty(area);
+        Widget::render(&hyperlink, area, &mut buf);
+
+        let start = "URL: ".chars().count(); // 5
+        let url_len = url.chars().count(); // 20
+        let open = format!("\x1b]8;;{url}\x1b\\");
+        let close = "\x1b]8;;\x1b\\";
+
+        let first = buf.cell((start as u16, 0)).unwrap().symbol().to_string();
+        let last = buf
+            .cell(((start + url_len - 1) as u16, 0))
+            .unwrap()
+            .symbol()
+            .to_string();
+        let middle = buf
+            .cell(((start + 1) as u16, 0))
+            .unwrap()
+            .symbol()
+            .to_string();
+
+        assert!(first.starts_with(&open), "first cell was {first:?}");
+        assert!(last.ends_with(close), "last cell was {last:?}");
+        assert_eq!(middle, "t"); // second char of "https://..."
+
+        // Text before the link (the "URL: " label) is untouched.
+        assert_eq!(buf.cell((0, 0)).unwrap().symbol(), "U");
+        assert_eq!(buf.cell((4, 0)).unwrap().symbol(), " ");
+    }
+
+    #[test]
+    fn hyperlink_wraps_open_and_close_in_the_same_cell_for_a_single_character_link() {
+        let hyperlink = Hyperlink::new(Line::from("x"), "x");
+        let area = Rect::new(0, 0, 1, 1);
+        let mut buf = Buffer::empty(area);
+        Widget::render(&hyperlink, area, &mut buf);
+
+        let cell = buf.cell((0, 0)).unwrap().symbol().to_string();
+        assert_eq!(cell, "\x1b]8;;x\x1b\\x\x1b]8;;\x1b\\");
     }
 }
