@@ -1,5 +1,6 @@
-//! Resolves the Linear API key for the plugin: the plugin's own config file first,
-//! falling back to the `LINEAR_API_KEY` environment variable.
+//! Resolves the Linear API key and the Linear project override for the plugin: the
+//! plugin's own config file first, falling back to environment variables (API key only —
+//! there's no environment-variable form of the project override).
 
 use crate::{Error, Result};
 use std::path::Path;
@@ -7,35 +8,53 @@ use std::path::Path;
 #[derive(serde::Deserialize)]
 struct ConfigFile {
     api_key: Option<String>,
+    project_id: Option<String>,
+}
+
+/// Reads and parses `config_dir/config.toml`, if `config_dir` is given and the file
+/// exists. `Ok(None)` means there's nothing to read (no config dir, or no file at that
+/// path) — that's the normal case, not an error. `Err` when the file exists but isn't
+/// valid TOML, or when it exists but couldn't be read (permission denied, not valid UTF-8,
+/// a directory in its place, etc.) — only a missing file is silently treated as "no config".
+fn read_config_file(config_dir: Option<&Path>) -> Result<Option<ConfigFile>> {
+    let Some(dir) = config_dir else {
+        return Ok(None);
+    };
+    let config_path = dir.join("config.toml");
+    let contents = match std::fs::read_to_string(&config_path) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            tracing::warn!("Failed to read {}: {}", config_path.display(), e);
+            return Err(Error::ConfigError(format!(
+                "{} exists but could not be read: {}",
+                config_path.display(),
+                e
+            )));
+        }
+    };
+    toml::from_str::<ConfigFile>(&contents)
+        .map(Some)
+        .map_err(|e| {
+            Error::ConfigError(format!(
+                "{} is not valid TOML: {}",
+                config_path.display(),
+                e
+            ))
+        })
 }
 
 /// Resolve the Linear API key: `config_dir/config.toml`'s `api_key` field first,
 /// then `env_api_key`. Pure function — callers own reading the real environment
 /// (see [`load`]) so this is deterministic and safe to unit test.
 pub fn resolve_api_key(config_dir: Option<&Path>, env_api_key: Option<&str>) -> Result<String> {
-    if let Some(dir) = config_dir {
-        let config_path = dir.join("config.toml");
-        if let Ok(contents) = std::fs::read_to_string(&config_path) {
-            match toml::from_str::<ConfigFile>(&contents) {
-                Ok(parsed) => {
-                    if let Some(key) = parsed.api_key {
-                        if !key.is_empty() {
-                            return Ok(key);
-                        }
-                    }
-                    // File parsed fine but no api_key, fall through to env var
-                }
-                Err(e) => {
-                    // File exists but failed to parse - return error immediately
-                    return Err(Error::ConfigError(format!(
-                        "{} is not valid TOML: {}",
-                        config_path.display(),
-                        e
-                    )));
-                }
+    if let Some(file) = read_config_file(config_dir)? {
+        if let Some(key) = file.api_key {
+            if !key.is_empty() {
+                return Ok(key);
             }
         }
-        // If read_to_string failed, file doesn't exist - fall through to env var
+        // File parsed fine but no (usable) api_key, fall through to env var.
     }
 
     if let Some(key) = env_api_key {
@@ -53,6 +72,17 @@ pub fn resolve_api_key(config_dir: Option<&Path>, env_api_key: Option<&str>) -> 
     )))
 }
 
+/// Resolve a `project_id` override: `config_dir/config.toml`'s `project_id` field, if set
+/// and non-empty. `Ok(None)` means "no override" (callers fall back to name matching, see
+/// [`crate::plugin::repo::resolve_project_id`]) — it is not an error. Pure function —
+/// callers own reading the real environment (see [`load_project_id_override`]).
+pub fn resolve_project_id_override(config_dir: Option<&Path>) -> Result<Option<String>> {
+    let project_id = read_config_file(config_dir)?
+        .and_then(|file| file.project_id)
+        .filter(|id| !id.trim().is_empty());
+    Ok(project_id)
+}
+
 /// Resolve the Linear API key from the real environment: `$HERDR_PLUGIN_CONFIG_DIR/config.toml`
 /// then `$LINEAR_API_KEY`. Thin wrapper around [`resolve_api_key`] used by the binary.
 pub fn load() -> Result<String> {
@@ -61,9 +91,17 @@ pub fn load() -> Result<String> {
     resolve_api_key(config_dir.as_deref(), env_api_key.as_deref())
 }
 
+/// Resolve the `project_id` override from the real environment:
+/// `$HERDR_PLUGIN_CONFIG_DIR/config.toml`. Thin wrapper around
+/// [`resolve_project_id_override`]; not yet called from the binary (see TF-578).
+pub fn load_project_id_override() -> Result<Option<String>> {
+    let config_dir = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR").map(std::path::PathBuf::from);
+    resolve_project_id_override(config_dir.as_deref())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::resolve_api_key;
+    use super::{resolve_api_key, resolve_project_id_override};
     use std::fs;
 
     #[test]
@@ -129,5 +167,81 @@ mod tests {
         assert!(message.contains(dir.path().to_str().unwrap()));
         // Verify it's not just the generic "no key found" message
         assert!(!message.contains("No Linear API key found"));
+    }
+
+    #[test]
+    fn errors_when_config_file_cannot_be_read() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory in place of config.toml fails to read with something other than
+        // NotFound - this must not be silently treated as "no config".
+        fs::create_dir(dir.path().join("config.toml")).unwrap();
+
+        let err = resolve_api_key(Some(dir.path()), Some("lin_api_from_env")).unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("could not be read"));
+        assert!(message.contains(dir.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn reads_project_id_override_from_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.toml"),
+            "project_id = \"proj-123\"\n",
+        )
+        .unwrap();
+
+        let project_id = resolve_project_id_override(Some(dir.path())).unwrap();
+
+        assert_eq!(project_id, Some("proj-123".to_string()));
+    }
+
+    #[test]
+    fn returns_none_when_config_file_missing_for_project_id() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let project_id = resolve_project_id_override(Some(dir.path())).unwrap();
+
+        assert_eq!(project_id, None);
+    }
+
+    #[test]
+    fn returns_none_when_project_id_is_empty_or_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.toml"), "project_id = \"   \"\n").unwrap();
+
+        let project_id = resolve_project_id_override(Some(dir.path())).unwrap();
+
+        assert_eq!(project_id, None);
+    }
+
+    #[test]
+    fn returns_none_when_config_file_has_no_project_id() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.toml"), "api_key = \"lin_api_x\"\n").unwrap();
+
+        let project_id = resolve_project_id_override(Some(dir.path())).unwrap();
+
+        assert_eq!(project_id, None);
+    }
+
+    #[test]
+    fn returns_none_when_config_dir_is_unknown_for_project_id() {
+        let project_id = resolve_project_id_override(None).unwrap();
+
+        assert_eq!(project_id, None);
+    }
+
+    #[test]
+    fn errors_immediately_on_malformed_toml_for_project_id() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.toml"), "this is [invalid toml\n").unwrap();
+
+        let err = resolve_project_id_override(Some(dir.path())).unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("not valid TOML"));
+        assert!(message.contains(dir.path().to_str().unwrap()));
     }
 }
