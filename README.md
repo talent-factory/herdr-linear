@@ -256,12 +256,12 @@ description = "Open Linear panel (tab)"
 
 Reload the config, then press the bound key to open the plugin. The panel opens on a
 menu with three options: "My Issues" (available), "Project Issues" (coming soon),
-and "Team Issues" (coming soon). Use `↑`/`↓` to navigate the menu, `Enter` to open
-the highlighted view. Once inside a view, use `↑`/`↓` to navigate the issue list,
-`o` to open the selected issue in your browser, `r` to retry after an error, and
-`Esc` to return to the menu. Press `q` to quit from anywhere (menu or view).
-Pressing the key again focuses the panel if it's open elsewhere, or closes it if
-it's already focused.
+and "Team Issues" (coming soon). From the menu, use `↑`/`↓` to navigate options,
+`Enter` to open the highlighted view, and `q` or `Esc` to quit. Once inside a view,
+use `↑`/`↓` to navigate the issue list, `o` to open the selected issue in your browser,
+`r` to retry after an error, and `Esc` to return to the menu. Press `q` to quit the
+panel from anywhere (menu or view). Pressing the key again focuses the panel if it's
+open elsewhere, or closes it if it's already focused.
 
 ## License
 
