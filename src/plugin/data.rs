@@ -82,7 +82,7 @@ async fn fetch_issues_paginated(
 
 /// Fetch the open (not completed, not canceled) issues assigned to the currently
 /// authenticated user, paginating past a single page the same way
-/// [`fetch_project_issues`] does (see [`fetch_issues_paginated`]) so a user with more
+/// [`fetch_project_issues`] does (see `fetch_issues_paginated`) so a user with more
 /// than one page of open issues doesn't see a silently truncated list.
 ///
 /// `LinearClient` has no dedicated "my issues" call, so this composes
@@ -97,7 +97,7 @@ pub async fn fetch_my_issues(client: &LinearClient) -> Result<Vec<Issue>> {
 }
 
 /// Fetch every open issue of `project_id`, following `pageInfo.hasNextPage` past a single
-/// `get_issues` page via [`fetch_issues_paginated`] (a single page previously silently
+/// `get_issues` page via `fetch_issues_paginated` (a single page previously silently
 /// truncated an active project's backlog at 50 issues — see `MAX_PAGES` for the fetch's
 /// own upper bound).
 pub async fn fetch_project_issues(client: &LinearClient, project_id: &str) -> Result<Vec<Issue>> {
