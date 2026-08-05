@@ -160,11 +160,9 @@ fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState) {
 
                 let description = issue.description.as_deref().unwrap_or_default();
                 let options = tui_markdown::Options::new(MarkdownStyleSheet);
-                let body = Paragraph::new(tui_markdown::from_str_with_options(
-                    description,
-                    &options,
-                ))
-                .wrap(Wrap { trim: true });
+                let body =
+                    Paragraph::new(tui_markdown::from_str_with_options(description, &options))
+                        .wrap(Wrap { trim: true });
                 frame.render_widget(body, sections[1]);
 
                 let hyperlink =
