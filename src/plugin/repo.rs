@@ -1,7 +1,7 @@
 //! Resolves which Linear project corresponds to the current working directory: derives a
 //! repo name from `git remote`/the working directory, then matches it against Linear
-//! projects fetched via `LinearClient::get_projects`. A `project_id` override in
-//! config.toml (see `crate::plugin::config`) always wins over name matching.
+//! projects fetched via [`crate::client::LinearClient::get_projects`]. A `project_id`
+//! override in config.toml (see `crate::plugin::config`) always wins over name matching.
 
 use crate::{Error, Project, Result};
 
@@ -33,14 +33,17 @@ fn parse_repo_name_from_remote(remote_url: &str) -> Option<String> {
 
 /// Match `repo_name` against `projects` by name: case-insensitive exact match first — if
 /// exactly one project matches, it wins outright even when other projects would also
-/// substring-match. Otherwise falls back to a case-insensitive substring match (either
-/// direction), which only resolves when it narrows to exactly one project — zero or
-/// multiple candidates at either stage are both errors, never a "best guess". Pure
-/// function — takes an already-fetched project list, no network access, so it's
-/// deterministic and safe to unit test (see [`resolve_project_id`] for the override-aware
-/// entry point callers should use).
+/// substring-match. If more than one project matches exactly, that's an immediate
+/// ambiguous error — substring matching is never attempted in that case. If zero projects
+/// match exactly, falls back to a case-insensitive substring match (either direction),
+/// which only resolves when it narrows to exactly one project — zero or multiple
+/// candidates at either stage are both errors, never a "best guess". Pure function — takes
+/// an already-fetched project list, no network access, so it's deterministic and safe to
+/// unit test (see [`resolve_project_id`] for the override-aware entry point callers should
+/// use).
 pub fn match_project<'a>(repo_name: &str, projects: &'a [Project]) -> Result<&'a Project> {
-    if repo_name.trim().is_empty() {
+    let repo_name = repo_name.trim();
+    if repo_name.is_empty() {
         return Err(no_match_error(repo_name));
     }
 
@@ -97,7 +100,7 @@ pub fn resolve_project_id(
     projects: &[Project],
 ) -> Result<String> {
     if let Some(override_id) = project_id_override {
-        if !override_id.is_empty() {
+        if !override_id.trim().is_empty() {
             return Ok(override_id.to_string());
         }
     }
@@ -106,15 +109,31 @@ pub fn resolve_project_id(
 
 /// Derive the repo name from the real environment: `git remote get-url origin` in the
 /// current working directory, falling back to the cwd's directory name. Thin wrapper
-/// around [`derive_repo_name`] used by the binary.
+/// around [`derive_repo_name`]; not yet called from the binary (see TF-578).
 pub fn detect_repo_name() -> String {
-    let remote_url = std::process::Command::new("git")
+    let remote_url = match std::process::Command::new("git")
         .args(["remote", "get-url", "origin"])
         .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|s| s.trim().to_string());
+    {
+        Ok(output) if output.status.success() => match String::from_utf8(output.stdout) {
+            Ok(s) => Some(s.trim().to_string()),
+            Err(e) => {
+                tracing::warn!("git remote get-url origin returned non-UTF-8 output: {e}");
+                None
+            }
+        },
+        // Non-zero exit: could be "no such remote" (expected, falls back to cwd below)
+        // or something worse (not a repo, corrupted repo) - log it so it's diagnosable.
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::debug!("git remote get-url origin failed: {}", stderr.trim());
+            None
+        }
+        Err(e) => {
+            tracing::warn!("Failed to invoke `git`: {e} (is git installed and on PATH?)");
+            None
+        }
+    };
 
     let cwd_dir_name = std::env::current_dir()
         .ok()
@@ -189,6 +208,17 @@ mod tests {
     }
 
     #[test]
+    fn remote_with_empty_name_after_stripping_git_suffix_falls_back_to_cwd_dir_name() {
+        // The last path segment is exactly ".git" - stripping the suffix leaves an empty
+        // name, which must not be treated as a usable repo name.
+        let name = derive_repo_name(
+            Some("https://github.com/talent-factory/.git"),
+            "my-local-repo",
+        );
+        assert_eq!(name, "my-local-repo");
+    }
+
+    #[test]
     fn exact_match_wins_over_substring_collision() {
         let projects = vec![
             test_project("p1", "herdr-linear"),
@@ -219,6 +249,18 @@ mod tests {
         let projects = vec![test_project("p1", "herdr-linear-plugin")];
 
         let matched = match_project("herdr-linear", &projects).unwrap();
+
+        assert_eq!(matched.id, "p1");
+    }
+
+    #[test]
+    fn reverse_substring_match_resolves_when_repo_name_is_more_specific() {
+        // The repo name is longer/more specific than the project name (e.g. a monorepo
+        // checked out under a suffixed directory/remote name) - substring matching must
+        // work in this direction too, not just "project name contains repo name".
+        let projects = vec![test_project("p1", "herdr-linear")];
+
+        let matched = match_project("herdr-linear-monorepo", &projects).unwrap();
 
         assert_eq!(matched.id, "p1");
     }

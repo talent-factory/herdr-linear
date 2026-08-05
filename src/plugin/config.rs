@@ -13,16 +13,25 @@ struct ConfigFile {
 
 /// Reads and parses `config_dir/config.toml`, if `config_dir` is given and the file
 /// exists. `Ok(None)` means there's nothing to read (no config dir, or no file at that
-/// path) — that's the normal case, not an error. `Err` only when the file exists but isn't
-/// valid TOML.
+/// path) — that's the normal case, not an error. `Err` when the file exists but isn't
+/// valid TOML, or when it exists but couldn't be read (permission denied, not valid UTF-8,
+/// a directory in its place, etc.) — only a missing file is silently treated as "no config".
 fn read_config_file(config_dir: Option<&Path>) -> Result<Option<ConfigFile>> {
     let Some(dir) = config_dir else {
         return Ok(None);
     };
     let config_path = dir.join("config.toml");
-    let Ok(contents) = std::fs::read_to_string(&config_path) else {
-        // File doesn't exist - nothing to read.
-        return Ok(None);
+    let contents = match std::fs::read_to_string(&config_path) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            tracing::warn!("Failed to read {}: {}", config_path.display(), e);
+            return Err(Error::ConfigError(format!(
+                "{} exists but could not be read: {}",
+                config_path.display(),
+                e
+            )));
+        }
     };
     toml::from_str::<ConfigFile>(&contents)
         .map(Some)
@@ -65,12 +74,12 @@ pub fn resolve_api_key(config_dir: Option<&Path>, env_api_key: Option<&str>) -> 
 
 /// Resolve a `project_id` override: `config_dir/config.toml`'s `project_id` field, if set
 /// and non-empty. `Ok(None)` means "no override" (callers fall back to name matching, see
-/// `crate::plugin::repo::resolve_project_id`) — it is not an error. Pure function —
+/// [`crate::plugin::repo::resolve_project_id`]) — it is not an error. Pure function —
 /// callers own reading the real environment (see [`load_project_id_override`]).
 pub fn resolve_project_id_override(config_dir: Option<&Path>) -> Result<Option<String>> {
     let project_id = read_config_file(config_dir)?
         .and_then(|file| file.project_id)
-        .filter(|id| !id.is_empty());
+        .filter(|id| !id.trim().is_empty());
     Ok(project_id)
 }
 
@@ -84,7 +93,7 @@ pub fn load() -> Result<String> {
 
 /// Resolve the `project_id` override from the real environment:
 /// `$HERDR_PLUGIN_CONFIG_DIR/config.toml`. Thin wrapper around
-/// [`resolve_project_id_override`] used by the binary.
+/// [`resolve_project_id_override`]; not yet called from the binary (see TF-578).
 pub fn load_project_id_override() -> Result<Option<String>> {
     let config_dir = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR").map(std::path::PathBuf::from);
     resolve_project_id_override(config_dir.as_deref())
@@ -161,6 +170,20 @@ mod tests {
     }
 
     #[test]
+    fn errors_when_config_file_cannot_be_read() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory in place of config.toml fails to read with something other than
+        // NotFound - this must not be silently treated as "no config".
+        fs::create_dir(dir.path().join("config.toml")).unwrap();
+
+        let err = resolve_api_key(Some(dir.path()), Some("lin_api_from_env")).unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("could not be read"));
+        assert!(message.contains(dir.path().to_str().unwrap()));
+    }
+
+    #[test]
     fn reads_project_id_override_from_config_file() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
@@ -177,6 +200,16 @@ mod tests {
     #[test]
     fn returns_none_when_config_file_missing_for_project_id() {
         let dir = tempfile::tempdir().unwrap();
+
+        let project_id = resolve_project_id_override(Some(dir.path())).unwrap();
+
+        assert_eq!(project_id, None);
+    }
+
+    #[test]
+    fn returns_none_when_project_id_is_empty_or_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.toml"), "project_id = \"   \"\n").unwrap();
 
         let project_id = resolve_project_id_override(Some(dir.path())).unwrap();
 
