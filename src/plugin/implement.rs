@@ -58,10 +58,20 @@ pub fn resolve_preferred_agent(agent_list_json: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Resolve the final agent command: `derived` (from other open tabs) wins, then
-/// `config_override` (`agent_command` in `config.toml`), then the `"hr"` default.
+/// Resolve the final agent command: an explicit `config_override` (`agent_command` in
+/// `config.toml`) always wins, then `derived` (from other open tabs), then the `"hr"` default.
+///
+/// `config_override` is checked first — not `derived` — because herdr's `agent list` can only
+/// ever report the *underlying binary* a pane is running (e.g. `"claude"`), never the shell
+/// alias/wrapper used to launch it. A pane started via an `hr` alias that itself execs `claude`
+/// (e.g. `alias hr='headroom wrap claude --memory --code-graph'`) is indistinguishable, from
+/// herdr's point of view, from one started with bare `claude`. If `derived` won, an explicit
+/// `agent_command = "hr"` (or the `"hr"` default) could never take effect once any other Claude
+/// pane is open — which, in practice, is effectively always. An explicit config choice should
+/// not be silently overridden by inference the plugin can't actually distinguish from the thing
+/// it's meant to override.
 pub fn resolve_agent_command(derived: Option<&str>, config_override: Option<&str>) -> String {
-    derived.or(config_override).unwrap_or("hr").to_string()
+    config_override.or(derived).unwrap_or("hr").to_string()
 }
 
 /// True if `command` is safe to interpolate into `sh -c <command>` (see [`build_shell_argv`])
@@ -188,13 +198,15 @@ mod tests {
     }
 
     #[test]
-    fn resolve_agent_command_prefers_the_derived_agent() {
-        assert_eq!(resolve_agent_command(Some("claude"), Some("hr")), "claude");
+    fn resolve_agent_command_prefers_the_config_override_over_derived() {
+        // An explicit `agent_command` always wins — herdr's `agent list` can't tell an
+        // alias-launched agent from a bare one, so `derived` must never silently override it.
+        assert_eq!(resolve_agent_command(Some("claude"), Some("hr")), "hr");
     }
 
     #[test]
-    fn resolve_agent_command_falls_back_to_the_config_override() {
-        assert_eq!(resolve_agent_command(None, Some("hr")), "hr");
+    fn resolve_agent_command_falls_back_to_derived_when_no_override_is_set() {
+        assert_eq!(resolve_agent_command(Some("codex"), None), "codex");
     }
 
     #[test]

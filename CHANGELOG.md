@@ -47,6 +47,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (quits) instead of being silently discarded along with buffered input (TF-584)
 - `herdr_cli`'s response parsing now treats a top-level `{"error": ...}` body as a
   failure even on a zero exit code, matching its own documented contract (TF-584)
+- Implement-on-`<Enter>`: `resolve_agent_command` now prefers an explicit `agent_command`
+  over the agent derived from other open herdr tabs (was the other way around). herdr's
+  tab list can only report the underlying binary a pane runs, never the alias/wrapper used
+  to launch it, so a pane started via an `hr`-style alias was indistinguishable from one
+  started bare — under the old precedence, `agent_command` (including the `"hr"` default)
+  could never actually take effect once any other Claude Code tab was open (TF-584)
+- Implement-on-`<Enter>`: `agent_wait` now retries (bounded, budget-aware) when `herdr agent
+  wait` returns a response missing the `result` field — a reproducible herdr v0.7.3 bug where
+  its wait stream closes as soon as the pane's agent identity is detected, well before the
+  agent is actually idle. Previously this surfaced as an immediate "agent didn't become
+  ready" error and the implement prompt was never injected (TF-584)
 
 ### Removed
 - Unused `cli` Cargo feature (and its `clap` dependency), superseded by the `plugin` feature

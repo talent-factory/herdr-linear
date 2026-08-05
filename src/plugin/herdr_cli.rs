@@ -4,6 +4,20 @@
 //! deliberately untested at this layer — same status as the existing `open::that(url)` call for
 //! the `o` key; see docs/superpowers/specs/2026-08-05-implement-on-enter-design.md for why. The
 //! response-interpretation half (`interpret_output`) is pure and unit-tested below.
+//!
+//! ## `agent_wait`'s retry-on-missing-`result` workaround
+//!
+//! herdr v0.7.3 has a reproducible bug: `herdr agent wait --status idle`'s underlying
+//! `events.subscribe` stream closes as soon as the target pane's *agent identity* is first
+//! detected (e.g. `previous_agent=None → agent=Some(Claude)`, logged the moment herdr notices
+//! which CLI is running in the pane), not when its *status* actually reaches the requested
+//! value — confirmed via `herdr-server.log` on every observed `agent.start` call, each followed
+//! within ~200ms by `outcome="stream_closed"`, long before the agent could plausibly be idle.
+//! The CLI then exits 0 with valid JSON missing the `result` field its own schema (`herdr api
+//! schema --json`) declares `required`. `agent_wait` retries specifically on this response (see
+//! [`is_missing_result_response`]) — the identity-transition event fires at most once per pane,
+//! so a retried call reliably observes the real status change instead. Revisit/remove once
+//! herdr fixes this upstream.
 
 use crate::error::Error;
 use crate::Result;
@@ -107,6 +121,14 @@ fn interpret_output(
         .ok_or_else(|| Error::Internal(format!("`{command_desc}` had no `result` field")))
 }
 
+/// True if `error` is herdr's known "no `result` field" response — see the module docs for the
+/// underlying stream-close race this works around. Distinguishes this one retryable case from a
+/// genuine failure (a real timeout, no such pane, an actual protocol error), so `agent_wait`
+/// only retries the failure mode retrying is likely to fix.
+fn is_missing_result_response(error: &Error) -> bool {
+    matches!(error, Error::Internal(msg) if msg.contains("had no `result` field"))
+}
+
 /// Run a `herdr` CLI subcommand, returning the parsed `result` field on success. See
 /// [`interpret_output`] for the success/failure mapping.
 async fn run(herdr_bin: &str, args: &[&str]) -> Result<Value> {
@@ -173,28 +195,50 @@ pub async fn tab_rename(herdr_bin: &str, tab_id: &TabId, label: &str) -> Result<
         .map(|_| ())
 }
 
-/// `herdr agent wait <pane_id> --status <status> --timeout <timeout_ms>`.
+/// Extra attempts `agent_wait` makes when herdr responds with the missing-`result` bug (see the
+/// module docs) before giving up and returning that error to the caller.
+const AGENT_WAIT_MAX_RETRIES: u32 = 2;
+
+/// `herdr agent wait <pane_id> --status <status> --timeout <timeout_ms>`. Retries, within the
+/// caller's original `timeout_ms` budget, when herdr responds with the missing-`result` bug
+/// documented at the top of this module — any other error (a real timeout, no such pane, ...)
+/// returns immediately.
 pub async fn agent_wait(
     herdr_bin: &str,
     pane_id: &PaneId,
     status: &str,
     timeout_ms: u64,
 ) -> Result<()> {
-    let timeout_str = timeout_ms.to_string();
-    run(
-        herdr_bin,
-        &[
-            "agent",
-            "wait",
-            pane_id.as_str(),
-            "--status",
-            status,
-            "--timeout",
-            &timeout_str,
-        ],
-    )
-    .await
-    .map(|_| ())
+    let start = std::time::Instant::now();
+    let mut attempt = 0;
+
+    loop {
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        let remaining_ms = timeout_ms.saturating_sub(elapsed_ms).max(1);
+        let timeout_str = remaining_ms.to_string();
+
+        let result = run(
+            herdr_bin,
+            &[
+                "agent",
+                "wait",
+                pane_id.as_str(),
+                "--status",
+                status,
+                "--timeout",
+                &timeout_str,
+            ],
+        )
+        .await;
+
+        match result {
+            Ok(_) => return Ok(()),
+            Err(err) if attempt < AGENT_WAIT_MAX_RETRIES && is_missing_result_response(&err) => {
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 /// `herdr agent send <pane_id> <text>`.
@@ -286,5 +330,35 @@ mod tests {
         let result = interpret_output("herdr agent list", true, r#"{"id":"cli:agent:list"}"#, "");
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn is_missing_result_response_matches_the_missing_result_error() {
+        let err = interpret_output(
+            "herdr agent wait wY:p1Q --status idle",
+            true,
+            r#"{"id":"x"}"#,
+            "",
+        )
+        .unwrap_err();
+
+        assert!(is_missing_result_response(&err));
+    }
+
+    #[test]
+    fn is_missing_result_response_does_not_match_other_internal_errors() {
+        let failed = interpret_output(
+            "herdr agent wait bogus",
+            false,
+            r#"{"error":{"message":"no such pane"}}"#,
+            "",
+        )
+        .unwrap_err();
+        let unparseable = interpret_output("herdr agent list", true, "not json", "").unwrap_err();
+        let spawn_failed = Error::Internal("Failed to run `herdr`: no such file".to_string());
+
+        assert!(!is_missing_result_response(&failed));
+        assert!(!is_missing_result_response(&unparseable));
+        assert!(!is_missing_result_response(&spawn_failed));
     }
 }

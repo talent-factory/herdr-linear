@@ -237,13 +237,18 @@ echo 'api_key = "lin_api_your_key_here"' > "$(herdr plugin config-dir herdr-line
 
 Or export `LINEAR_API_KEY` in the environment Herdr runs in.
 
-Optionally set `agent_command` in the same `config.toml` as a **fallback** coding agent
-for when you implement an issue (see "Use" below). It is not the first choice: if any
-other herdr tab is already running a recognized coding agent, that agent is preferred
-over `agent_command` every time — the setting only takes effect when no other agent tab
-is open. It defaults to `"hr"`, a personal shell alias — it won't exist for other users,
-so if you have no other herdr agent tabs open and don't set `agent_command`, either set
-it yourself or define an `hr` alias/function in your shell.
+Optionally set `agent_command` in the same `config.toml` to choose the coding agent started
+when you implement an issue (see "Use" below). If set, it **always** wins. If unset, the
+plugin looks at your other open herdr tabs and reuses whatever coding agent you're already
+running there; if none are open either, it falls back to `"hr"`, a personal shell alias — it
+won't exist for other users, so either set `agent_command` yourself or define an `hr`
+alias/function in your shell.
+
+(Earlier versions preferred the other-open-tabs guess over an explicit `agent_command`. That
+was reversed: herdr's tab list can only report the underlying binary a pane runs — e.g.
+`"claude"` — never the alias that launched it, so a pane started via `hr` looks identical to
+one started bare. Under the old precedence, `agent_command = "hr"` could never actually take
+effect once any other Claude Code tab was open.)
 
 ### Use
 
