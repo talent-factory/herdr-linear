@@ -84,6 +84,22 @@ fn ambiguous_error(repo_name: &str, candidates: &[&Project]) -> Error {
     ))
 }
 
+/// Composition entry point for project ID resolution: returns a project_id from either
+/// an override (which short-circuits outright if provided and non-empty), or by delegating
+/// to `match_project` to find a project by name. Callers: TF-578.
+pub fn resolve_project_id(
+    project_id_override: Option<&str>,
+    repo_name: &str,
+    projects: &[Project],
+) -> Result<String> {
+    if let Some(override_id) = project_id_override {
+        if !override_id.is_empty() {
+            return Ok(override_id.to_string());
+        }
+    }
+    match_project(repo_name, projects).map(|p| p.id.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +228,38 @@ mod tests {
     #[test]
     fn no_projects_at_all_errors() {
         let err = match_project("herdr-linear", &[]).unwrap_err();
+
+        assert!(err.to_string().contains("No Linear project matches"));
+    }
+
+    #[test]
+    fn override_short_circuits_without_matching_project() {
+        let id = resolve_project_id(Some("proj-999"), "anything", &[]).unwrap();
+
+        assert_eq!(id, "proj-999");
+    }
+
+    #[test]
+    fn empty_override_falls_back_to_matching() {
+        let projects = vec![test_project("p1", "herdr-linear")];
+
+        let id = resolve_project_id(Some(""), "herdr-linear", &projects).unwrap();
+
+        assert_eq!(id, "p1");
+    }
+
+    #[test]
+    fn no_override_delegates_to_match_project() {
+        let projects = vec![test_project("p1", "herdr-linear")];
+
+        let id = resolve_project_id(None, "herdr-linear", &projects).unwrap();
+
+        assert_eq!(id, "p1");
+    }
+
+    #[test]
+    fn no_override_and_no_match_propagates_error() {
+        let err = resolve_project_id(None, "herdr-linear", &[]).unwrap_err();
 
         assert!(err.to_string().contains("No Linear project matches"));
     }
