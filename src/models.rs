@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Represents a Linear user
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct User {
     pub id: String,
@@ -15,7 +15,7 @@ pub struct User {
 }
 
 /// Represents a Linear team
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Team {
     pub id: String,
@@ -27,7 +27,7 @@ pub struct Team {
 }
 
 /// Represents a Linear issue
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Issue {
     pub id: String,
@@ -60,7 +60,7 @@ pub struct IssueState {
 }
 
 /// Represents a Linear project
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Project {
     pub id: String,
@@ -77,7 +77,7 @@ pub struct Project {
 }
 
 /// Represents a Linear project's status
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectStatus {
     pub id: String,
@@ -86,7 +86,7 @@ pub struct ProjectStatus {
 }
 
 /// Represents a Linear cycle (sprint)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Cycle {
     pub id: String,
@@ -101,7 +101,7 @@ pub struct Cycle {
 }
 
 /// Represents a Linear label
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Label {
     pub id: String,
@@ -114,7 +114,7 @@ pub struct Label {
 
 /// Wraps an issue's `labels(first: N) { nodes { ... } }` selection, which the
 /// Linear API returns as a connection object rather than a bare array.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LabelConnection {
     pub nodes: Vec<Label>,
