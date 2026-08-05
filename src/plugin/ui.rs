@@ -3,11 +3,10 @@
 
 use crate::plugin::app::{App, Screen, ViewKind, ViewState, MENU_OPTIONS};
 use ratatui::{
-    buffer::{Buffer, CellDiffOption},
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout},
     style::{Modifier, Style},
-    text::Line,
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Widget, Wrap},
+    text::{Line, Text},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
 
@@ -43,11 +42,14 @@ fn draw_menu(frame: &mut Frame, selected: usize) {
     frame.render_stateful_widget(list, frame.area(), &mut list_state);
 }
 
-/// `tui-markdown`'s default `StyleSheet` renders heading markers literally
-/// (e.g. `"# Heading"`), which reads as raw Markdown syntax rather than a
-/// distinctly-formatted heading. This override drops the marker; the heading
-/// is still visually distinct via `StyleSheet::heading`'s bold/underline
-/// style (unchanged from the default).
+/// `tui-markdown`'s default `StyleSheet` renders heading markers and code
+/// fences literally (e.g. `"# Heading"`, a bare ` ``` ` line around a code
+/// block), which reads as raw Markdown syntax rather than distinctly
+/// formatted content. This override drops both markers; a heading stays
+/// visually distinct via the unmodified `StyleSheet::heading` (bold and
+/// underlined for H1, lighter treatments for lower levels), and code block
+/// content is still rendered via `StyleSheet::code` — only the surrounding
+/// fence line disappears.
 #[derive(Clone)]
 struct MarkdownStyleSheet;
 
@@ -55,78 +57,9 @@ impl tui_markdown::StyleSheet for MarkdownStyleSheet {
     fn heading_marker(&self, _level: u8) -> &str {
         ""
     }
-}
 
-/// A single-line widget that renders `text` normally, then wraps the trailing
-/// `url.chars().count()` cells — the URL substring at the end of `text`, e.g.
-/// `"URL: {url}"` — in an OSC 8 terminal hyperlink escape sequence. The escape
-/// bytes are zero-width to the terminal, so layout/wrapping is unaffected, and
-/// terminals without OSC 8 support just show the plain text.
-struct Hyperlink<'a> {
-    text: Line<'a>,
-    url: String,
-}
-
-impl<'a> Hyperlink<'a> {
-    fn new(text: Line<'a>, url: impl Into<String>) -> Self {
-        // `url` ends up interpolated verbatim into a live OSC 8 escape
-        // sequence (`\x1b]8;;{url}\x1b\`). It's server-controlled (a Linear
-        // issue URL) rather than user-typed, but stripping ASCII control
-        // bytes (ESC, BEL, ...) before embedding avoids any chance of a
-        // malformed/compromised value prematurely terminating the escape
-        // sequence and injecting arbitrary bytes into the terminal — the
-        // same hardening `bat`/`eza --hyperlink` apply to hyperlink targets.
-        let url = url.into().chars().filter(|c| !c.is_control()).collect();
-        Self { text, url }
-    }
-}
-
-impl Widget for &Hyperlink<'_> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        if area.is_empty() {
-            // Guards against a squeezed layout (e.g. a very short terminal)
-            // handing us a zero-height area: `Paragraph::render` already
-            // no-ops on that, but the manual cell-overlay loop below does
-            // not check `area.height` and would otherwise write into
-            // `area.y`, which — for a zero-height area — is a real row
-            // belonging to whatever widget is rendered next to/around it.
-            return;
-        }
-
-        Paragraph::new(self.text.clone()).render(area, buf);
-
-        let link_width = self.url.chars().count();
-        let total_width = self.text.width();
-        let start = total_width
-            .saturating_sub(link_width)
-            .min(area.width as usize);
-        let end = total_width.min(area.width as usize);
-
-        for x in start..end {
-            let Some(cell) = buf.cell_mut((area.x + x as u16, area.y)) else {
-                continue;
-            };
-            let symbol = cell.symbol().to_string();
-            let wrapped = match (x == start, x + 1 == end) {
-                (true, true) => format!("\x1b]8;;{}\x1b\\{symbol}\x1b]8;;\x1b\\", self.url),
-                (true, false) => format!("\x1b]8;;{}\x1b\\{symbol}", self.url),
-                (false, true) => format!("{symbol}\x1b]8;;\x1b\\"),
-                (false, false) => symbol,
-            };
-            cell.set_symbol(&wrapped);
-            // Without this, `Buffer::diff` computes this cell's display
-            // width from the raw symbol string via `unicode-width`, which
-            // has no concept of ANSI/OSC escape framing — every printable
-            // byte in the embedded OSC 8 sequence (the URL target, "]8;;",
-            // etc.) counts toward the computed width, making a single
-            // wrapped cell look tens of columns wide. `Terminal::draw` then
-            // treats that as one wide glyph and silently drops (skips) the
-            // following cells from the update it sends to the backend,
-            // blanking out the rest of the visible link text. Forcing the
-            // width back to 1 — this cell always represents exactly one
-            // visible terminal column — fixes that.
-            cell.set_diff_option(CellDiffOption::ForcedWidth(std::num::NonZeroU16::MIN));
-        }
+    fn code_block_fence(&self) -> &str {
+        ""
     }
 }
 
@@ -169,32 +102,57 @@ fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState) {
             frame.render_widget(detail_block, chunks[1]);
 
             if let Some(issue) = issues.get(*selected) {
-                let sections = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(5),
-                        Constraint::Min(0),
-                        Constraint::Length(1),
-                    ])
-                    .split(detail_area);
+                // Header (identifier/title/Status/Assignee/Project) and body
+                // (the Markdown description) are rendered as one continuous
+                // `Text` in a single `Min(0)` area rather than two areas split
+                // by a fixed-height header. A fixed header height clips
+                // whatever doesn't fit once a long title wraps past one line —
+                // exactly what happened to `State:` before this change — and
+                // there's no reliable way to pre-compute the wrapped height
+                // without depending on ratatui's unstable line-counting API.
+                // A single scrollable block sidesteps that entirely: nothing
+                // downstream of the title can be clipped by it.
+                let assignee = issue
+                    .assignee
+                    .as_ref()
+                    .map(|user| user.name.as_str())
+                    .unwrap_or("Unassigned");
+                let project = issue
+                    .project
+                    .as_ref()
+                    .map(|project| project.name.as_str())
+                    .unwrap_or("None");
 
-                let header = Paragraph::new(format!(
-                    "{}\n\n{}\n\nState: {}",
-                    issue.identifier, issue.title, issue.state.name
-                ))
-                .wrap(Wrap { trim: true });
-                frame.render_widget(header, sections[0]);
+                let mut lines = vec![
+                    Line::from(issue.identifier.as_str()),
+                    Line::from(""),
+                    Line::from(issue.title.as_str()),
+                    Line::from(""),
+                    Line::from(format!("Status: {}", issue.state.name)),
+                    Line::from(format!("Assignee: {assignee}")),
+                    Line::from(format!("Project: {project}")),
+                    Line::from(""),
+                ];
 
                 let description = issue.description.as_deref().unwrap_or_default();
                 let options = tui_markdown::Options::new(MarkdownStyleSheet);
-                let body =
-                    Paragraph::new(tui_markdown::from_str_with_options(description, &options))
-                        .wrap(Wrap { trim: true });
-                frame.render_widget(body, sections[1]);
+                lines.extend(tui_markdown::from_str_with_options(description, &options).lines);
 
-                let hyperlink =
-                    Hyperlink::new(Line::from(format!("URL: {}", issue.url)), issue.url.clone());
-                frame.render_widget(&hyperlink, sections[2]);
+                let sections = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(0), Constraint::Length(1)])
+                    .split(detail_area);
+
+                // `trim: false` preserves each line's leading whitespace, which
+                // is exactly what Markdown uses to convey nested lists and
+                // indented code — `trim: true` would strip it and flatten that
+                // structure away. The header lines above have no leading
+                // whitespace to begin with, so this is harmless for them.
+                let body = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+                frame.render_widget(body, sections[0]);
+
+                let footer = Paragraph::new(format!("URL: {}", issue.url));
+                frame.render_widget(footer, sections[1]);
             }
         }
     }
@@ -208,7 +166,31 @@ mod tests {
     use ratatui::{backend::TestBackend, Terminal};
     use serde_json::json;
 
-    fn sample_issue_json(identifier: &str, description: Option<&str>) -> serde_json::Value {
+    #[allow(clippy::too_many_arguments)]
+    fn sample_issue_json(
+        identifier: &str,
+        description: Option<&str>,
+        assignee_name: Option<&str>,
+        project_name: Option<&str>,
+    ) -> serde_json::Value {
+        let assignee = assignee_name.map(|name| {
+            json!({
+                "id": "user-2", "email": "b@example.com", "name": name,
+                "avatarUrl": null,
+                "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z"
+            })
+        });
+        let project = project_name.map(|name| {
+            json!({
+                "id": "project-1", "name": name, "description": null,
+                "url": "https://linear.app/team/project/proj-1",
+                "leadId": null, "lead": null,
+                "status": {"id": "status-1", "name": "Planned", "type": "planned"},
+                "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
+                "startDate": null, "targetDate": null
+            })
+        });
+
         json!({
             "id": format!("issue-{identifier}"),
             "identifier": identifier,
@@ -222,7 +204,7 @@ mod tests {
                 "description": null,
                 "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z"
             },
-            "assignee": null,
+            "assignee": assignee,
             "creator": {
                 "id": "user-1", "email": "a@example.com", "name": "Alice",
                 "avatarUrl": null,
@@ -233,19 +215,30 @@ mod tests {
             "startedAt": null,
             "completedAt": null,
             "cycle": null,
-            "project": null,
+            "project": project,
             "labels": {"nodes": []},
             "url": format!("https://linear.app/team/issue/{identifier}")
         })
     }
 
     fn sample_issue(identifier: &str) -> Issue {
-        serde_json::from_value(sample_issue_json(identifier, None)).expect("valid issue payload")
+        serde_json::from_value(sample_issue_json(identifier, None, None, None))
+            .expect("valid issue payload")
     }
 
     fn sample_issue_with_description(identifier: &str, description: &str) -> Issue {
-        serde_json::from_value(sample_issue_json(identifier, Some(description)))
+        serde_json::from_value(sample_issue_json(identifier, Some(description), None, None))
             .expect("valid issue payload")
+    }
+
+    fn sample_issue_with_metadata(identifier: &str, assignee: &str, project: &str) -> Issue {
+        serde_json::from_value(sample_issue_json(
+            identifier,
+            None,
+            Some(assignee),
+            Some(project),
+        ))
+        .expect("valid issue payload")
     }
 
     fn rendered_text_with_size(app: &App, width: u16, height: u16) -> String {
@@ -263,36 +256,6 @@ mod tests {
 
     fn rendered_text(app: &App) -> String {
         rendered_text_with_size(app, 60, 15)
-    }
-
-    /// Removes OSC 8 hyperlink escape sequences from `text`, leaving only
-    /// what a terminal would actually display. Without this, a naive
-    /// `contains(url)` check on `Hyperlink`-rendered text passes trivially
-    /// because the escape *open* sequence embeds the URL as its target
-    /// parameter (`\x1b]8;;{url}\x1b\`), regardless of whether the visible
-    /// characters that follow are correctly placed. Stripping escapes first
-    /// means assertions only pass if the reconstructed visible text is
-    /// actually correct.
-    fn strip_osc8_escapes(text: &str) -> String {
-        let mut result = String::new();
-        let mut chars = text.chars();
-        while let Some(c) = chars.next() {
-            if c != '\x1b' {
-                result.push(c);
-                continue;
-            }
-            // Consume the rest of the escape sequence up to and including
-            // its ST terminator (`\x1b\`), dropping it entirely.
-            let mut prev = c;
-            for next in chars.by_ref() {
-                let terminated = prev == '\x1b' && next == '\\';
-                prev = next;
-                if terminated {
-                    break;
-                }
-            }
-        }
-        result
     }
 
     /// An `App` that has already entered the "My Issues" view (still `Loading`).
@@ -349,59 +312,15 @@ mod tests {
     }
 
     #[test]
-    fn hyperlink_wraps_the_trailing_url_portion_in_osc8_escapes() {
-        let url = "https://example.com";
-        let hyperlink = Hyperlink::new(Line::from(format!("URL: {url}")), url);
-        let area = Rect::new(0, 0, 30, 1);
-        let mut buf = Buffer::empty(area);
-        Widget::render(&hyperlink, area, &mut buf);
-
-        let start = "URL: ".chars().count(); // 5
-        let url_len = url.chars().count(); // 20
-        let open = format!("\x1b]8;;{url}\x1b\\");
-        let close = "\x1b]8;;\x1b\\";
-
-        let first = buf.cell((start as u16, 0)).unwrap().symbol().to_string();
-        let last = buf
-            .cell(((start + url_len - 1) as u16, 0))
-            .unwrap()
-            .symbol()
-            .to_string();
-        let middle = buf
-            .cell(((start + 1) as u16, 0))
-            .unwrap()
-            .symbol()
-            .to_string();
-
-        assert!(first.starts_with(&open), "first cell was {first:?}");
-        assert!(last.ends_with(close), "last cell was {last:?}");
-        assert_eq!(middle, "t"); // second char of "https://..."
-
-        // Text before the link (the "URL: " label) is untouched.
-        assert_eq!(buf.cell((0, 0)).unwrap().symbol(), "U");
-        assert_eq!(buf.cell((4, 0)).unwrap().symbol(), " ");
-    }
-
-    #[test]
-    fn hyperlink_wraps_open_and_close_in_the_same_cell_for_a_single_character_link() {
-        let hyperlink = Hyperlink::new(Line::from("x"), "x");
-        let area = Rect::new(0, 0, 1, 1);
-        let mut buf = Buffer::empty(area);
-        Widget::render(&hyperlink, area, &mut buf);
-
-        let cell = buf.cell((0, 0)).unwrap().symbol().to_string();
-        assert_eq!(cell, "\x1b]8;;x\x1b\\x\x1b]8;;\x1b\\");
-    }
-
-    #[test]
     fn renders_issue_description_as_formatted_markdown() {
         let mut app = app_in_my_issues_view();
         app.set_issues(vec![sample_issue_with_description(
             "ENG-2",
-            "# Heading\n\n- item one\n- item two\n\n**bold** and `code`",
+            "# Heading\n\n- item one\n- item two\n\n**bold** and `code`\n\n\
+             ```rust\nlet answer = 42;\n```",
         )]);
 
-        let text = rendered_text(&app);
+        let text = rendered_text_with_size(&app, 100, 30);
         assert!(text.contains("Heading"));
         assert!(!text.contains("# Heading"));
         assert!(text.contains("item one"));
@@ -410,6 +329,10 @@ mod tests {
         assert!(!text.contains("**bold**"));
         assert!(text.contains("code"));
         assert!(!text.contains("`code`"));
+        // Regression: fenced code blocks previously showed the ``` fence
+        // markers literally instead of just the code content.
+        assert!(text.contains("let answer = 42;"));
+        assert!(!text.contains("```"));
     }
 
     #[test]
@@ -418,52 +341,54 @@ mod tests {
         app.set_issues(vec![sample_issue("ENG-3")]);
 
         let text = rendered_text_with_size(&app, 100, 20);
-        // The URL is OSC 8-wrapped by `Hyperlink`, so strip escapes first —
-        // otherwise this would pass trivially off the escape sequence's
-        // target parameter alone, without actually checking that the
-        // visible characters are placed correctly (that placement math is
-        // exercised directly by the `hyperlink_*` tests above; this test's
-        // job is to confirm `draw_view` wires the footer up at all).
-        let visible = strip_osc8_escapes(&text);
-        assert!(visible.contains("URL: https://linear.app/team/issue/ENG-3"));
+        assert!(text.contains("URL: https://linear.app/team/issue/ENG-3"));
     }
 
     #[test]
-    fn hyperlink_renders_nothing_on_a_zero_height_area() {
-        let hyperlink = Hyperlink::new(
-            Line::from("URL: https://example.com"),
-            "https://example.com",
-        );
-        let area = Rect::new(0, 0, 30, 0);
-        let mut buf = Buffer::empty(Rect::new(0, 0, 30, 1));
+    fn renders_status_assignee_and_project_in_the_detail_pane() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue_with_metadata(
+            "ENG-4",
+            "Alice",
+            "Herdr Linear",
+        )]);
 
-        // Render into a zero-height sub-area of a 1-row buffer; the row
-        // must be left completely untouched (regression test for a bug
-        // where the manual cell-overlay loop ignored `area.height` and
-        // wrote into `area.y` regardless).
-        Widget::render(&hyperlink, area, &mut buf);
-
-        for x in 0..30 {
-            assert_eq!(buf.cell((x, 0)).unwrap().symbol(), " ");
-        }
+        let text = rendered_text_with_size(&app, 100, 20);
+        assert!(text.contains("Status: In Progress"));
+        assert!(text.contains("Assignee: Alice"));
+        assert!(text.contains("Project: Herdr Linear"));
     }
 
     #[test]
-    fn hyperlink_stays_within_bounds_when_the_area_is_narrower_than_the_label() {
-        let url = "https://example.com";
-        let hyperlink = Hyperlink::new(Line::from(format!("URL: {url}")), url);
-        // "URL: " is 5 visible chars; a 4-wide area clips before the link
-        // portion of the line would even start (link start = 25 - 20 = 5,
-        // clamped to the 4-wide area — so the overlay range collapses to
-        // empty and nothing beyond column 3 is ever touched).
-        let area = Rect::new(0, 0, 4, 1);
-        let mut buf = Buffer::empty(area);
+    fn renders_unassigned_and_no_project_fallbacks_when_absent() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-5")]);
 
-        Widget::render(&hyperlink, area, &mut buf);
+        let text = rendered_text_with_size(&app, 100, 20);
+        assert!(text.contains("Assignee: Unassigned"));
+        assert!(text.contains("Project: None"));
+    }
 
-        for x in 0..4 {
-            let symbol = buf.cell((x, 0)).unwrap().symbol();
-            assert!(!symbol.contains('\x1b'), "cell {x} was {symbol:?}");
-        }
+    #[test]
+    fn does_not_clip_status_assignee_or_project_behind_a_long_wrapped_title() {
+        // Regression: a fixed-height header (`Constraint::Length(5)`) clipped
+        // `State:` (now `Status:`) once a long title wrapped past a single
+        // line — exactly the scenario a wide-but-long title forces here. The
+        // terminal is wide enough that "Status: In Progress" etc. don't wrap
+        // themselves (`rendered_text_with_size` flattens rows without line
+        // breaks, so a wrapped multi-line match wouldn't `contains()` cleanly —
+        // that's a test-harness limitation, not a rendering one), but narrow
+        // enough that the long title still wraps across several lines.
+        let mut app = app_in_my_issues_view();
+        let mut issue = sample_issue_with_metadata("ENG-6", "Alice", "Herdr Linear");
+        issue.title =
+            "A deliberately long issue title that will wrap across several lines in a narrow pane"
+                .to_string();
+        app.set_issues(vec![issue]);
+
+        let text = rendered_text_with_size(&app, 60, 20);
+        assert!(text.contains("Status: In Progress"));
+        assert!(text.contains("Assignee: Alice"));
+        assert!(text.contains("Project: Herdr Linear"));
     }
 }
