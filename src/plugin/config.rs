@@ -163,7 +163,11 @@ mod tests {
     #[test]
     fn reads_project_id_override_from_config_file() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("config.toml"), "project_id = \"proj-123\"\n").unwrap();
+        fs::write(
+            dir.path().join("config.toml"),
+            "project_id = \"proj-123\"\n",
+        )
+        .unwrap();
 
         let project_id = resolve_project_id_override(Some(dir.path())).unwrap();
 
