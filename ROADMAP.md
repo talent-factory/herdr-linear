@@ -10,9 +10,7 @@ A complete, production-ready Rust client for Linear.app's GraphQL API, providing
 
 ## Phases
 
-### Phase 1: Core Foundations ✅ (Current)
-
-**Status**: In Progress
+### Phase 1: Core Foundations ✅ Complete
 
 - [x] Basic GraphQL query/mutation execution
 - [x] Viewer/authentication
@@ -24,13 +22,43 @@ A complete, production-ready Rust client for Linear.app's GraphQL API, providing
 - [x] Error handling and logging
 - [x] Documentation and examples
 - [x] CI/CD pipeline
-- [ ] Comprehensive test coverage (→ Phase 1.5)
+- [x] Test coverage (55 unit/integration tests across client + plugin)
 
-### Phase 1.5: Polish & Stability
+### Plugin v1: "My Issues" Panel ✅ Complete (Current)
+
+Delivered ahead of the original schedule as part of what Phase 3 called
+"Herdr Plugin Development" — a read-only Herdr split-pane/tab plugin.
+
+- [x] Plugin manifest, launcher scripts, `herdr plugin install`
+- [x] Config resolution (`config.toml` → `LINEAR_API_KEY`)
+- [x] TUI: loading/loaded/error states, list navigation
+- [x] Fetch the viewer's assigned issues
+- [x] Open selected issue in browser, retry-on-error
+
+**Known gap**: the panel only ever shows *my* assigned issues across *all*
+teams/projects — no way to scope to the project you're actually working in,
+or to switch views. See Phase 1.6 below.
+
+### Phase 1.6: Smart Issue Selection (Plugin v2)
 
 **Estimated**: August-September 2026
 
-- [ ] Unit test coverage (80%+)
+Closes the gap between this Rust reimplementation and the original
+[JacquesvanWyk/herdr-linear](https://github.com/JacquesvanWyk/herdr-linear)
+plugin it's modeled after, which lets you drill into projects and search
+rather than only ever showing "my issues". Tracked as issues in the
+[herdr-linear Linear project](https://linear.app/talent-factory/project/herdr-linear-10dca51ea35b/overview).
+
+- [ ] View switcher: My Issues / Project Issues / Team Issues
+- [ ] Detect the Linear project for the current working directory (git
+      repo → Linear project mapping) and show its open issues
+- [ ] Issue search/filter within the panel (fzf-style)
+- [ ] Create issue from the plugin
+
+### Phase 1.5: Polish & Stability
+
+**Estimated**: September 2026
+
 - [ ] Integration tests with Linear sandbox
 - [ ] Performance benchmarks
 - [ ] Rate limiting strategies
@@ -66,10 +94,7 @@ A complete, production-ready Rust client for Linear.app's GraphQL API, providing
 
 **Estimated**: October-November 2026
 
-- [ ] **Herdr Plugin Development**
-  - Plugin SDK integration
-  - Issue sync strategies
-  - Team synchronization
+- [x] **Herdr Plugin Development** — see Plugin v1/v2 above
 
 - [ ] **Sync Engine**
   - Bidirectional sync with Herdr
@@ -163,13 +188,15 @@ Have ideas? Please:
 
 ## Schedule & Milestones
 
-| Date       | Milestone                    | Status   |
-|-----------|------------------------------|----------|
-| Aug 2026  | Phase 1 Complete            | Current  |
-| Sep 2026  | Phase 1.5 (Stability)       | Planned  |
-| Oct 2026  | Phase 2 (Advanced Features) | Planned  |
-| Nov 2026  | Phase 3 (Herdr Integration) | Planned  |
-| Dec 2026  | Phase 4 (Production)        | Planned  |
+| Date       | Milestone                       | Status    |
+|-----------|----------------------------------|-----------|
+| Aug 2026  | Phase 1 Complete                | Done      |
+| Aug 2026  | Plugin v1 ("My Issues") Complete | Done      |
+| Sep 2026  | Phase 1.6 (Smart Issue Selection)| Current   |
+| Sep 2026  | Phase 1.5 (Stability)            | Planned   |
+| Oct 2026  | Phase 2 (Advanced Features)     | Planned   |
+| Nov 2026  | Phase 3 (Herdr Integration)     | Planned   |
+| Dec 2026  | Phase 4 (Production)            | Planned   |
 
 ## Feedback
 
@@ -179,4 +206,4 @@ Have ideas? Please:
 
 ---
 
-Last updated: 2026-08-04
+Last updated: 2026-08-05
