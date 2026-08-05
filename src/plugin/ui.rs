@@ -113,7 +113,6 @@ fn draw_view(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,7 +223,10 @@ mod tests {
     fn renders_the_status_banner_when_present() {
         let mut app = app_in_my_issues_view();
         app.set_issues(vec![sample_issue("ENG-1")]);
-        app.set_status("ENG-1: tab opened, agent started, set to In Progress.".to_string(), false);
+        app.set_status(
+            "ENG-1: tab opened, agent started, set to In Progress.".to_string(),
+            false,
+        );
 
         let text = rendered_text(&app);
         assert!(text.contains("ENG-1: tab opened, agent started, set to In Progress."));

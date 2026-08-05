@@ -269,7 +269,11 @@ mod tests {
     #[test]
     fn reads_agent_command_from_config_file() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("config.toml"), "agent_command = \"my-agent\"\n").unwrap();
+        fs::write(
+            dir.path().join("config.toml"),
+            "agent_command = \"my-agent\"\n",
+        )
+        .unwrap();
 
         let agent_command = resolve_agent_command_override(Some(dir.path())).unwrap();
 

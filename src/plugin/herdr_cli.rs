@@ -99,9 +99,7 @@ pub async fn agent_start(
         .get("agent")
         .and_then(|a| a.get("pane_id"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            Error::Internal("agent.start response missing agent.pane_id".to_string())
-        })?
+        .ok_or_else(|| Error::Internal("agent.start response missing agent.pane_id".to_string()))?
         .to_string();
     let tab_id = result
         .get("agent")
@@ -121,7 +119,12 @@ pub async fn tab_rename(herdr_bin: &str, tab_id: &str, label: &str) -> Result<()
 }
 
 /// `herdr agent wait <pane_id> --status <status> --timeout <timeout_ms>`.
-pub async fn agent_wait(herdr_bin: &str, pane_id: &str, status: &str, timeout_ms: u64) -> Result<()> {
+pub async fn agent_wait(
+    herdr_bin: &str,
+    pane_id: &str,
+    status: &str,
+    timeout_ms: u64,
+) -> Result<()> {
     let timeout_str = timeout_ms.to_string();
     run(
         herdr_bin,
