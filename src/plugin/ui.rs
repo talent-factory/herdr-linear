@@ -1,10 +1,10 @@
 //! Rendering for the plugin TUI: a view-selection menu, a loading message, an error
 //! message with a retry hint, or a two-pane issue list + detail view.
 
-use crate::plugin::app::{App, Screen, ViewKind, ViewState, MENU_OPTIONS};
+use crate::plugin::app::{App, Screen, Status, ViewKind, ViewState, MENU_OPTIONS};
 use ratatui::{
     layout::{Constraint, Direction, Layout},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
@@ -41,12 +41,7 @@ fn draw_menu(frame: &mut Frame, selected: usize) {
     frame.render_stateful_widget(list, frame.area(), &mut list_state);
 }
 
-fn draw_view(
-    frame: &mut Frame,
-    kind: ViewKind,
-    view_state: &ViewState,
-    status: Option<(&str, bool)>,
-) {
+fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState, status: Option<&Status>) {
     match view_state {
         ViewState::Loading => {
             let paragraph = Paragraph::new("Loading issues...")
@@ -64,17 +59,25 @@ fn draw_view(
             frame.render_widget(paragraph, frame.area());
         }
         ViewState::Loaded { issues, selected } => {
-            let area = if let Some((text, is_error)) = status {
+            let area = if let Some(status) = status {
                 let outer = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([Constraint::Min(3), Constraint::Length(1)])
+                    // 3 rows (not 1) so a long error message — these can nest a whole
+                    // underlying `herdr`/Linear error plus a manual-fallback prompt — wraps
+                    // instead of being silently truncated at terminal width.
+                    .constraints([Constraint::Min(3), Constraint::Length(3)])
                     .split(frame.area());
-                let style = if is_error {
-                    Style::default().add_modifier(Modifier::BOLD)
+                let style = if status.is_error() {
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default()
+                    Style::default().fg(Color::Green)
                 };
-                frame.render_widget(Paragraph::new(text).style(style), outer[1]);
+                frame.render_widget(
+                    Paragraph::new(status.text())
+                        .style(style)
+                        .wrap(Wrap { trim: false }),
+                    outer[1],
+                );
                 outer[0]
             } else {
                 frame.area()
@@ -223,10 +226,9 @@ mod tests {
     fn renders_the_status_banner_when_present() {
         let mut app = app_in_my_issues_view();
         app.set_issues(vec![sample_issue("ENG-1")]);
-        app.set_status(
+        app.set_status(Status::Ok(
             "ENG-1: tab opened, agent started, set to In Progress.".to_string(),
-            false,
-        );
+        ));
 
         let text = rendered_text(&app);
         assert!(text.contains("ENG-1: tab opened, agent started, set to In Progress."));
@@ -236,7 +238,9 @@ mod tests {
     fn renders_an_error_status_banner() {
         let mut app = app_in_my_issues_view();
         app.set_issues(vec![sample_issue("ENG-1")]);
-        app.set_status("ENG-1: failed to start agent tab: boom".to_string(), true);
+        app.set_status(Status::Error(
+            "ENG-1: failed to start agent tab: boom".to_string(),
+        ));
 
         let text = rendered_text(&app);
         assert!(text.contains("ENG-1: failed to start agent tab: boom"));

