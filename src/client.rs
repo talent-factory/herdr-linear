@@ -502,4 +502,162 @@ mod tests {
 
         assert!(matches!(err, Error::RateLimitExceeded { .. }));
     }
+
+    #[tokio::test]
+    async fn get_projects_parses_a_project_with_a_lead() {
+        // Regression test: `Project.lead` deserializes into `User`, which requires
+        // `avatarUrl`/`createdAt`/`updatedAt` alongside `id`/`email`/`name` (no
+        // `#[serde(default)]`). QUERY_PROJECTS's `lead` sub-selection previously only
+        // asked for `id`/`name`/`email`, so a real (well-formed, matching what was
+        // actually selected) API response failed to parse with "missing field
+        // `createdAt`" — this mock mirrors the full `User` shape the query now selects.
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "data": {
+                        "projects": {
+                            "nodes": [{
+                                "id": "project-1",
+                                "name": "herdr-linear",
+                                "description": "",
+                                "url": "https://linear.app/talent-factory/project/herdr-linear",
+                                "status": { "id": "status-1", "name": "Backlog", "type": "backlog" },
+                                "createdAt": "2026-01-01T00:00:00Z",
+                                "updatedAt": "2026-01-01T00:00:00Z",
+                                "startDate": null,
+                                "targetDate": null,
+                                "lead": {
+                                    "id": "user-1",
+                                    "name": "Daniel Senften",
+                                    "email": "daniel@example.com",
+                                    "avatarUrl": null,
+                                    "createdAt": "2026-01-01T00:00:00Z",
+                                    "updatedAt": "2026-01-01T00:00:00Z"
+                                }
+                            }],
+                            "pageInfo": {
+                                "hasNextPage": false,
+                                "hasPreviousPage": false,
+                                "startCursor": null,
+                                "endCursor": null
+                            }
+                        }
+                    },
+                    "errors": null
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let connection = client
+            .get_projects(None, Some(50), None)
+            .await
+            .expect("a project whose lead has the full User shape should parse");
+
+        assert_eq!(connection.nodes.len(), 1);
+        assert_eq!(
+            connection.nodes[0].lead.as_ref().map(|u| u.name.as_str()),
+            Some("Daniel Senften")
+        );
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn get_issues_parses_an_issue_with_a_cycle() {
+        // Regression test: `Issue.cycle` deserializes into `Cycle`, whose `team` field is
+        // required (non-`Option`) — but QUERY_ISSUES's `cycle` sub-selection never asked
+        // for it. Any issue actually assigned to a cycle would fail to parse with
+        // "missing field `team`", breaking the whole `get_issues()` call (a single
+        // unparseable node fails the surrounding `Vec<Issue>` deserialization). This
+        // mirrors a realistic response for an issue with a cycle set.
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "data": {
+                        "issues": {
+                            "nodes": [{
+                                "id": "issue-1",
+                                "identifier": "ENG-1",
+                                "title": "Test issue",
+                                "description": null,
+                                "priority": 0,
+                                "estimate": null,
+                                "url": "https://linear.app/team/issue/ENG-1",
+                                "createdAt": "2026-01-01T00:00:00Z",
+                                "updatedAt": "2026-01-01T00:00:00Z",
+                                "startedAt": null,
+                                "completedAt": null,
+                                "state": { "id": "state-1", "name": "In Progress", "type": "started" },
+                                "team": {
+                                    "id": "team-1", "key": "ENG", "name": "Engineering",
+                                    "description": null,
+                                    "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z"
+                                },
+                                "assignee": null,
+                                "creator": null,
+                                "cycle": {
+                                    "id": "cycle-1",
+                                    "number": 12,
+                                    "name": "Sprint 12",
+                                    "team": {
+                                        "id": "team-1", "key": "ENG", "name": "Engineering",
+                                        "description": null,
+                                        "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z"
+                                    },
+                                    "createdAt": "2026-01-01T00:00:00Z",
+                                    "updatedAt": "2026-01-01T00:00:00Z",
+                                    "startsAt": "2026-01-01T00:00:00Z",
+                                    "endsAt": "2026-01-15T00:00:00Z",
+                                    "completedAt": null
+                                },
+                                "project": null,
+                                "labels": { "nodes": [] }
+                            }],
+                            "pageInfo": {
+                                "hasNextPage": false,
+                                "hasPreviousPage": false,
+                                "startCursor": null,
+                                "endCursor": null
+                            }
+                        }
+                    },
+                    "errors": null
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let connection = client
+            .get_issues(None, Some(50), None)
+            .await
+            .expect("an issue whose cycle has the full Cycle shape should parse");
+
+        assert_eq!(connection.nodes.len(), 1);
+        assert_eq!(
+            connection.nodes[0]
+                .cycle
+                .as_ref()
+                .map(|c| c.team.key.as_str()),
+            Some("ENG")
+        );
+        mock.assert_async().await;
+    }
 }

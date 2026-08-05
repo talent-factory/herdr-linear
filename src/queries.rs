@@ -107,6 +107,14 @@ query Issues(
         id
         number
         name
+        team {
+          id
+          key
+          name
+          description
+          createdAt
+          updatedAt
+        }
         createdAt
         updatedAt
         startsAt
@@ -197,6 +205,14 @@ query Issue($id: String!) {
       id
       number
       name
+      team {
+        id
+        key
+        name
+        description
+        createdAt
+        updatedAt
+      }
       createdAt
       updatedAt
       startsAt
@@ -271,6 +287,19 @@ mutation CreateIssue($input: IssueCreateInput!) {
         id
         key
         name
+        description
+        createdAt
+        updatedAt
+      }
+      labels(first: 50) {
+        nodes {
+          id
+          name
+          color
+          description
+          createdAt
+          updatedAt
+        }
       }
     }
   }
@@ -289,15 +318,39 @@ mutation UpdateIssue($id: String!, $input: IssueUpdateInput!) {
       description
       priority
       estimate
+      url
+      createdAt
+      updatedAt
       state {
         id
         name
         type
       }
+      team {
+        id
+        key
+        name
+        description
+        createdAt
+        updatedAt
+      }
       assignee {
         id
-        name
         email
+        name
+        avatarUrl
+        createdAt
+        updatedAt
+      }
+      labels(first: 50) {
+        nodes {
+          id
+          name
+          color
+          description
+          createdAt
+          updatedAt
+        }
       }
     }
   }
@@ -314,10 +367,14 @@ mutation AddComment($input: CommentCreateInput!) {
       body
       user {
         id
-        name
         email
+        name
+        avatarUrl
+        createdAt
+        updatedAt
       }
       createdAt
+      updatedAt
     }
   }
 }
@@ -343,8 +400,11 @@ query Projects($first: Int, $after: String, $filter: ProjectFilter) {
       targetDate
       lead {
         id
-        name
         email
+        name
+        avatarUrl
+        createdAt
+        updatedAt
       }
     }
     pageInfo {
@@ -374,6 +434,9 @@ query Cycles($filter: CycleFilter, $first: Int, $after: String) {
         id
         key
         name
+        description
+        createdAt
+        updatedAt
       }
     }
     pageInfo {
