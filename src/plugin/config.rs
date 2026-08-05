@@ -9,6 +9,7 @@ use std::path::Path;
 struct ConfigFile {
     api_key: Option<String>,
     project_id: Option<String>,
+    agent_command: Option<String>,
 }
 
 /// Reads and parses `config_dir/config.toml`, if `config_dir` is given and the file
@@ -83,6 +84,18 @@ pub fn resolve_project_id_override(config_dir: Option<&Path>) -> Result<Option<S
     Ok(project_id)
 }
 
+/// Resolve an `agent_command` override: `config_dir/config.toml`'s `agent_command` field, if
+/// set and non-empty. `Ok(None)` means "no override" (callers fall back to the agent name
+/// derived from other open herdr tabs, then finally `"hr"` — see
+/// [`crate::plugin::implement::resolve_agent_command`]). Pure function — callers own reading
+/// the real environment (see [`load_agent_command_override`]).
+pub fn resolve_agent_command_override(config_dir: Option<&Path>) -> Result<Option<String>> {
+    let agent_command = read_config_file(config_dir)?
+        .and_then(|file| file.agent_command)
+        .filter(|cmd| !cmd.trim().is_empty());
+    Ok(agent_command)
+}
+
 /// Resolve the Linear API key from the real environment: `$HERDR_PLUGIN_CONFIG_DIR/config.toml`
 /// then `$LINEAR_API_KEY`. Thin wrapper around [`resolve_api_key`] used by the binary.
 pub fn load() -> Result<String> {
@@ -99,9 +112,17 @@ pub fn load_project_id_override() -> Result<Option<String>> {
     resolve_project_id_override(config_dir.as_deref())
 }
 
+/// Resolve the `agent_command` override from the real environment:
+/// `$HERDR_PLUGIN_CONFIG_DIR/config.toml`. Thin wrapper around
+/// [`resolve_agent_command_override`]; called from `main.rs`'s `start_implementation`.
+pub fn load_agent_command_override() -> Result<Option<String>> {
+    let config_dir = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR").map(std::path::PathBuf::from);
+    resolve_agent_command_override(config_dir.as_deref())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{resolve_api_key, resolve_project_id_override};
+    use super::{resolve_agent_command_override, resolve_api_key, resolve_project_id_override};
     use std::fs;
 
     #[test]
@@ -239,6 +260,57 @@ mod tests {
         fs::write(dir.path().join("config.toml"), "this is [invalid toml\n").unwrap();
 
         let err = resolve_project_id_override(Some(dir.path())).unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("not valid TOML"));
+        assert!(message.contains(dir.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn reads_agent_command_from_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.toml"), "agent_command = \"my-agent\"\n").unwrap();
+
+        let agent_command = resolve_agent_command_override(Some(dir.path())).unwrap();
+
+        assert_eq!(agent_command, Some("my-agent".to_string()));
+    }
+
+    #[test]
+    fn returns_none_when_config_file_missing_for_agent_command() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let agent_command = resolve_agent_command_override(Some(dir.path())).unwrap();
+
+        assert_eq!(agent_command, None);
+    }
+
+    #[test]
+    fn returns_none_when_agent_command_is_empty_or_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.toml"), "agent_command = \"   \"\n").unwrap();
+
+        let agent_command = resolve_agent_command_override(Some(dir.path())).unwrap();
+
+        assert_eq!(agent_command, None);
+    }
+
+    #[test]
+    fn returns_none_when_config_file_has_no_agent_command() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.toml"), "api_key = \"lin_api_x\"\n").unwrap();
+
+        let agent_command = resolve_agent_command_override(Some(dir.path())).unwrap();
+
+        assert_eq!(agent_command, None);
+    }
+
+    #[test]
+    fn errors_immediately_on_malformed_toml_for_agent_command() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.toml"), "this is [invalid toml\n").unwrap();
+
+        let err = resolve_agent_command_override(Some(dir.path())).unwrap_err();
 
         let message = err.to_string();
         assert!(message.contains("not valid TOML"));
