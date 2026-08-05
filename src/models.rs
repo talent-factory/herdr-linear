@@ -56,7 +56,7 @@ pub struct Issue {
 pub struct IssueState {
     pub id: String,
     pub name: String,
-    pub r#type: String, // "backlog", "unstarted", "started", "completed", "canceled"
+    pub r#type: String, // "triage", "backlog", "unstarted", "started", "completed", "canceled"
 }
 
 /// Represents a Linear project

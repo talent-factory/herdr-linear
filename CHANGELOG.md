@@ -25,15 +25,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Contributing guide
 - Roadmap
 - Herdr plugin layer, gated behind the new `plugin` Cargo feature: a ratatui/crossterm
-  TUI panel showing the viewer's assigned Linear issues (navigate, open in browser,
+  TUI panel showing the viewer's open assigned Linear issues (navigate, open in browser,
   retry on error), API key resolution from the plugin config file or `LINEAR_API_KEY`,
   the `herdr-plugin.toml` manifest, and the `scripts/open-split.sh` / `scripts/open-tab.sh`
   idempotent launcher scripts
 - Herdr plugin view switcher: menu-first interface allowing users to choose between
-  My Issues (implemented), Project Issues, and Team Issues (both not yet available)
+  My Issues and Project Issues (both implemented) and Team Issues (not yet available)
 
 ### Fixed
-- N/A
+- My Issues no longer lists completed/canceled issues (TF-582)
 
 ### Removed
 - Unused `cli` Cargo feature (and its `clap` dependency), superseded by the `plugin` feature
