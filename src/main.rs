@@ -349,16 +349,17 @@ async fn event_loop(
                                 ))),
                             }
 
-                            // Flush any input that arrived while the flow above was blocking —
-                            // agent_wait alone has a 30s timeout, but get_workflow_states/
-                            // update_issue can each independently take up to their own 30s HTTP
-                            // timeout, and the untimed `herdr` subprocess calls (agent_list,
-                            // agent_start, tab_rename, agent_send) have no bound at all if the
-                            // `herdr` binary hangs — so this can be much longer than "~31s", or
-                            // unbounded. A buffered <Enter> must not replay as a fresh action
-                            // once we're back to polling, so it's dropped; a buffered `q` is
-                            // honored instead of silently discarded, since the user very
-                            // plausibly pressed it because the panel looked hung.
+                            // Flush any input that arrived while the flow above was blocking.
+                            // Every step now has its own bound — agent_wait's own budget (up to
+                            // 30s plus retry buffer), get_workflow_states/update_issue's 30s HTTP
+                            // timeout each, and the other `herdr` subprocess calls (agent_list,
+                            // agent_start, tab_rename, agent_send) at `DEFAULT_CLI_TIMEOUT` (15s)
+                            // each — but they're sequential, so the flow as a whole can still run
+                            // well past "~31s" in the worst case. A buffered <Enter> must not
+                            // replay as a fresh action once we're back to polling, so it's
+                            // dropped; a buffered `q` is honored instead of silently discarded,
+                            // since the user very plausibly pressed it because the panel looked
+                            // hung.
                             let mut quit_requested = false;
                             while crossterm::event::poll(std::time::Duration::from_millis(0))? {
                                 if let crossterm::event::Event::Key(key) = crossterm::event::read()?
