@@ -190,6 +190,19 @@ const PROMPT_SEND_SETTLE_DELAY: std::time::Duration = std::time::Duration::from_
 /// input widget after the prompt box had already been painted once.
 const PROMPT_SEND_CONFIRM_DELAY: std::time::Duration = std::time::Duration::from_millis(800);
 
+/// Starter content written to `config.toml` by the `c` keybinding when the file doesn't
+/// exist yet, so pressing `c` never fails with "file not found" and always opens something
+/// editable. Comments out every field rather than pre-filling one, since none has a
+/// meaningful default the plugin should silently start using.
+const CONFIG_TEMPLATE: &str = r#"# herdr-linear plugin config. See README.md for the full field reference.
+
+# api_key = "lin_api_..."
+# agent_command = "hr"
+
+# [project_overrides]
+# "repo-name" = "linear-project-id"
+"#;
+
 /// Sends `prompt` to `pane_id` and confirms it actually landed — and *stayed* landed — before
 /// returning success.
 ///
@@ -407,6 +420,15 @@ async fn event_loop(
                         plugin::app::Action::Quit => break,
                         plugin::app::Action::OpenInBrowser(url) => {
                             let _ = open::that(url);
+                        }
+                        plugin::app::Action::OpenConfig(path) => {
+                            if let Some(parent) = path.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            if !path.exists() {
+                                let _ = std::fs::write(&path, CONFIG_TEMPLATE);
+                            }
+                            let _ = open::that(&path);
                         }
                         plugin::app::Action::Retry | plugin::app::Action::EnterView => {
                             // `handle_key` already moved `app` into `Loading` — either

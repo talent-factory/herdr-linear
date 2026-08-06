@@ -35,6 +35,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the preferred coding agent, sets the issue to "In Progress" via a real GraphQL
   mutation, and injects an implement prompt once the agent is ready; configurable
   `agent_command` fallback in `config.toml` (TF-584)
+- `c` keybinding on the "no Linear project matches repo" error screen opens
+  `config.toml` directly in your editor (creating the file/directory first if either is
+  missing), instead of requiring you to quit the plugin and find the path yourself (TF-588)
+
+### Changed
+- The Linear project override in `config.toml` is now a `[project_overrides]` table keyed
+  by repo name instead of a single flat `project_id` value. The flat key was scoped to the
+  plugin *installation*, not the repo — since one `config.toml` is shared by every
+  repo/workspace using the plugin, setting it for one repo silently redirected every other
+  repo sharing that install to the same project too. An old `project_id = "..."` entry is
+  now simply ignored (falls back to name matching) rather than erroring. Never
+  released/documented, so no migration is needed (TF-588, found while fixing TF-589)
+- The "no project matches"/"multiple projects match" error messages now show the resolved
+  `config.toml` path and a ready-to-paste `[project_overrides]` snippet for the current
+  repo, instead of a generic "Set `project_id` in config.toml to override" (TF-588)
 
 ### Fixed
 - My Issues no longer lists completed/canceled issues (TF-582)

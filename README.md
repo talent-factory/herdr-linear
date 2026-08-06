@@ -237,6 +237,22 @@ echo 'api_key = "lin_api_your_key_here"' > "$(herdr plugin config-dir herdr-line
 
 Or export `LINEAR_API_KEY` in the environment Herdr runs in.
 
+If "Project Issues" can't match your repo to a Linear project by name (see "Use" below),
+add a repo-scoped override to the same `config.toml`:
+
+```toml
+[project_overrides]
+"your-repo-name" = "linear-project-id"
+```
+
+This file is shared by every repo/workspace that opens this plugin's panel (there's one
+`config.toml` per plugin *installation*, not per repo), so `project_overrides` is a table
+keyed by repo name rather than a single value — an entry for one repo never affects how
+another repo resolves. You don't need to work out the repo name or project id yourself:
+pressing `c` on the "no project matches" error screen opens this file directly (creating it
+if it doesn't exist yet), and the error text itself shows the exact snippet to paste in,
+with your repo name already filled in.
+
 Optionally set `agent_command` in the same `config.toml` to choose the coding agent started
 when you implement an issue (see "Use" below). If set, it **always** wins. If unset, the
 plugin looks at your other open herdr tabs and reuses whatever coding agent you're already
@@ -275,7 +291,9 @@ and "Team Issues" (coming soon). From the menu, use `↑`/`↓` to navigate opti
 use `↑`/`↓` to navigate the issue list, `o` to open the selected issue in your browser,
 `<Enter>` to implement it (opens a herdr tab, starts the preferred coding agent, sets
 the issue to "In Progress", and injects an implement prompt once the agent is ready),
-`r` to retry after an error, and `Esc` to return to the menu. Press `q` to quit the
+`r` to retry after an error, `c` to open `config.toml` from an error screen (see
+"Configure" above — creates the file if it doesn't exist yet), and `Esc` to return to the
+menu. Press `q` to quit the
 panel from anywhere (menu or view). Pressing the key again focuses the panel if it's
 open elsewhere, or closes it if it's already focused.
 

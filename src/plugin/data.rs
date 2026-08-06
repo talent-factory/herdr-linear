@@ -144,27 +144,31 @@ async fn fetch_all_projects(client: &LinearClient) -> Result<Vec<Project>> {
 /// Resolve the Linear project matching the current working directory, then fetch its
 /// open issues.
 ///
-/// A configured `project_id` override short-circuits entirely: `resolve_project_id`
-/// returns it without ever consulting `repo_name`/`projects` (see its doc comment), so
-/// this skips `detect_repo_name`'s git subprocess and the `get_projects` network fetch in
-/// that case rather than paying for both only to discard the result — and, just as
-/// importantly, means a workspace-wide project fetch failing (bad scope, timeout) can't
-/// break a view whose project id was already known from config.
+/// `repo::detect_repo_name` (CWD/git remote) runs first and unconditionally — it's the
+/// lookup key for a repo-scoped `[project_overrides]` entry (see
+/// `config::load_project_id_override`), so unlike the override this replaces, it can no
+/// longer be skipped even when an override is configured. A configured override for this
+/// specific repo still short-circuits the more expensive half: `fetch_all_projects`'s
+/// network call (paginated `get_projects`) and `repo::resolve_project_id`'s name matching
+/// are both skipped in that case — and, just as importantly, means a workspace-wide
+/// project fetch failing (bad scope, timeout) can't break a view whose project id was
+/// already known from config.
 ///
-/// Without an override, this composes `repo::detect_repo_name` (CWD/git remote),
-/// `fetch_all_projects` (network, paginated), and `repo::resolve_project_id` (name
-/// matching) to find the project id, then delegates to `fetch_project_issues`. Re-runs
-/// every step on each call — no caching — so a `config.toml` edit or a `git remote`
-/// change between calls (e.g. across a retry) is picked up rather than served stale.
+/// Without an override for this repo, this composes `fetch_all_projects` and
+/// `repo::resolve_project_id` (name matching) to find the project id, then delegates to
+/// `fetch_project_issues`. Re-runs every step on each call — no caching — so a
+/// `config.toml` edit or a `git remote` change between calls (e.g. across a retry) is
+/// picked up rather than served stale.
 pub async fn fetch_current_project_issues(client: &LinearClient) -> Result<Vec<Issue>> {
-    let project_id_override = config::load_project_id_override()?;
+    let repo_name = repo::detect_repo_name();
+    let project_id_override = config::load_project_id_override(&repo_name)?;
 
     let project_id = match project_id_override {
         Some(id) => id,
         None => {
-            let repo_name = repo::detect_repo_name();
             let projects = fetch_all_projects(client).await?;
-            repo::resolve_project_id(None, &repo_name, &projects)?
+            let config_path_hint = config::current_config_path_hint();
+            repo::resolve_project_id(None, &repo_name, &projects, &config_path_hint)?
         }
     };
 

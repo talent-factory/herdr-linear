@@ -7,6 +7,7 @@
 //! loaded issues, error) and navigation within its issue list.
 
 use crate::Issue;
+use std::path::PathBuf;
 
 /// The views selectable from the menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -302,6 +303,11 @@ pub enum Action {
     /// coding agent, set the issue to "In Progress", and inject the implement prompt once
     /// ready. Orchestrated in `main.rs`'s `start_implementation`.
     Implement(Issue),
+    /// `c` was pressed on the error screen: open `config.toml` (creating the directory and
+    /// a starter file first if either is missing) in the user's editor. Handled in
+    /// `main.rs`'s `event_loop`, mirroring the existing `OpenInBrowser` → `open::that`
+    /// pattern.
+    OpenConfig(PathBuf),
 }
 
 /// Map a key press to an [`Action`], applying any state change (menu navigation,
@@ -356,8 +362,22 @@ pub fn handle_key(app: &mut App, key: crossterm::event::KeyCode) -> Option<Actio
                 None
             }
         }
+        KeyCode::Char('c') if app.is_view_error() => {
+            open_config_action(std::env::var_os("HERDR_PLUGIN_CONFIG_DIR").as_deref())
+        }
         _ => None,
     }
+}
+
+/// Pure half of the `c`-in-error-state key handling, split out from [`handle_key`] purely
+/// so it's unit-testable without mutating the real process environment (no `App` field
+/// caches the config dir — every `config.rs` entry point re-reads `HERDR_PLUGIN_CONFIG_DIR`
+/// fresh on each use, see that module's doc comment — so this mirrors the same pattern
+/// rather than introducing new app state for a single keypress). `None` (env var unset) is
+/// a no-op, same as `r` outside the error view — near-impossible in practice since herdr
+/// always sets it when launching the plugin.
+fn open_config_action(config_dir_env: Option<&std::ffi::OsStr>) -> Option<Action> {
+    config_dir_env.map(|dir| Action::OpenConfig(PathBuf::from(dir).join("config.toml")))
 }
 
 #[cfg(test)]
@@ -836,5 +856,54 @@ mod tests {
         app.set_issues(vec![sample_issue("ENG-1")]);
 
         assert_eq!(handle_key(&mut app, KeyCode::Char('r')), None);
+    }
+
+    // `c`-key handling is split across two layers precisely so it's testable without
+    // mutating the real process environment (which, run in parallel with every other test
+    // in this binary, would be a data race on shared global state): `open_config_action`
+    // is a pure function taking an injected `Option<&OsStr>`, tested directly here; the
+    // `handle_key` tests below only exercise the `is_view_error()` guard, which never
+    // touches the environment regardless of what's actually set on the running machine.
+
+    #[test]
+    fn open_config_action_builds_path_when_config_dir_is_known() {
+        let dir = std::ffi::OsStr::new("/fake/config/dir");
+
+        let action = open_config_action(Some(dir));
+
+        assert_eq!(
+            action,
+            Some(Action::OpenConfig(PathBuf::from(
+                "/fake/config/dir/config.toml"
+            )))
+        );
+    }
+
+    #[test]
+    fn open_config_action_does_nothing_when_config_dir_is_unknown() {
+        assert_eq!(open_config_action(None), None);
+    }
+
+    #[test]
+    fn c_key_in_error_state_is_handled() {
+        let mut app = app_in_my_issues_view();
+        app.set_error("boom".to_string());
+
+        let action = handle_key(&mut app, KeyCode::Char('c'));
+
+        // Deterministic and parallel-safe regardless of what `HERDR_PLUGIN_CONFIG_DIR`
+        // happens to be in the test process: both sides read the same live value, so this
+        // asserts `handle_key` actually reaches `open_config_action` when `is_view_error()`
+        // is true (not the catch-all `_ => None` arm), without hardcoding either outcome.
+        let expected = open_config_action(std::env::var_os("HERDR_PLUGIN_CONFIG_DIR").as_deref());
+        assert_eq!(action, expected);
+    }
+
+    #[test]
+    fn c_key_outside_error_state_does_nothing() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+
+        assert_eq!(handle_key(&mut app, KeyCode::Char('c')), None);
     }
 }

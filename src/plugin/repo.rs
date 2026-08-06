@@ -1,7 +1,8 @@
 //! Resolves which Linear project corresponds to the current working directory: derives a
 //! repo name from `git remote`/the working directory, then matches it against Linear
-//! projects fetched via [`crate::client::LinearClient::get_projects`]. A `project_id`
-//! override in config.toml (see `crate::plugin::config`) always wins over name matching.
+//! projects fetched via [`crate::client::LinearClient::get_projects`]. A repo-scoped
+//! `[project_overrides]` entry in config.toml (see `crate::plugin::config`) for the
+//! current repo name always wins over name matching.
 //!
 //! "Current working directory" here means [`crate::plugin::host::resolve_cwd`]'s result, not a
 //! bare `std::env::current_dir()` — the plugin process itself always runs from its own install
@@ -46,11 +47,16 @@ fn parse_repo_name_from_remote(remote_url: &str) -> Option<String> {
 /// candidates at either stage are both errors, never a "best guess". Pure function — takes
 /// an already-fetched project list, no network access, so it's deterministic and safe to
 /// unit test (see [`resolve_project_id`] for the override-aware entry point callers should
-/// use).
-pub fn match_project<'a>(repo_name: &str, projects: &'a [Project]) -> Result<&'a Project> {
+/// use). `config_path_hint` (see [`crate::plugin::config::config_path_hint`]) is only used
+/// to build a concrete, actionable error message — it never affects matching itself.
+pub fn match_project<'a>(
+    repo_name: &str,
+    projects: &'a [Project],
+    config_path_hint: &str,
+) -> Result<&'a Project> {
     let repo_name = repo_name.trim();
     if repo_name.is_empty() {
-        return Err(no_match_error(repo_name));
+        return Err(no_match_error(repo_name, config_path_hint));
     }
 
     let repo_lower = repo_name.to_lowercase();
@@ -63,7 +69,7 @@ pub fn match_project<'a>(repo_name: &str, projects: &'a [Project]) -> Result<&'a
         return Ok(exact[0]);
     }
     if exact.len() > 1 {
-        return Err(ambiguous_error(repo_name, &exact));
+        return Err(ambiguous_error(repo_name, &exact, config_path_hint));
     }
 
     let substring: Vec<&Project> = projects
@@ -75,43 +81,56 @@ pub fn match_project<'a>(repo_name: &str, projects: &'a [Project]) -> Result<&'a
         .collect();
     match substring.len() {
         1 => Ok(substring[0]),
-        0 => Err(no_match_error(repo_name)),
-        _ => Err(ambiguous_error(repo_name, &substring)),
+        0 => Err(no_match_error(repo_name, config_path_hint)),
+        _ => Err(ambiguous_error(repo_name, &substring, config_path_hint)),
     }
 }
 
-fn no_match_error(repo_name: &str) -> Error {
+/// The copy-pasteable `[project_overrides]` snippet for `repo_name`, appended to both
+/// `no_match_error` and `ambiguous_error` so the fix is "paste this", not "figure out the
+/// TOML syntax yourself".
+fn override_snippet(repo_name: &str) -> String {
+    format!("[project_overrides]\n\"{repo_name}\" = \"<project-id>\"")
+}
+
+fn no_match_error(repo_name: &str, config_path_hint: &str) -> Error {
     Error::ConfigError(format!(
-        "No Linear project matches repo \"{repo_name}\". Set `project_id` in config.toml to override."
+        "No Linear project matches repo \"{repo_name}\". Add to {config_path_hint}:\n{}",
+        override_snippet(repo_name)
     ))
 }
 
-fn ambiguous_error(repo_name: &str, candidates: &[&Project]) -> Error {
+fn ambiguous_error(repo_name: &str, candidates: &[&Project], config_path_hint: &str) -> Error {
     let names = candidates
         .iter()
         .map(|p| p.name.as_str())
         .collect::<Vec<_>>()
         .join(", ");
     Error::ConfigError(format!(
-        "Multiple Linear projects match repo \"{repo_name}\": {names}. Set `project_id` in config.toml to disambiguate."
+        "Multiple Linear projects match repo \"{repo_name}\": {names}. Add to {config_path_hint}:\n{}",
+        override_snippet(repo_name)
     ))
 }
 
 /// Composition entry point for project ID resolution: returns a project_id from either
-/// an override (which short-circuits outright if provided and non-empty), or by delegating
-/// to `match_project` to find a project by name. Called from
-/// [`crate::plugin::data::fetch_current_project_issues`].
+/// an override (which short-circuits outright if provided and non-empty — by the time it
+/// reaches here, callers have already scoped it to `repo_name` via
+/// [`crate::plugin::config::resolve_project_id_override`], so trusting it unconditionally
+/// is correct), or by delegating to `match_project` to find a project by name.
+/// `config_path_hint` is forwarded to `match_project` for its error messages only. Called
+/// from [`crate::plugin::data::fetch_current_project_issues`].
 pub fn resolve_project_id(
     project_id_override: Option<&str>,
     repo_name: &str,
     projects: &[Project],
+    config_path_hint: &str,
 ) -> Result<String> {
     if let Some(override_id) = project_id_override {
         if !override_id.trim().is_empty() {
             return Ok(override_id.to_string());
         }
     }
-    match_project(repo_name, projects).map(|p| p.id.clone())
+    match_project(repo_name, projects, config_path_hint).map(|p| p.id.clone())
 }
 
 /// Derive the repo name from the real environment: `git remote get-url origin` run in
@@ -159,6 +178,10 @@ pub fn detect_repo_name() -> String {
 mod tests {
     use super::*;
     use crate::ProjectStatus;
+
+    /// Dummy hint used by tests that don't care about the exact path text — only tests
+    /// specifically about the hint/snippet assert on its content.
+    const HINT: &str = "/fake/config.toml";
 
     fn test_project(id: &str, name: &str) -> Project {
         Project {
@@ -237,7 +260,7 @@ mod tests {
             test_project("p2", "herdr-linear-docs"),
         ];
 
-        let matched = match_project("Herdr-Linear", &projects).unwrap();
+        let matched = match_project("Herdr-Linear", &projects, HINT).unwrap();
 
         assert_eq!(matched.id, "p1");
     }
@@ -249,7 +272,7 @@ mod tests {
             test_project("p2", "herdr-linear"),
         ];
 
-        let err = match_project("herdr-linear", &projects).unwrap_err();
+        let err = match_project("herdr-linear", &projects, HINT).unwrap_err();
 
         let message = err.to_string();
         assert!(message.contains("Multiple Linear projects"));
@@ -260,7 +283,7 @@ mod tests {
     fn substring_match_resolves_when_unique() {
         let projects = vec![test_project("p1", "herdr-linear-plugin")];
 
-        let matched = match_project("herdr-linear", &projects).unwrap();
+        let matched = match_project("herdr-linear", &projects, HINT).unwrap();
 
         assert_eq!(matched.id, "p1");
     }
@@ -272,20 +295,23 @@ mod tests {
         // work in this direction too, not just "project name contains repo name".
         let projects = vec![test_project("p1", "herdr-linear")];
 
-        let matched = match_project("herdr-linear-monorepo", &projects).unwrap();
+        let matched = match_project("herdr-linear-monorepo", &projects, HINT).unwrap();
 
         assert_eq!(matched.id, "p1");
     }
 
     #[test]
-    fn no_match_errors_and_mentions_project_id_override() {
+    fn no_match_errors_and_shows_config_path_and_snippet() {
         let projects = vec![test_project("p1", "totally-unrelated")];
 
-        let err = match_project("herdr-linear", &projects).unwrap_err();
+        let err =
+            match_project("herdr-linear", &projects, "/Users/daniel/config.toml").unwrap_err();
 
         let message = err.to_string();
         assert!(message.contains("No Linear project matches"));
-        assert!(message.contains("project_id"));
+        assert!(message.contains("/Users/daniel/config.toml"));
+        assert!(message.contains("[project_overrides]"));
+        assert!(message.contains("\"herdr-linear\" = \"<project-id>\""));
     }
 
     #[test]
@@ -295,7 +321,7 @@ mod tests {
             test_project("p2", "herdr-linear-docs"),
         ];
 
-        let err = match_project("herdr-linear", &projects).unwrap_err();
+        let err = match_project("herdr-linear", &projects, HINT).unwrap_err();
 
         let message = err.to_string();
         assert!(message.contains("Multiple Linear projects"));
@@ -304,8 +330,24 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_error_also_shows_config_path_and_snippet() {
+        let projects = vec![
+            test_project("p1", "herdr-linear-app"),
+            test_project("p2", "herdr-linear-docs"),
+        ];
+
+        let err =
+            match_project("herdr-linear", &projects, "/Users/daniel/config.toml").unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("/Users/daniel/config.toml"));
+        assert!(message.contains("[project_overrides]"));
+        assert!(message.contains("\"herdr-linear\" = \"<project-id>\""));
+    }
+
+    #[test]
     fn no_projects_at_all_errors() {
-        let err = match_project("herdr-linear", &[]).unwrap_err();
+        let err = match_project("herdr-linear", &[], HINT).unwrap_err();
 
         assert!(err.to_string().contains("No Linear project matches"));
     }
@@ -317,14 +359,14 @@ mod tests {
             test_project("p2", "another-project"),
         ];
 
-        let err = match_project("", &projects).unwrap_err();
+        let err = match_project("", &projects, HINT).unwrap_err();
 
         assert!(err.to_string().contains("No Linear project matches"));
     }
 
     #[test]
     fn override_short_circuits_without_matching_project() {
-        let id = resolve_project_id(Some("proj-999"), "anything", &[]).unwrap();
+        let id = resolve_project_id(Some("proj-999"), "anything", &[], HINT).unwrap();
 
         assert_eq!(id, "proj-999");
     }
@@ -333,7 +375,7 @@ mod tests {
     fn empty_override_falls_back_to_matching() {
         let projects = vec![test_project("p1", "herdr-linear")];
 
-        let id = resolve_project_id(Some(""), "herdr-linear", &projects).unwrap();
+        let id = resolve_project_id(Some(""), "herdr-linear", &projects, HINT).unwrap();
 
         assert_eq!(id, "p1");
     }
@@ -342,14 +384,14 @@ mod tests {
     fn no_override_delegates_to_match_project() {
         let projects = vec![test_project("p1", "herdr-linear")];
 
-        let id = resolve_project_id(None, "herdr-linear", &projects).unwrap();
+        let id = resolve_project_id(None, "herdr-linear", &projects, HINT).unwrap();
 
         assert_eq!(id, "p1");
     }
 
     #[test]
     fn no_override_and_no_match_propagates_error() {
-        let err = resolve_project_id(None, "herdr-linear", &[]).unwrap_err();
+        let err = resolve_project_id(None, "herdr-linear", &[], HINT).unwrap_err();
 
         assert!(err.to_string().contains("No Linear project matches"));
     }
