@@ -39,6 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   etc.) opens `config.toml` with your OS's default handler for `.toml` files (creating the
   file/directory first if either is missing), instead of requiring you to quit the plugin
   and find the path yourself (TF-588)
+- `/` keybinding on a loaded view's issue list opens type-to-filter: narrows the list live
+  by title or identifier (case-insensitive substring match), `↑`/`↓` still navigate the
+  narrowed list, `<Enter>` confirms and keeps the filter applied, `Esc` cancels and restores
+  the full list (TF-580)
 
 ### Changed
 - The Linear project override in `config.toml` is now a `[project_overrides]` table keyed
