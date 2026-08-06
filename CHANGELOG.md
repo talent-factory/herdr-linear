@@ -39,6 +39,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   etc.) opens `config.toml` with your OS's default handler for `.toml` files (creating the
   file/directory first if either is missing), instead of requiring you to quit the plugin
   and find the path yourself (TF-588)
+- Multi-select in the issue list: `<Space>` marks/unmarks the selected issue (shown with a
+  `[x]`/`[ ]` checkbox prefix), and `<Enter>` with one or more issues marked implements all
+  of them sequentially, summarizing the results in one status banner (e.g. "3/4 started",
+  plus a message per issue that failed or finished with a warning); unmarked `<Enter>`
+  behaves exactly as before (TF-590)
 
 ### Changed
 - The Linear project override in `config.toml` is now a `[project_overrides]` table keyed
@@ -89,6 +94,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (TF-584)
 - `is_valid_agent_command` now also rejects glob metacharacters (`* ? [ ] ~`) and `!` (bash
   history expansion, live since the command runs through `sh -i`) (TF-584)
+- Implement-on-`<Enter>`: starting a second issue while an earlier issue's agent tab is
+  still running under the same `agent_command` no longer fails with a raw
+  `agent_name_taken` internal error. Each issue's `herdr agent start` call now uses a name
+  unique to that issue (the resolved command plus the issue identifier, e.g. `hr-tf-579`)
+  instead of reusing the bare command string for every issue, and if herdr still reports
+  the name as taken, the call retries automatically with one of herdr's suggested
+  candidates before giving up (TF-590)
 
 ### Removed
 - Unused `cli` Cargo feature (and its `clap` dependency), superseded by the `plugin` feature
