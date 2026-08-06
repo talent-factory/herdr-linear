@@ -463,7 +463,7 @@ pub enum Action {
 ///
 /// `/` opens type-to-filter on a loaded view's issue list (TF-580); once editing, this
 /// function's own filtering branch takes over key dispatch entirely (see
-/// [`App::is_filtering`]) until `Enter` confirms or `Esc` cancels, so none of the
+/// `App::is_filtering`) until `Enter` confirms or `Esc` cancels, so none of the
 /// ordinary view bindings below (`q`, `o`, `r`, `Enter`-to-implement, ...) fire on a
 /// character typed into the filter.
 pub fn handle_key(
