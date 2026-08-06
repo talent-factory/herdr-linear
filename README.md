@@ -249,9 +249,10 @@ This file is shared by every repo/workspace that opens this plugin's panel (ther
 `config.toml` per plugin *installation*, not per repo), so `project_overrides` is a table
 keyed by repo name rather than a single value — an entry for one repo never affects how
 another repo resolves. You don't need to work out the repo name or project id yourself:
-pressing `c` on the "no project matches" error screen opens this file directly (creating it
-if it doesn't exist yet), and the error text itself shows the exact snippet to paste in,
-with your repo name already filled in.
+pressing `c` on any Linear error screen (no project matches, multiple projects match, etc.)
+opens this file with your OS's default handler for `.toml` files (creating it if it doesn't
+exist yet), and the error text itself shows the exact snippet to paste in, with your repo
+name already filled in.
 
 Optionally set `agent_command` in the same `config.toml` to choose the coding agent started
 when you implement an issue (see "Use" below). If set, it **always** wins. If unset, the

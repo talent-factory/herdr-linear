@@ -313,8 +313,24 @@ pub enum Action {
 /// Map a key press to an [`Action`], applying any state change (menu navigation,
 /// entering a view, list navigation, retry, returning to the menu) directly to
 /// `app`. Returns `None` when the key had no effect or only changed state in place.
-pub fn handle_key(app: &mut App, key: crossterm::event::KeyCode) -> Option<Action> {
-    use crossterm::event::KeyCode;
+///
+/// `modifiers` must be threaded through from the real `KeyEvent` (see `main.rs`'s
+/// `event_loop`) rather than assumed empty: raw mode delivers `Ctrl+C` as an ordinary
+/// `KeyCode::Char('c')` key event, not `SIGINT`, so without checking modifiers it would be
+/// indistinguishable from a plain `c` press — including on the error screen, where a plain
+/// `c` now triggers `Action::OpenConfig` (filesystem writes + spawning an external opener).
+/// The interrupt reflex is handled unconditionally, before any screen-specific dispatch, so
+/// it always quits rather than ever being reinterpreted as a screen's own binding.
+pub fn handle_key(
+    app: &mut App,
+    key: crossterm::event::KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+) -> Option<Action> {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    if modifiers.contains(KeyModifiers::CONTROL) && key == KeyCode::Char('c') {
+        return Some(Action::Quit);
+    }
 
     let in_menu = matches!(app.screen, Screen::Menu { .. });
 
@@ -362,7 +378,11 @@ pub fn handle_key(app: &mut App, key: crossterm::event::KeyCode) -> Option<Actio
                 None
             }
         }
-        KeyCode::Char('c') if app.is_view_error() => {
+        // `modifiers.is_empty()` matters beyond the `Ctrl+C` case already handled above: it
+        // also keeps e.g. `Alt+C`/`Shift+C` from triggering config-file writes, since this
+        // arm's side effect (create + open `config.toml`) is meant for a deliberate, bare
+        // `c` press, not any key event that happens to carry the `'c'` character.
+        KeyCode::Char('c') if modifiers.is_empty() && app.is_view_error() => {
             open_config_action(std::env::var_os("HERDR_PLUGIN_CONFIG_DIR").as_deref())
         }
         _ => None,
@@ -371,11 +391,12 @@ pub fn handle_key(app: &mut App, key: crossterm::event::KeyCode) -> Option<Actio
 
 /// Pure half of the `c`-in-error-state key handling, split out from [`handle_key`] purely
 /// so it's unit-testable without mutating the real process environment (no `App` field
-/// caches the config dir — every `config.rs` entry point re-reads `HERDR_PLUGIN_CONFIG_DIR`
-/// fresh on each use, see that module's doc comment — so this mirrors the same pattern
-/// rather than introducing new app state for a single keypress). `None` (env var unset) is
-/// a no-op, same as `r` outside the error view — near-impossible in practice since herdr
-/// always sets it when launching the plugin.
+/// caches the config dir — every `load_*`/`resolve_*` function in `config.rs` re-reads
+/// `HERDR_PLUGIN_CONFIG_DIR` fresh on each call rather than caching it — see e.g.
+/// `load_project_id_override` — so this mirrors the same pattern rather than introducing
+/// new app state for a single keypress). `None` (env var unset) is a no-op, same as `r`
+/// outside the error view — near-impossible in practice since herdr always sets it when
+/// launching the plugin.
 fn open_config_action(config_dir_env: Option<&std::ffi::OsStr>) -> Option<Action> {
     config_dir_env.map(|dir| Action::OpenConfig(PathBuf::from(dir).join("config.toml")))
 }
@@ -617,14 +638,14 @@ mod tests {
         ));
     }
 
-    use crossterm::event::KeyCode;
+    use crossterm::event::{KeyCode, KeyModifiers};
 
     #[test]
     fn down_key_moves_selection_and_returns_no_action() {
         let mut app = app_in_my_issues_view();
         app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
 
-        let action = handle_key(&mut app, KeyCode::Down);
+        let action = handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
 
         assert_eq!(action, None);
         assert_eq!(app.selected_issue().unwrap().identifier, "ENG-2");
@@ -636,7 +657,7 @@ mod tests {
         app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
         app.move_selection_down();
 
-        let action = handle_key(&mut app, KeyCode::Up);
+        let action = handle_key(&mut app, KeyCode::Up, KeyModifiers::NONE);
 
         assert_eq!(action, None);
         assert_eq!(app.selected_issue().unwrap().identifier, "ENG-1");
@@ -647,7 +668,7 @@ mod tests {
         let mut app = app_in_my_issues_view();
         app.set_issues(vec![sample_issue("ENG-1")]);
 
-        let action = handle_key(&mut app, KeyCode::Char('o'));
+        let action = handle_key(&mut app, KeyCode::Char('o'), KeyModifiers::NONE);
 
         assert_eq!(
             action,
@@ -662,7 +683,10 @@ mod tests {
         let mut app = app_in_my_issues_view();
         app.set_issues(vec![]);
 
-        assert_eq!(handle_key(&mut app, KeyCode::Char('o')), None);
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Char('o'), KeyModifiers::NONE),
+            None
+        );
     }
 
     #[test]
@@ -670,7 +694,7 @@ mod tests {
         let mut app = app_in_my_issues_view();
         app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
 
-        let action = handle_key(&mut app, KeyCode::Enter);
+        let action = handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
 
         assert_eq!(action, Some(Action::Implement(sample_issue("ENG-1"))));
     }
@@ -680,7 +704,10 @@ mod tests {
         let mut app = app_in_my_issues_view();
         app.set_issues(vec![]);
 
-        assert_eq!(handle_key(&mut app, KeyCode::Enter), None);
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+            None
+        );
     }
 
     #[test]
@@ -716,7 +743,7 @@ mod tests {
         app.set_issues(vec![sample_issue("ENG-1")]);
         app.set_status(Status::Ok("started".to_string()));
 
-        handle_key(&mut app, KeyCode::Esc);
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
 
         assert_eq!(app.status(), None);
     }
@@ -746,21 +773,27 @@ mod tests {
     fn q_key_from_the_menu_returns_quit() {
         let mut app = App::new();
 
-        assert_eq!(handle_key(&mut app, KeyCode::Char('q')), Some(Action::Quit));
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Char('q'), KeyModifiers::NONE),
+            Some(Action::Quit)
+        );
     }
 
     #[test]
     fn esc_key_from_the_menu_returns_quit() {
         let mut app = App::new();
 
-        assert_eq!(handle_key(&mut app, KeyCode::Esc), Some(Action::Quit));
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE),
+            Some(Action::Quit)
+        );
     }
 
     #[test]
     fn enter_key_on_the_default_menu_selection_enters_my_issues() {
         let mut app = App::new();
 
-        let action = handle_key(&mut app, KeyCode::Enter);
+        let action = handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
 
         assert_eq!(action, Some(Action::EnterView));
         assert!(matches!(
@@ -772,10 +805,10 @@ mod tests {
     #[test]
     fn enter_key_on_an_unavailable_menu_option_does_nothing() {
         let mut app = App::new();
-        handle_key(&mut app, KeyCode::Down);
-        handle_key(&mut app, KeyCode::Down); // -> Team Issues, unavailable
+        handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE); // -> Team Issues, unavailable
 
-        let action = handle_key(&mut app, KeyCode::Enter);
+        let action = handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
 
         assert_eq!(action, None);
         assert!(matches!(app.screen, Screen::Menu { selected: 2 }));
@@ -784,9 +817,9 @@ mod tests {
     #[test]
     fn up_key_from_the_menu_moves_selection_and_returns_no_action() {
         let mut app = App::new();
-        handle_key(&mut app, KeyCode::Down);
+        handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
 
-        let action = handle_key(&mut app, KeyCode::Up);
+        let action = handle_key(&mut app, KeyCode::Up, KeyModifiers::NONE);
 
         assert_eq!(action, None);
         assert!(matches!(app.screen, Screen::Menu { selected: 0 }));
@@ -796,7 +829,10 @@ mod tests {
     fn q_key_from_a_view_returns_quit() {
         let mut app = app_in_my_issues_view();
 
-        assert_eq!(handle_key(&mut app, KeyCode::Char('q')), Some(Action::Quit));
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Char('q'), KeyModifiers::NONE),
+            Some(Action::Quit)
+        );
     }
 
     #[test]
@@ -804,7 +840,7 @@ mod tests {
         let mut app = app_in_my_issues_view();
         app.set_issues(vec![sample_issue("ENG-1")]);
 
-        let action = handle_key(&mut app, KeyCode::Esc);
+        let action = handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
 
         assert_eq!(action, None);
         assert!(matches!(app.screen, Screen::Menu { selected: 0 }));
@@ -815,7 +851,7 @@ mod tests {
         let mut app = app_in_my_issues_view();
         app.set_error("boom".to_string());
 
-        let action = handle_key(&mut app, KeyCode::Esc);
+        let action = handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
 
         assert_eq!(action, None);
         assert!(matches!(app.screen, Screen::Menu { selected: 0 }));
@@ -825,9 +861,9 @@ mod tests {
     fn reentering_a_view_after_esc_starts_a_fresh_loading_state() {
         let mut app = app_in_my_issues_view();
         app.set_issues(vec![sample_issue("ENG-1")]);
-        handle_key(&mut app, KeyCode::Esc);
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
 
-        let action = handle_key(&mut app, KeyCode::Enter);
+        let action = handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
 
         assert_eq!(action, Some(Action::EnterView));
         assert!(matches!(
@@ -841,7 +877,7 @@ mod tests {
         let mut app = app_in_my_issues_view();
         app.set_error("boom".to_string());
 
-        let action = handle_key(&mut app, KeyCode::Char('r'));
+        let action = handle_key(&mut app, KeyCode::Char('r'), KeyModifiers::NONE);
 
         assert_eq!(action, Some(Action::Retry));
         assert!(matches!(
@@ -855,15 +891,19 @@ mod tests {
         let mut app = app_in_my_issues_view();
         app.set_issues(vec![sample_issue("ENG-1")]);
 
-        assert_eq!(handle_key(&mut app, KeyCode::Char('r')), None);
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Char('r'), KeyModifiers::NONE),
+            None
+        );
     }
 
     // `c`-key handling is split across two layers precisely so it's testable without
     // mutating the real process environment (which, run in parallel with every other test
     // in this binary, would be a data race on shared global state): `open_config_action`
-    // is a pure function taking an injected `Option<&OsStr>`, tested directly here; the
-    // `handle_key` tests below only exercise the `is_view_error()` guard, which never
-    // touches the environment regardless of what's actually set on the running machine.
+    // is a pure function taking an injected `Option<&OsStr>`, tested directly here. The one
+    // `handle_key` test that needs to observe the *real* `c`-in-error-state wiring end to
+    // end (`c_key_in_error_state_opens_config_when_dir_is_set`) mutates the process
+    // environment deliberately and guards it with `ENV_LOCK` — see that test's comment.
 
     #[test]
     fn open_config_action_builds_path_when_config_dir_is_known() {
@@ -884,19 +924,37 @@ mod tests {
         assert_eq!(open_config_action(None), None);
     }
 
+    /// Serializes tests that mutate `HERDR_PLUGIN_CONFIG_DIR` (process-global state) against
+    /// each other. Currently only one test needs this, but the lock makes that an enforced
+    /// property rather than an implicit one that silently stops holding the moment a second
+    /// such test is added.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
-    fn c_key_in_error_state_is_handled() {
+    fn c_key_in_error_state_opens_config_when_dir_is_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR");
+        std::env::set_var("HERDR_PLUGIN_CONFIG_DIR", "/fake/config/dir");
+
         let mut app = app_in_my_issues_view();
         app.set_error("boom".to_string());
+        let action = handle_key(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
 
-        let action = handle_key(&mut app, KeyCode::Char('c'));
+        match previous {
+            Some(value) => std::env::set_var("HERDR_PLUGIN_CONFIG_DIR", value),
+            None => std::env::remove_var("HERDR_PLUGIN_CONFIG_DIR"),
+        }
 
-        // Deterministic and parallel-safe regardless of what `HERDR_PLUGIN_CONFIG_DIR`
-        // happens to be in the test process: both sides read the same live value, so this
-        // asserts `handle_key` actually reaches `open_config_action` when `is_view_error()`
-        // is true (not the catch-all `_ => None` arm), without hardcoding either outcome.
-        let expected = open_config_action(std::env::var_os("HERDR_PLUGIN_CONFIG_DIR").as_deref());
-        assert_eq!(action, expected);
+        // A concrete, known-non-None expectation — not a self-referential re-read of the
+        // same env var `handle_key` just consulted — so a regression that mis-wires the
+        // `is_view_error()` guard (or deletes the arm entirely, falling through to
+        // `_ => None`) actually fails this test instead of passing vacuously.
+        assert_eq!(
+            action,
+            Some(Action::OpenConfig(PathBuf::from(
+                "/fake/config/dir/config.toml"
+            )))
+        );
     }
 
     #[test]
@@ -904,6 +962,45 @@ mod tests {
         let mut app = app_in_my_issues_view();
         app.set_issues(vec![sample_issue("ENG-1")]);
 
-        assert_eq!(handle_key(&mut app, KeyCode::Char('c')), None);
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Char('c'), KeyModifiers::NONE),
+            None
+        );
+    }
+
+    #[test]
+    fn ctrl_c_quits_regardless_of_screen() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL),
+            Some(Action::Quit)
+        );
+    }
+
+    #[test]
+    fn ctrl_c_quits_on_error_screen_instead_of_opening_config() {
+        let mut app = app_in_my_issues_view();
+        app.set_error("boom".to_string());
+
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL),
+            Some(Action::Quit)
+        );
+    }
+
+    #[test]
+    fn modified_c_on_error_screen_does_not_open_config() {
+        let mut app = app_in_my_issues_view();
+        app.set_error("boom".to_string());
+
+        // Alt+C (or any other modifier combination besides the Ctrl+C handled above) must
+        // not be treated as the bare `c` keybinding — it's not the deliberate press this
+        // side-effecting action is meant for.
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Char('c'), KeyModifiers::ALT),
+            None
+        );
     }
 }

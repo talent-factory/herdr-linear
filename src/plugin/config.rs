@@ -17,8 +17,15 @@ struct ConfigFile {
     /// repo* — unlike the flat `project_id` key this replaces, a single herdr-linear
     /// plugin install shared across many repos/workspaces no longer redirects every one
     /// of them to whichever project was overridden last. `BTreeMap` (not `HashMap`) so
-    /// iteration order — and therefore any message built from it — is deterministic.
-    project_overrides: Option<BTreeMap<String, String>>,
+    /// iteration order is deterministic — relevant if this is ever iterated to build a
+    /// message (nothing currently does; lookups go through
+    /// [`resolve_project_id_override`]'s `.find()` instead). `#[serde(default)]` so a
+    /// missing `[project_overrides]` table and an explicitly empty one both deserialize to
+    /// the same empty map — every caller already treats "no override for this repo" the
+    /// same way regardless of which of those two states produced it, so there's no need
+    /// for `Option` to distinguish them.
+    #[serde(default)]
+    project_overrides: BTreeMap<String, String>,
     agent_command: Option<String>,
 }
 
@@ -94,25 +101,49 @@ pub fn resolve_api_key(config_dir: Option<&Path>, env_api_key: Option<&str>) -> 
 /// Resolve a `project_id` override for `repo_name`: `config_dir/config.toml`'s
 /// `[project_overrides]` table, looked up case-insensitively against `repo_name`
 /// (matching [`crate::plugin::repo::match_project`]'s own case-insensitivity), if set and
-/// non-empty. `Ok(None)` means "no override for this repo" (callers fall back to name
-/// matching, see [`crate::plugin::repo::resolve_project_id`]) — it is not an error, and it
-/// does *not* mean the table is empty: entries for *other* repos are simply ignored. Pure
-/// function — callers own reading the real environment (see [`load_project_id_override`]).
+/// non-empty (returned value is trimmed, same as the key comparison). `Ok(None)` means "no
+/// override for this repo" (callers fall back to name matching, see
+/// [`crate::plugin::repo::match_project`]) — it is not an error, and it does *not* mean the
+/// table is empty: entries for *other* repos are simply ignored. `Err` when two or more
+/// `[project_overrides]` keys match `repo_name` case-insensitively (e.g. both `"Repo"` and
+/// `"repo"` present) — resolving that silently by picking whichever key happens to sort
+/// first would reintroduce the same class of silent misrouting this table exists to
+/// prevent, just one level down. Pure function — callers own reading the real environment
+/// (see [`load_project_id_override`]).
 pub fn resolve_project_id_override(
     config_dir: Option<&Path>,
     repo_name: &str,
 ) -> Result<Option<String>> {
     let repo_lower = repo_name.trim().to_lowercase();
-    let project_id = read_config_file(config_dir)?
-        .and_then(|file| file.project_overrides)
-        .and_then(|overrides| {
-            overrides
-                .into_iter()
-                .find(|(key, _)| key.trim().to_lowercase() == repo_lower)
-                .map(|(_, id)| id)
-        })
-        .filter(|id| !id.trim().is_empty());
-    Ok(project_id)
+    let Some(file) = read_config_file(config_dir)? else {
+        return Ok(None);
+    };
+
+    let matches: Vec<(&String, &String)> = file
+        .project_overrides
+        .iter()
+        .filter(|(key, _)| key.trim().to_lowercase() == repo_lower)
+        .collect();
+
+    if matches.len() > 1 {
+        let keys = matches
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(Error::ConfigError(format!(
+            "{} has {} `[project_overrides]` keys matching repo \"{repo_name}\" \
+             case-insensitively: {keys}. Keep only one.",
+            config_path_hint(config_dir),
+            matches.len(),
+        )));
+    }
+
+    Ok(matches
+        .first()
+        .map(|(_, id)| id.trim())
+        .filter(|id| !id.is_empty())
+        .map(str::to_string))
 }
 
 /// Resolve an `agent_command` override: `config_dir/config.toml`'s `agent_command` field, if
@@ -322,6 +353,59 @@ mod tests {
         fs::write(
             dir.path().join("config.toml"),
             "[project_overrides]\n\"Examcraft-Private\" = \"proj-123\"\n",
+        )
+        .unwrap();
+
+        let project_id =
+            resolve_project_id_override(Some(dir.path()), "examcraft-private").unwrap();
+
+        assert_eq!(project_id, Some("proj-123".to_string()));
+    }
+
+    #[test]
+    fn override_value_is_trimmed() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.toml"),
+            "[project_overrides]\n\"examcraft-private\" = \"  proj-123  \"\n",
+        )
+        .unwrap();
+
+        let project_id =
+            resolve_project_id_override(Some(dir.path()), "examcraft-private").unwrap();
+
+        assert_eq!(project_id, Some("proj-123".to_string()));
+    }
+
+    /// Two keys that collide only under case-insensitive comparison must error rather than
+    /// silently resolving to whichever one a `BTreeMap` happens to iterate first — that
+    /// would reintroduce the same class of silent misrouting this table exists to prevent.
+    #[test]
+    fn case_colliding_override_keys_error_instead_of_silently_picking_one() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.toml"),
+            "[project_overrides]\n\"Repo\" = \"proj-a\"\n\"repo\" = \"proj-b\"\n",
+        )
+        .unwrap();
+
+        let err = resolve_project_id_override(Some(dir.path()), "repo").unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("case-insensitively"));
+        assert!(message.contains("Repo"));
+        assert!(message.contains("repo"));
+    }
+
+    /// A hand-edited config in the middle of migrating from the old flat key to the new
+    /// table should resolve the table entries normally, with the stray `project_id` simply
+    /// ignored rather than causing a deserialize conflict.
+    #[test]
+    fn old_flat_key_and_new_table_can_coexist() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.toml"),
+            "project_id = \"stale-proj\"\n[project_overrides]\n\"examcraft-private\" = \"proj-123\"\n",
         )
         .unwrap();
 

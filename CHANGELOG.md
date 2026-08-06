@@ -35,9 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the preferred coding agent, sets the issue to "In Progress" via a real GraphQL
   mutation, and injects an implement prompt once the agent is ready; configurable
   `agent_command` fallback in `config.toml` (TF-584)
-- `c` keybinding on the "no Linear project matches repo" error screen opens
-  `config.toml` directly in your editor (creating the file/directory first if either is
-  missing), instead of requiring you to quit the plugin and find the path yourself (TF-588)
+- `c` keybinding on any Linear error screen (no project matches, multiple projects match,
+  etc.) opens `config.toml` with your OS's default handler for `.toml` files (creating the
+  file/directory first if either is missing), instead of requiring you to quit the plugin
+  and find the path yourself (TF-588)
 
 ### Changed
 - The Linear project override in `config.toml` is now a `[project_overrides]` table keyed

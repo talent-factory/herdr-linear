@@ -130,8 +130,9 @@ async fn fetch_all_projects(client: &LinearClient) -> Result<Vec<Project>> {
         if page >= MAX_PAGES {
             tracing::warn!(
                 "Workspace still has more projects after {page} pages of {PROJECT_PAGE_SIZE} \
-                 — project name matching may miss projects beyond the {} fetched. Set \
-                 `project_id` in config.toml to bypass name matching.",
+                 — project name matching may miss projects beyond the {} fetched. Add a \
+                 `[project_overrides]` entry for this repo to config.toml to bypass name \
+                 matching.",
                 projects.len()
             );
             break;
@@ -149,13 +150,13 @@ async fn fetch_all_projects(client: &LinearClient) -> Result<Vec<Project>> {
 /// `config::load_project_id_override`), so unlike the override this replaces, it can no
 /// longer be skipped even when an override is configured. A configured override for this
 /// specific repo still short-circuits the more expensive half: `fetch_all_projects`'s
-/// network call (paginated `get_projects`) and `repo::resolve_project_id`'s name matching
-/// are both skipped in that case — and, just as importantly, means a workspace-wide
-/// project fetch failing (bad scope, timeout) can't break a view whose project id was
-/// already known from config.
+/// network call (paginated `get_projects`) and `repo::match_project`'s name matching are
+/// both skipped in that case — and, just as importantly, means a workspace-wide project
+/// fetch failing (bad scope, timeout) can't break a view whose project id was already
+/// known from config.
 ///
 /// Without an override for this repo, this composes `fetch_all_projects` and
-/// `repo::resolve_project_id` (name matching) to find the project id, then delegates to
+/// `repo::match_project` (name matching) to find the project id, then delegates to
 /// `fetch_project_issues`. Re-runs every step on each call — no caching — so a
 /// `config.toml` edit or a `git remote` change between calls (e.g. across a retry) is
 /// picked up rather than served stale.
@@ -168,7 +169,9 @@ pub async fn fetch_current_project_issues(client: &LinearClient) -> Result<Vec<I
         None => {
             let projects = fetch_all_projects(client).await?;
             let config_path_hint = config::current_config_path_hint();
-            repo::resolve_project_id(None, &repo_name, &projects, &config_path_hint)?
+            repo::match_project(&repo_name, &projects, &config_path_hint)?
+                .id
+                .clone()
         }
     };
 

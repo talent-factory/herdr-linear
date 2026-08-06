@@ -415,20 +415,42 @@ async fn event_loop(
 
         if crossterm::event::poll(std::time::Duration::from_millis(200))? {
             if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
-                if let Some(action) = plugin::app::handle_key(app, key.code) {
+                if let Some(action) = plugin::app::handle_key(app, key.code, key.modifiers) {
                     match action {
                         plugin::app::Action::Quit => break,
                         plugin::app::Action::OpenInBrowser(url) => {
                             let _ = open::that(url);
                         }
                         plugin::app::Action::OpenConfig(path) => {
-                            if let Some(parent) = path.parent() {
-                                let _ = std::fs::create_dir_all(parent);
+                            // Unlike `OpenInBrowser` above, this chains two filesystem
+                            // writes in front of the same `open::that` call — each with
+                            // real, user-hittable failure modes (permission denied, disk
+                            // full, parent path already exists as a file) — and it's the
+                            // sole recovery action offered on the error screen. Silently
+                            // doing nothing here would leave the user stuck with no
+                            // indication that pressing `c` didn't work, so unlike
+                            // `OpenInBrowser` this surfaces a failure via `set_status`
+                            // rather than discarding it.
+                            let result: Result<(), String> = (|| {
+                                if let Some(parent) = path.parent() {
+                                    std::fs::create_dir_all(parent).map_err(|e| {
+                                        format!("Couldn't create {}: {e}", parent.display())
+                                    })?;
+                                }
+                                if !path.exists() {
+                                    std::fs::write(&path, CONFIG_TEMPLATE).map_err(|e| {
+                                        format!("Couldn't write {}: {e}", path.display())
+                                    })?;
+                                }
+                                open::that(&path)
+                                    .map_err(|e| format!("Couldn't open {}: {e}", path.display()))
+                            })();
+
+                            if let Err(message) = result {
+                                app.set_status(plugin::app::Status::Error(format!(
+                                    "{message}. Edit it manually."
+                                )));
                             }
-                            if !path.exists() {
-                                let _ = std::fs::write(&path, CONFIG_TEMPLATE);
-                            }
-                            let _ = open::that(&path);
                         }
                         plugin::app::Action::Retry | plugin::app::Action::EnterView => {
                             // `handle_key` already moved `app` into `Loading` — either

@@ -46,8 +46,10 @@ fn parse_repo_name_from_remote(remote_url: &str) -> Option<String> {
 /// which only resolves when it narrows to exactly one project — zero or multiple
 /// candidates at either stage are both errors, never a "best guess". Pure function — takes
 /// an already-fetched project list, no network access, so it's deterministic and safe to
-/// unit test (see [`resolve_project_id`] for the override-aware entry point callers should
-/// use). `config_path_hint` (see [`crate::plugin::config::config_path_hint`]) is only used
+/// unit test (see [`crate::plugin::data::fetch_current_project_issues`] for the
+/// override-aware entry point callers should use — a configured
+/// `[project_overrides]` entry for `repo_name` short-circuits this function entirely).
+/// `config_path_hint` (see [`crate::plugin::config::config_path_hint`]) is only used
 /// to build a concrete, actionable error message — it never affects matching itself.
 pub fn match_project<'a>(
     repo_name: &str,
@@ -90,7 +92,13 @@ pub fn match_project<'a>(
 /// `no_match_error` and `ambiguous_error` so the fix is "paste this", not "figure out the
 /// TOML syntax yourself".
 fn override_snippet(repo_name: &str) -> String {
-    format!("[project_overrides]\n\"{repo_name}\" = \"<project-id>\"")
+    // `repo_name` is derived from a git remote URL path segment or a directory name (see
+    // `derive_repo_name`), either of which can legally contain a `"` or `\` on Unix — escape
+    // both before interpolating into a TOML string literal so the snippet a user pastes is
+    // always valid TOML, never a parse error on top of the "no project matches" error it's
+    // meant to fix.
+    let escaped_repo_name = repo_name.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("[project_overrides]\n\"{escaped_repo_name}\" = \"<project-id>\"")
 }
 
 fn no_match_error(repo_name: &str, config_path_hint: &str) -> Error {
@@ -110,27 +118,6 @@ fn ambiguous_error(repo_name: &str, candidates: &[&Project], config_path_hint: &
         "Multiple Linear projects match repo \"{repo_name}\": {names}. Add to {config_path_hint}:\n{}",
         override_snippet(repo_name)
     ))
-}
-
-/// Composition entry point for project ID resolution: returns a project_id from either
-/// an override (which short-circuits outright if provided and non-empty — by the time it
-/// reaches here, callers have already scoped it to `repo_name` via
-/// [`crate::plugin::config::resolve_project_id_override`], so trusting it unconditionally
-/// is correct), or by delegating to `match_project` to find a project by name.
-/// `config_path_hint` is forwarded to `match_project` for its error messages only. Called
-/// from [`crate::plugin::data::fetch_current_project_issues`].
-pub fn resolve_project_id(
-    project_id_override: Option<&str>,
-    repo_name: &str,
-    projects: &[Project],
-    config_path_hint: &str,
-) -> Result<String> {
-    if let Some(override_id) = project_id_override {
-        if !override_id.trim().is_empty() {
-            return Ok(override_id.to_string());
-        }
-    }
-    match_project(repo_name, projects, config_path_hint).map(|p| p.id.clone())
 }
 
 /// Derive the repo name from the real environment: `git remote get-url origin` run in
@@ -171,7 +158,20 @@ pub fn detect_repo_name() -> String {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
 
-    derive_repo_name(remote_url.as_deref(), &cwd_dir_name)
+    let repo_name = derive_repo_name(remote_url.as_deref(), &cwd_dir_name);
+    if repo_name.is_empty() {
+        // `host::resolve_cwd()` itself falls back to `std::env::current_dir()` silently
+        // (see its doc comment), so if this path is ever hit, `match_project`'s eventual
+        // `No Linear project matches repo ""` error would otherwise give the user zero clue
+        // that the real problem is "couldn't determine your working directory" rather than
+        // "no project overrides configured for the (correctly detected) repo".
+        tracing::warn!(
+            "Could not determine a repo name from {} (no git remote, and its directory name \
+             is also empty) — falling back to an empty repo name.",
+            cwd.display()
+        );
+    }
+    repo_name
 }
 
 #[cfg(test)]
@@ -314,6 +314,18 @@ mod tests {
         assert!(message.contains("\"herdr-linear\" = \"<project-id>\""));
     }
 
+    /// A repo name containing a `"` (legal in a directory/path segment on Unix) must not
+    /// break the pasted-in TOML snippet.
+    #[test]
+    fn no_match_error_escapes_quotes_in_the_repo_name_snippet() {
+        let projects = vec![test_project("p1", "totally-unrelated")];
+
+        let err = match_project("weird\"repo", &projects, HINT).unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("\"weird\\\"repo\" = \"<project-id>\""));
+    }
+
     #[test]
     fn substring_match_ambiguous_with_multiple_candidates() {
         let projects = vec![
@@ -360,38 +372,6 @@ mod tests {
         ];
 
         let err = match_project("", &projects, HINT).unwrap_err();
-
-        assert!(err.to_string().contains("No Linear project matches"));
-    }
-
-    #[test]
-    fn override_short_circuits_without_matching_project() {
-        let id = resolve_project_id(Some("proj-999"), "anything", &[], HINT).unwrap();
-
-        assert_eq!(id, "proj-999");
-    }
-
-    #[test]
-    fn empty_override_falls_back_to_matching() {
-        let projects = vec![test_project("p1", "herdr-linear")];
-
-        let id = resolve_project_id(Some(""), "herdr-linear", &projects, HINT).unwrap();
-
-        assert_eq!(id, "p1");
-    }
-
-    #[test]
-    fn no_override_delegates_to_match_project() {
-        let projects = vec![test_project("p1", "herdr-linear")];
-
-        let id = resolve_project_id(None, "herdr-linear", &projects, HINT).unwrap();
-
-        assert_eq!(id, "p1");
-    }
-
-    #[test]
-    fn no_override_and_no_match_propagates_error() {
-        let err = resolve_project_id(None, "herdr-linear", &[], HINT).unwrap_err();
 
         assert!(err.to_string().contains("No Linear project matches"));
     }
