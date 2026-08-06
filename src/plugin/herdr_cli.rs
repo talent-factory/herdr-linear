@@ -87,7 +87,7 @@ pub fn herdr_bin() -> String {
 /// [`parse_agent_name_taken_error`]) — only [`agent_start`] (via [`run_for_agent_start`]) passes
 /// `true`. Scoped this way rather than checked unconditionally for every `herdr` subcommand
 /// because `agent_name_taken` is meaningful only in the context of a `agent start` call; if any
-/// other subcommand (`tab_rename`, `agent_wait`, ...) ever received a response reusing that same
+/// other subcommand (`tab_create`, `agent_wait`, ...) ever received a response reusing that same
 /// code, treating it as the same structured error would surface the wrong candidates/remedy
 /// out of context, with no retry logic actually applying.
 fn interpret_output(
@@ -214,7 +214,7 @@ fn is_missing_result_response(error: &Error) -> bool {
 }
 
 /// Wall-clock ceiling for `herdr` subprocess calls that don't carry their own `--timeout`
-/// argument (everything routed through [`run`]: `agent_list`, `agent_start`, `tab_rename`,
+/// argument (everything routed through [`run`]: `agent_list`, `tab_create`, `agent_start`,
 /// `agent_send`). Without this, a hung `herdr` daemon blocks the single-threaded TUI's event
 /// loop indefinitely — `agent_wait` is the exception, since it computes its own call-specific
 /// bound in [`agent_wait`] instead of using this constant.
@@ -312,7 +312,7 @@ fn parse_tab_created(result: &Value) -> Result<TabId> {
 /// in which the tab could be confused with — or have its label stolen by — a different,
 /// already-running tab. See
 /// docs/superpowers/specs/2026-08-06-guaranteed-tab-per-issue-design.md for why this replaced a
-/// `tab_rename`-after-`agent_start` sequence.
+/// rename-after-`agent_start` sequence.
 pub async fn tab_create(herdr_bin: &str, cwd: &Path, label: &str) -> Result<TabId> {
     let cwd_str = cwd.to_string_lossy().to_string();
     let result = run(
@@ -357,8 +357,12 @@ fn next_name_taken_retry<'a>(
         .find(|candidate| !tried.contains(*candidate))
 }
 
-/// `herdr agent start <name> --cwd <cwd> --focus -- <argv...>` — starts `name` (used by herdr
-/// for its own agent-status tracking) running `argv` in a fresh, focused tab at `cwd`.
+/// `herdr agent start <name> --cwd <cwd> --tab <tab> --focus -- <argv...>` — starts `name` (used
+/// by herdr for its own agent-status tracking) running `argv` at `cwd`, explicitly placed inside
+/// `tab` (created via [`tab_create`]) rather than trusting herdr's own default placement — see
+/// docs/superpowers/specs/2026-08-06-guaranteed-tab-per-issue-design.md for why an implicit
+/// placement previously let one issue's agent land as a split inside a different, already-running
+/// issue's tab. There is deliberately no variant of this function that omits `tab`.
 ///
 /// If herdr rejects `name` with `agent_name_taken` (TF-590 — e.g. because a previous issue's
 /// agent tab is still running under a name that collides with this one), retries automatically
@@ -372,6 +376,7 @@ pub async fn agent_start(
     herdr_bin: &str,
     name: &str,
     cwd: &Path,
+    tab: &TabId,
     argv: &[String],
 ) -> Result<AgentStarted> {
     let cwd_str = cwd.to_string_lossy().to_string();
@@ -387,6 +392,8 @@ pub async fn agent_start(
             &attempt_name,
             "--cwd",
             &cwd_str,
+            "--tab",
+            tab.as_str(),
             "--focus",
             "--",
         ];
@@ -448,13 +455,6 @@ pub async fn agent_start(
             Err(err) => return Err(err),
         }
     }
-}
-
-/// `herdr tab rename <tab_id> <label>`.
-pub async fn tab_rename(herdr_bin: &str, tab_id: &TabId, label: &str) -> Result<()> {
-    run(herdr_bin, &["tab", "rename", tab_id.as_str(), label])
-        .await
-        .map(|_| ())
 }
 
 /// Extra attempts `agent_wait` makes when herdr responds with the missing-`result` bug (see the
@@ -962,6 +962,7 @@ fi
             script.to_str().unwrap(),
             "hr",
             Path::new("/tmp"),
+            &TabId("t0".to_string()),
             &["zsh".to_string()],
         )
         .await
@@ -989,6 +990,7 @@ exit 1
             script.to_str().unwrap(),
             "hr",
             Path::new("/tmp"),
+            &TabId("t0".to_string()),
             &["zsh".to_string()],
         )
         .await
@@ -1023,6 +1025,7 @@ exit 1
             script.to_str().unwrap(),
             "hr",
             Path::new("/tmp"),
+            &TabId("t0".to_string()),
             &["zsh".to_string()],
         )
         .await
@@ -1060,6 +1063,7 @@ exit 1
             script.to_str().unwrap(),
             "hr",
             Path::new("/tmp"),
+            &TabId("t0".to_string()),
             &["zsh".to_string()],
         )
         .await
@@ -1112,6 +1116,7 @@ fi
             script.to_str().unwrap(),
             "hr",
             Path::new("/tmp"),
+            &TabId("t0".to_string()),
             &["zsh".to_string()],
         )
         .await
@@ -1137,6 +1142,7 @@ exit 0
             script.to_str().unwrap(),
             "hr",
             Path::new("/tmp"),
+            &TabId("t0".to_string()),
             &["zsh".to_string()],
         )
         .await
@@ -1163,6 +1169,7 @@ exit 1
             script.to_str().unwrap(),
             "hr",
             Path::new("/tmp"),
+            &TabId("t0".to_string()),
             &["zsh".to_string()],
         )
         .await

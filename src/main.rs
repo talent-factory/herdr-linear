@@ -300,23 +300,24 @@ async fn resolve_validated_agent_command(
     })
 }
 
-/// Runs the full "implement this issue" flow for one issue: open a herdr tab running `command`
-/// under a name unique to this issue (TF-590, see [`plugin::implement::build_agent_name`]), set
-/// the issue to its team's "In Progress" state, wait for the agent to become ready, then inject
-/// the implement prompt. `command` is resolved once per run by
-/// [`resolve_validated_agent_command`] — not here — so every issue processed in the same
-/// `<Enter>` press (single or [`start_implementation_many`]'s marked-multiple case) launches
-/// under the same command; see that function's doc for why re-resolving per issue was a bug.
-/// Never propagates — every failure becomes an [`ImplementOutcome::Failed`] so both callers
+/// Runs the full "implement this issue" flow for one issue: create a fresh tab labeled after the
+/// issue and start `command` running inside it under a name unique to this issue (TF-590, see
+/// [`plugin::implement::build_agent_name`]), set the issue to its team's "In Progress" state,
+/// wait for the agent to become ready, then inject the implement prompt. `command` is resolved
+/// once per run by [`resolve_validated_agent_command`] — not here — so every issue processed in
+/// the same `<Enter>` press (single or [`start_implementation_many`]'s marked-multiple case)
+/// launches under the same command; see that function's doc for why re-resolving per issue was a
+/// bug. Never propagates — every failure becomes an [`ImplementOutcome::Failed`] so both callers
 /// ([`start_implementation`] for the single-issue case, [`start_implementation_many`] for the
 /// marked-multiple case) can turn it into whatever status banner fits their situation,
 /// mirroring `ensure_loaded`'s "inline error instead of crashing" philosophy. Any non-fatal
-/// warnings collected along the way (tab rename, workflow-state lookup, the actual state
-/// transition) are preserved in *every* terminal outcome, not just the final success case — a
-/// failure late in the flow (e.g. `agent_wait` timing out) must not hide an earlier one (e.g.
-/// the issue never actually reaching "In Progress"). See
-/// docs/superpowers/specs/2026-08-05-implement-on-enter-design.md for the full data flow this
-/// extends.
+/// warnings collected along the way (workflow-state lookup, the actual state transition) are
+/// preserved in *every* terminal outcome, not just the final success case — a failure late in
+/// the flow (e.g. `agent_wait` timing out) must not hide an earlier one (e.g. the issue never
+/// actually reaching "In Progress"). See
+/// docs/superpowers/specs/2026-08-05-implement-on-enter-design.md for the full original data
+/// flow this extends, and docs/superpowers/specs/2026-08-06-guaranteed-tab-per-issue-design.md
+/// for the tab-creation change.
 ///
 /// The agent is spawned in [`plugin::host::resolve_cwd`]'s directory — the herdr-injected
 /// launch context's working directory, not the plugin process's own `std::env::current_dir()`
@@ -327,7 +328,7 @@ async fn resolve_validated_agent_command(
 /// split-only caveat this replaces. `resolve_cwd` itself never fails outright (see its own
 /// doc), so this function separately guards against the one case that matters here: both its
 /// launch-context parse *and* its `current_dir()` fallback failing, which would otherwise pass
-/// an empty `--cwd` straight through to `agent_start`.
+/// an empty `--cwd` straight through to `tab_create` and `agent_start`.
 async fn implement_one(
     herdr_bin: &str,
     client: &herdr_linear::LinearClient,
@@ -353,18 +354,25 @@ async fn implement_one(
     // suggested name each time — this is what makes those retries something other than the
     // exact same losing name).
     let agent_name = plugin::implement::build_agent_name(command.as_str(), &issue.identifier);
-    let started = match plugin::herdr_cli::agent_start(herdr_bin, &agent_name, &cwd, &argv).await {
-        Ok(started) => started,
-        Err(err) => return ImplementOutcome::Failed(format!("failed to start agent tab: {err}")),
+
+    let tab_id = match plugin::herdr_cli::tab_create(herdr_bin, &cwd, &issue.identifier).await {
+        Ok(tab_id) => tab_id,
+        Err(err) => return ImplementOutcome::Failed(format!("failed to create a tab: {err}")),
     };
 
-    let mut warnings = Vec::new();
+    let started =
+        match plugin::herdr_cli::agent_start(herdr_bin, &agent_name, &cwd, &tab_id, &argv).await {
+            Ok(started) => started,
+            Err(err) => {
+                return ImplementOutcome::Failed(format!(
+                    "tab created but agent failed to start ({err}) — an empty '{}' tab was left \
+                     open, close it manually",
+                    issue.identifier
+                ));
+            }
+        };
 
-    if let Err(err) =
-        plugin::herdr_cli::tab_rename(herdr_bin, &started.tab_id, &issue.identifier).await
-    {
-        warnings.push(format!("failed to rename tab: {err}"));
-    }
+    let mut warnings = Vec::new();
 
     match client.get_workflow_states(&issue.team.id).await {
         Ok(states) => match plugin::implement::pick_in_progress_state(&states) {
@@ -595,7 +603,7 @@ fn is_buffered_quit_key(
 /// (`Action::Implement` / `Action::ImplementMany`) ran, so a buffered `<Enter>` doesn't replay
 /// as a fresh action once we're back to polling. Every step in that flow has its own bound —
 /// `agent_wait`'s own budget (up to 30s plus retry buffer), `get_workflow_states`/
-/// `update_issue`'s 30s HTTP timeout each, `tab_rename`/`agent_send`/`agent_list` at
+/// `update_issue`'s 30s HTTP timeout each, `tab_create`/`agent_send`/`agent_list` at
 /// `DEFAULT_CLI_TIMEOUT` (15s) each, and `agent_start` at up to `DEFAULT_CLI_TIMEOUT` times
 /// `1 + AGENT_START_NAME_TAKEN_MAX_RETRIES` (TF-590's `agent_name_taken` retry loop, ~45s
 /// worst case, not a flat 15s) — but they're sequential (and, for `Action::ImplementMany`,
