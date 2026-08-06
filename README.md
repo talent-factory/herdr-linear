@@ -267,6 +267,20 @@ was reversed: herdr's tab list can only report the underlying binary a pane runs
 one started bare. Under the old precedence, `agent_command = "hr"` could never actually take
 effect once any other Claude Code tab was open.)
 
+"Team Issues" shows a Linear team's open issues. Unlike a project, a team has no
+repo-derived name to match, so it needs an explicit default: set `team_id` in the same
+`config.toml`.
+
+```toml
+team_id = "linear-team-id"
+```
+
+You only need this if your workspace has more than one team — a single-team workspace
+resolves automatically. If `team_id` is unset and the workspace has more than one team,
+entering "Team Issues" shows an error naming every team (so you can see which id to use)
+and pointing at `config.toml`; press `c` on that error screen to open it, same as for the
+project-matching errors above.
+
 ### Use
 
 Bind keys to the plugin's actions in `~/.config/herdr/config.toml`:
@@ -286,8 +300,8 @@ description = "Open Linear panel (tab)"
 ```
 
 Reload the config, then press the bound key to open the plugin. The panel opens on a
-menu with three options: "My Issues" (available), "Project Issues" (coming soon),
-and "Team Issues" (coming soon). From the menu, use `↑`/`↓` to navigate options,
+menu with three options — "My Issues", "Project Issues", and "Team Issues" — all
+available. From the menu, use `↑`/`↓` to navigate options,
 `Enter` to open the highlighted view, and `q` or `Esc` to quit. Once inside a view,
 use `↑`/`↓` to navigate the issue list, `o` to open the selected issue in your browser,
 `<Enter>` to implement it (opens a herdr tab, starts the preferred coding agent, sets

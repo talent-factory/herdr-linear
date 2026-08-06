@@ -1,8 +1,9 @@
 //! Composes existing `LinearClient` calls into what the plugin needs: the
-//! authenticated viewer's open assigned issues, and the current project's open issues.
+//! authenticated viewer's open assigned issues, the current project's open issues, and
+//! (TF-579) a resolved team's open issues.
 
 use crate::plugin::{config, repo};
-use crate::{Issue, LinearClient, Project, Result};
+use crate::{Error, Issue, LinearClient, Project, Result, Team};
 use serde_json::{json, Value};
 
 /// Page size used when paginating `get_issues`/`get_projects` to completion (see
@@ -10,6 +11,13 @@ use serde_json::{json, Value};
 /// default; Linear's API caps a single page at 250 regardless of what's requested.
 const ISSUE_PAGE_SIZE: i32 = 50;
 const PROJECT_PAGE_SIZE: i32 = 250;
+
+/// Page size for `get_teams` when resolving which team to use for the Team Issues
+/// view: matches `PROJECT_PAGE_SIZE`'s use of the API's own single-page cap, since
+/// (like [`fetch_all_projects`]) every team in the workspace is needed to tell
+/// "exactly one" from "more than one" — a truncated first page could wrongly report
+/// an ambiguous workspace as unambiguous.
+const TEAM_PAGE_SIZE: i32 = 250;
 
 /// Hang/cost guard on the pagination loops below: stop after this many pages even if
 /// Linear still reports more, logging a warning rather than fetching indefinitely. Chosen
@@ -178,6 +186,118 @@ pub async fn fetch_current_project_issues(client: &LinearClient) -> Result<Vec<I
     fetch_project_issues(client, &project_id).await
 }
 
+/// True for an issue whose `state.type` is neither `"completed"` nor `"canceled"` —
+/// the same "open" definition [`assignee_open_filter`]/[`project_open_filter`]
+/// express at the query level, applied here client-side since `get_team_issues`
+/// (unlike `get_issues`) doesn't accept an extra filter clause of its own. See
+/// [`fetch_team_issues`].
+fn is_open(issue: &Issue) -> bool {
+    !matches!(issue.state.r#type.as_str(), "completed" | "canceled")
+}
+
+/// Fetch every team in the workspace, following `pageInfo.hasNextPage` past a single
+/// `get_teams` page the same way [`fetch_all_projects`] does for projects (see
+/// `MAX_PAGES` for the fetch's own upper bound). Needed because [`resolve_team_id`]
+/// must see every team to tell "exactly one" from "more than one".
+async fn fetch_all_teams(client: &LinearClient) -> Result<Vec<Team>> {
+    let mut teams = Vec::new();
+    let mut after: Option<String> = None;
+    let mut page = 0u32;
+
+    loop {
+        page += 1;
+        let connection = client.get_teams(Some(TEAM_PAGE_SIZE), after.take()).await?;
+        let has_next_page = connection.page_info.has_next_page;
+        after = connection.page_info.end_cursor.clone();
+        teams.extend(connection.nodes);
+
+        if !has_next_page || after.is_none() {
+            break;
+        }
+        if page >= MAX_PAGES {
+            tracing::warn!(
+                "Workspace still has more teams after {page} pages of {TEAM_PAGE_SIZE} \
+                 — team selection may miss teams beyond the {} fetched. Set `team_id` \
+                 in config.toml to bypass team listing.",
+                teams.len()
+            );
+            break;
+        }
+    }
+
+    Ok(teams)
+}
+
+/// Resolve which team's issues [`fetch_current_team_issues`] should show.
+///
+/// A configured `team_id` (see `config::load_team_id_override`) short-circuits this,
+/// skipping [`fetch_all_teams`]'s network call entirely — mirrors how
+/// `fetch_current_project_issues`'s `project_overrides` short-circuits
+/// `fetch_all_projects`. Without one, every team in the workspace is fetched to
+/// decide: exactly one team resolves to it automatically (nothing to disambiguate);
+/// zero or more than one is an `Error::ConfigError` naming the candidates (if any)
+/// and telling the user to set `team_id`. Unlike the project override, there's no
+/// per-repo signal (name, git remote) to match a team by — Linear teams aren't tied
+/// to a single repo the way projects are — so this is a single global default rather
+/// than a table keyed by repo name.
+async fn resolve_team_id(client: &LinearClient) -> Result<String> {
+    if let Some(team_id) = config::load_team_id_override()? {
+        return Ok(team_id);
+    }
+
+    let teams = fetch_all_teams(client).await?;
+    let config_path_hint = config::current_config_path_hint();
+
+    match teams.len() {
+        1 => Ok(teams[0].id.clone()),
+        0 => Err(Error::ConfigError(format!(
+            "No teams found in this Linear workspace. Set `team_id` in \
+             {config_path_hint} once you know which team to use."
+        ))),
+        _ => {
+            let names = teams
+                .iter()
+                .map(|team| format!("{} ({})", team.name, team.key))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(Error::ConfigError(format!(
+                "Multiple teams found: {names}. Set `team_id` in {config_path_hint} to \
+                 pick one."
+            )))
+        }
+    }
+}
+
+/// Fetch the open (not completed, not canceled) issues of `team_id`.
+///
+/// Delegates the fetch itself to [`LinearClient::get_team_issues`] (per TF-579: it
+/// already exists in the client) rather than composing `client.get_issues` with a
+/// purpose-built filter the way [`fetch_project_issues`] composes
+/// [`project_open_filter`] — `get_team_issues` fixes its own filter to `team.id.eq`
+/// and doesn't accept an additional clause, so the open-state filter (`is_open`) is
+/// applied client-side on the result instead of at the query. For the same reason it
+/// also doesn't accept a pagination cursor: a team with more than `ISSUE_PAGE_SIZE`
+/// open issues is silently truncated here, the same gap `get_projects`/`get_issues`
+/// had before TF-577/578 added their own `after` params — left as-is since widening
+/// `get_team_issues`'s signature is outside TF-579's scope (its ticket text notes the
+/// client-layer call already exists; only the plugin-layer composition was missing).
+pub async fn fetch_team_issues(client: &LinearClient, team_id: &str) -> Result<Vec<Issue>> {
+    let connection = client
+        .get_team_issues(team_id, Some(ISSUE_PAGE_SIZE))
+        .await?;
+
+    Ok(connection.nodes.into_iter().filter(is_open).collect())
+}
+
+/// Resolve which team to show (see `resolve_team_id`), then fetch its open issues.
+/// Re-runs resolution on every call — no caching — matching
+/// [`fetch_current_project_issues`], so a `config.toml` edit between calls (e.g.
+/// across a retry) is picked up rather than served stale.
+pub async fn fetch_current_team_issues(client: &LinearClient) -> Result<Vec<Issue>> {
+    let team_id = resolve_team_id(client).await?;
+    fetch_team_issues(client, &team_id).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,5 +322,59 @@ mod tests {
             filter["state"]["type"]["nin"],
             json!(["completed", "canceled"])
         );
+    }
+
+    fn sample_issue_with_state_type(state_type: &str) -> Issue {
+        serde_json::from_value(json!({
+            "id": "issue-1",
+            "identifier": "ENG-1",
+            "title": "Sample",
+            "description": null,
+            "state": {"id": "state-1", "name": "Sample State", "type": state_type},
+            "priority": 0,
+            "estimate": null,
+            "team": {
+                "id": "team-1",
+                "key": "ENG",
+                "name": "Engineering",
+                "description": null,
+                "createdAt": "2026-01-01T00:00:00Z",
+                "updatedAt": "2026-01-01T00:00:00Z"
+            },
+            "assignee": null,
+            "creator": null,
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:00:00Z",
+            "startedAt": null,
+            "completedAt": null,
+            "cycle": null,
+            "project": null,
+            "labels": {"nodes": []},
+            "url": "https://linear.app/team/issue/ENG-1"
+        }))
+        .expect("valid issue payload")
+    }
+
+    /// [`is_open`] is what [`fetch_team_issues`] uses to filter `get_team_issues`'s
+    /// result client-side, since (unlike `get_issues`) it can't express "open" as
+    /// part of the query itself.
+    #[test]
+    fn is_open_keeps_non_terminal_states() {
+        for state_type in ["triage", "backlog", "unstarted", "started"] {
+            assert!(
+                is_open(&sample_issue_with_state_type(state_type)),
+                "{state_type} should be open"
+            );
+        }
+    }
+
+    #[test]
+    fn is_open_excludes_terminal_states() {
+        for state_type in ["completed", "canceled"] {
+            assert!(
+                !is_open(&sample_issue_with_state_type(state_type)),
+                "{state_type} should not be open"
+            );
+        }
     }
 }
