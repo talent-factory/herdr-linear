@@ -311,6 +311,48 @@ pub async fn agent_send(herdr_bin: &str, pane_id: &PaneId, text: &str) -> Result
         .map(|_| ())
 }
 
+/// Extract the rendered pane text from a `herdr agent read` call's already-unwrapped `result`
+/// value. Split out from [`agent_read`] for the same testability reason as
+/// [`parse_agent_started`].
+fn parse_agent_read(result: &Value) -> Result<String> {
+    result
+        .get("read")
+        .and_then(|r| r.get("text"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| Error::Internal("agent.read response missing read.text".to_string()))
+}
+
+/// `herdr agent read <pane_id> --source <source> --lines <lines>` — the pane's rendered
+/// terminal text. Used by `main.rs`'s `send_prompt_until_visible` to confirm an [`agent_send`]
+/// actually reached the target's input box, rather than trusting `agent_wait`'s screen-scraped
+/// "idle" status alone: that status can go true the instant the prompt box is *painted*, which
+/// can be a beat before the target's input loop has actually attached to read the pty — a
+/// keystroke written into that gap is silently dropped, not queued (see the module docs above
+/// for the related, already-worked-around `agent_wait` race).
+pub async fn agent_read(
+    herdr_bin: &str,
+    pane_id: &PaneId,
+    source: &str,
+    lines: u32,
+) -> Result<String> {
+    let lines_str = lines.to_string();
+    let result = run(
+        herdr_bin,
+        &[
+            "agent",
+            "read",
+            pane_id.as_str(),
+            "--source",
+            source,
+            "--lines",
+            &lines_str,
+        ],
+    )
+    .await?;
+    parse_agent_read(&result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,6 +500,31 @@ mod tests {
         let result = serde_json::json!({"id": "cli:agent:start"});
 
         assert!(parse_agent_started(&result).is_err());
+    }
+
+    #[test]
+    fn parse_agent_read_extracts_the_rendered_text() {
+        let result = serde_json::json!({"read": {"text": "❯ Implement Linear Issue TF-579"}});
+
+        let text = parse_agent_read(&result).unwrap();
+
+        assert_eq!(text, "❯ Implement Linear Issue TF-579");
+    }
+
+    #[test]
+    fn parse_agent_read_errors_when_read_text_is_missing() {
+        let result = serde_json::json!({"read": {"pane_id": "wY:p10"}});
+
+        let err = parse_agent_read(&result).unwrap_err().to_string();
+
+        assert!(err.contains("read.text"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn parse_agent_read_errors_when_the_read_object_is_missing_entirely() {
+        let result = serde_json::json!({"id": "cli:agent:read"});
+
+        assert!(parse_agent_read(&result).is_err());
     }
 
     #[test]
