@@ -301,14 +301,16 @@ mod tests {
         assert!(text.contains("Team Issues"));
     }
 
+    /// As of TF-579 all three menu options are available, so none should show the
+    /// "(coming soon)" suffix `draw_menu` adds for `!option.available` entries —
+    /// replaces the old `marks_unavailable_menu_options_as_coming_soon`, which
+    /// asserted Team Issues showed it.
     #[test]
-    fn marks_unavailable_menu_options_as_coming_soon() {
+    fn no_menu_option_is_marked_coming_soon() {
         let app = App::new();
         let text = rendered_text(&app);
 
-        assert!(text.contains("Team Issues (coming soon)"));
-        assert!(!text.contains("My Issues (coming soon)"));
-        assert!(!text.contains("Project Issues (coming soon)"));
+        assert!(!text.contains("(coming soon)"));
     }
 
     #[test]

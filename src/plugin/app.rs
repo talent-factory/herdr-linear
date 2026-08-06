@@ -16,7 +16,7 @@ pub enum ViewKind {
     MyIssues,
     /// All open issues in the current project.
     ProjectIssues,
-    /// All open issues in a team (not yet implemented — see TF-579).
+    /// All open issues in a team.
     TeamIssues,
 }
 
@@ -40,8 +40,7 @@ pub struct MenuOption {
     pub available: bool,
 }
 
-/// The menu options in display order. `TeamIssues` becomes available once TF-579
-/// implements its data fetching — until then the menu shows but disables it.
+/// The menu options in display order. All three are available as of TF-579.
 pub const MENU_OPTIONS: [MenuOption; 3] = [
     MenuOption {
         kind: ViewKind::MyIssues,
@@ -53,7 +52,7 @@ pub const MENU_OPTIONS: [MenuOption; 3] = [
     },
     MenuOption {
         kind: ViewKind::TeamIssues,
-        available: false,
+        available: true,
     },
 ];
 
@@ -518,15 +517,19 @@ mod tests {
     }
 
     #[test]
-    fn entering_an_unavailable_option_does_nothing() {
+    fn entering_the_team_issues_option_transitions_to_loading_and_returns_enter_view() {
         let mut app = App::new();
         app.move_menu_selection_down();
-        app.move_menu_selection_down(); // -> Team Issues, unavailable
+        app.move_menu_selection_down(); // -> Team Issues, available since TF-579
 
         let action = app.enter_selected_menu_option();
 
-        assert_eq!(action, None);
-        assert!(matches!(app.screen, Screen::Menu { selected: 2 }));
+        assert_eq!(action, Some(Action::EnterView));
+        assert!(matches!(
+            app.screen,
+            Screen::View(ViewKind::TeamIssues, ViewState::Loading)
+        ));
+        assert_eq!(app.current_view(), Some(ViewKind::TeamIssues));
     }
 
     #[test]
@@ -803,15 +806,18 @@ mod tests {
     }
 
     #[test]
-    fn enter_key_on_an_unavailable_menu_option_does_nothing() {
+    fn enter_key_on_the_team_issues_menu_selection_enters_team_issues() {
         let mut app = App::new();
         handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
-        handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE); // -> Team Issues, unavailable
+        handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE); // -> Team Issues, available since TF-579
 
         let action = handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
 
-        assert_eq!(action, None);
-        assert!(matches!(app.screen, Screen::Menu { selected: 2 }));
+        assert_eq!(action, Some(Action::EnterView));
+        assert!(matches!(
+            app.screen,
+            Screen::View(ViewKind::TeamIssues, ViewState::Loading)
+        ));
     }
 
     #[test]
