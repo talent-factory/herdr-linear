@@ -1,7 +1,9 @@
 //! Rendering for the plugin TUI: a view-selection menu, a loading message, an error
 //! message with a retry hint, or a two-pane issue list + detail view.
 
-use crate::plugin::app::{App, Screen, Status, ViewKind, ViewState, MENU_OPTIONS};
+use crate::plugin::app::{
+    matching_issue_indices, App, Screen, Status, ViewKind, ViewState, MENU_OPTIONS,
+};
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
@@ -82,7 +84,11 @@ fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState, status: 
             );
             frame.render_widget(paragraph, frame.area());
         }
-        ViewState::Loaded { issues, selected } => {
+        ViewState::Loaded {
+            issues,
+            selected,
+            filter,
+        } => {
             let area = if let Some(status) = status {
                 let outer = Layout::default()
                     .direction(Direction::Vertical)
@@ -112,12 +118,36 @@ fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState, status: 
                 .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .split(area);
 
-            let items: Vec<ListItem> = issues
-                .iter()
-                .map(|issue| ListItem::new(format!("{} {}", issue.identifier, issue.title)))
-                .collect();
+            // `selected` indexes this filtered subset, not `issues` directly — see
+            // `matching_issue_indices`'s doc comment and `App::selected_issue`, which the
+            // detail pane below mirrors exactly so the two panes never disagree about
+            // which issue is highlighted.
+            let matched_indices = matching_issue_indices(issues, &filter.query);
+
+            // `▏` marks the live cursor position while editing, so it's visually
+            // distinct from a confirmed-but-inactive filter shown without one.
+            let list_title = match (filter.editing, filter.query.is_empty()) {
+                (true, _) => format!("{} — filter: {}▏", kind.label(), filter.query),
+                (false, true) => kind.label().to_string(),
+                (false, false) => format!("{} — filter: {}", kind.label(), filter.query),
+            };
+
+            let items: Vec<ListItem> = if matched_indices.is_empty() && !issues.is_empty() {
+                vec![
+                    ListItem::new(format!("No issues match \"{}\"", filter.query))
+                        .style(Style::default().add_modifier(Modifier::DIM)),
+                ]
+            } else {
+                matched_indices
+                    .iter()
+                    .map(|&index| {
+                        let issue = &issues[index];
+                        ListItem::new(format!("{} {}", issue.identifier, issue.title))
+                    })
+                    .collect()
+            };
             let list = List::new(items)
-                .block(Block::default().borders(Borders::ALL).title(kind.label()))
+                .block(Block::default().borders(Borders::ALL).title(list_title))
                 .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
             let mut list_state = ListState::default();
             list_state.select(Some(*selected));
@@ -127,7 +157,10 @@ fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState, status: 
             let detail_area = detail_block.inner(chunks[1]);
             frame.render_widget(detail_block, chunks[1]);
 
-            if let Some(issue) = issues.get(*selected) {
+            let selected_issue = matched_indices
+                .get(*selected)
+                .and_then(|&index| issues.get(index));
+            if let Some(issue) = selected_issue {
                 // Header (identifier/title/Status/Assignee/Project) and body
                 // (the Markdown description) are rendered as one continuous
                 // `Text` in a single `Min(0)` area rather than two areas split
@@ -187,8 +220,9 @@ fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState, status: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugin::app::App;
+    use crate::plugin::app::{handle_key, App};
     use crate::Issue;
+    use crossterm::event::{KeyCode, KeyModifiers};
     use ratatui::{backend::TestBackend, Terminal};
     use serde_json::json;
 
@@ -450,5 +484,68 @@ mod tests {
         assert!(text.contains("Status: In Progress"));
         assert!(text.contains("Assignee: Alice"));
         assert!(text.contains("Project: Herdr Linear"));
+    }
+
+    // TF-580: type-to-filter rendering.
+
+    #[test]
+    fn shows_the_filter_query_and_a_cursor_marker_in_the_list_title_while_editing() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        for c in "eng".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+
+        let text = rendered_text(&app);
+        assert!(text.contains("filter: eng"));
+        // The cursor marker (▏) is present while actively editing.
+        assert!(text.contains('▏'));
+    }
+
+    #[test]
+    fn shows_the_confirmed_filter_query_without_a_cursor_marker() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        for c in "eng".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        let text = rendered_text(&app);
+        assert!(text.contains("filter: eng"));
+        assert!(!text.contains('▏'));
+    }
+
+    #[test]
+    fn only_matching_issues_are_rendered_in_the_list_while_filtering() {
+        let mut app = app_in_my_issues_view();
+        let mut issues = vec![sample_issue("ENG-1"), sample_issue("ENG-2")];
+        issues[0].title = "Fix login bug".to_string();
+        issues[1].title = "Add dark mode".to_string();
+        app.set_issues(issues);
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        for c in "login".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+
+        let text = rendered_text(&app);
+        assert!(text.contains("Fix login bug"));
+        assert!(!text.contains("Add dark mode"));
+    }
+
+    #[test]
+    fn shows_a_no_matches_message_when_the_filter_matches_nothing() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        for c in "nonexistent".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+
+        let text = rendered_text(&app);
+        assert!(text.contains("No issues match"));
+        assert!(!text.contains("Title for ENG-1"));
     }
 }

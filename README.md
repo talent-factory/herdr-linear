@@ -289,10 +289,12 @@ Reload the config, then press the bound key to open the plugin. The panel opens 
 menu with three options: "My Issues" (available), "Project Issues" (coming soon),
 and "Team Issues" (coming soon). From the menu, use `↑`/`↓` to navigate options,
 `Enter` to open the highlighted view, and `q` or `Esc` to quit. Once inside a view,
-use `↑`/`↓` to navigate the issue list, `o` to open the selected issue in your browser,
-`<Enter>` to implement it (opens a herdr tab, starts the preferred coding agent, sets
-the issue to "In Progress", and injects an implement prompt once the agent is ready),
-`r` to retry after an error, `c` to open `config.toml` from an error screen (see
+use `↑`/`↓` to navigate the issue list, `/` to filter it by title or identifier (type to
+narrow, `↑`/`↓` still navigate the narrowed list live, `<Enter>` confirms and keeps the
+filter applied, `Esc` cancels and restores the full list), `o` to open the selected issue
+in your browser, `<Enter>` to implement it (opens a herdr tab, starts the preferred coding
+agent, sets the issue to "In Progress", and injects an implement prompt once the agent is
+ready), `r` to retry after an error, `c` to open `config.toml` from an error screen (see
 "Configure" above — creates the file if it doesn't exist yet), and `Esc` to return to the
 menu. Press `q` to quit the
 panel from anywhere (menu or view). Pressing the key again focuses the panel if it's
