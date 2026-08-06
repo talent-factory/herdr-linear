@@ -111,4 +111,25 @@ mod tests {
         };
         assert_eq!(err.to_string(), "Rate limit exceeded: 5000ms");
     }
+
+    #[test]
+    fn agent_name_taken_display_omits_candidates_suffix_when_empty() {
+        let err = Error::AgentNameTaken {
+            message: "agent name hr is already used".to_string(),
+            candidates: vec![],
+        };
+        assert_eq!(err.to_string(), "agent name hr is already used");
+    }
+
+    #[test]
+    fn agent_name_taken_display_appends_candidates_when_present() {
+        let err = Error::AgentNameTaken {
+            message: "agent name hr is already used".to_string(),
+            candidates: vec!["hr-2".to_string(), "hr-3".to_string()],
+        };
+        assert_eq!(
+            err.to_string(),
+            "agent name hr is already used; candidates: hr-2, hr-3"
+        );
+    }
 }

@@ -84,7 +84,12 @@ fn status_banner_height(text: &str, width: u16) -> u16 {
     if width == 0 {
         return STATUS_BANNER_MIN_HEIGHT;
     }
-    let chars = text.chars().count() as u16;
+    // `.min(u16::MAX as usize)` before the cast: `text` is in practice bounded by
+    // `main.rs::MAX_STATUS_DETAILS`, but that's a count of *segments*, not a length cap on the
+    // underlying `herdr`/Linear error text within each one — an unbounded single message could
+    // otherwise wrap `as u16` around to a small number and *under*-estimate, which is exactly
+    // the failure mode this function's own doc says it deliberately avoids.
+    let chars = text.chars().count().min(u16::MAX as usize) as u16;
     let estimated = chars.div_ceil(width).saturating_add(2);
     estimated.clamp(STATUS_BANNER_MIN_HEIGHT, STATUS_BANNER_MAX_HEIGHT)
 }
@@ -433,6 +438,27 @@ mod tests {
     fn status_banner_height_is_clamped_to_a_maximum() {
         let huge = "x".repeat(10_000);
         assert_eq!(status_banner_height(&huge, 60), STATUS_BANNER_MAX_HEIGHT);
+    }
+
+    #[test]
+    fn status_banner_height_treats_a_zero_width_as_the_floor() {
+        assert_eq!(
+            status_banner_height("anything", 0),
+            STATUS_BANNER_MIN_HEIGHT
+        );
+    }
+
+    #[test]
+    fn status_banner_height_does_not_wrap_around_for_a_pathologically_long_message() {
+        // A single underlying herdr/Linear error string isn't length-capped by
+        // `main.rs::MAX_STATUS_DETAILS` (that bounds segment *count*, not each segment's
+        // length) — a message past `u16::MAX` chars must still saturate to the maximum banner
+        // height, not wrap `as u16` around to a small number and under-estimate.
+        let pathological = "x".repeat(u16::MAX as usize + 1);
+        assert_eq!(
+            status_banner_height(&pathological, 1),
+            STATUS_BANNER_MAX_HEIGHT
+        );
     }
 
     #[test]

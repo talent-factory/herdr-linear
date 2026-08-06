@@ -100,18 +100,25 @@ fn interpret_output(
     let parsed: Option<Value> = serde_json::from_str(stdout.trim()).ok();
 
     let error_obj = parsed.as_ref().and_then(|v| v.get("error"));
+
+    // Checked independently of `status_success`/`error.message` presence, and before the
+    // generic failure gate below: herdr could in principle report an `agent_name_taken`
+    // collision with a clean exit and no `message` field at all (see
+    // `parse_agent_name_taken_error`'s message fallback, added for exactly that case), and
+    // gating this on "is this a failure at all" would let such a response slip through as a
+    // false success instead of the collision it actually is.
+    if check_agent_name_taken {
+        if let Some(agent_name_taken) = parse_agent_name_taken_error(error_obj) {
+            return Err(agent_name_taken);
+        }
+    }
+
     let error_message = error_obj
         .and_then(|e| e.get("message"))
         .and_then(|m| m.as_str())
         .map(str::to_string);
 
     if !status_success || error_message.is_some() {
-        if check_agent_name_taken {
-            if let Some(agent_name_taken) = parse_agent_name_taken_error(error_obj) {
-                return Err(agent_name_taken);
-            }
-        }
-
         let message = error_message.unwrap_or_else(|| {
             let stderr = stderr.trim();
             if stderr.is_empty() {
@@ -145,10 +152,13 @@ fn interpret_output(
 ///
 /// `message` falls back to a generic notice if herdr's body omits it (shouldn't happen in
 /// practice, but the field is read the same optional way `candidates` already was). If
-/// `candidates` is present but isn't a JSON array, or contains non-string entries, this logs a
-/// `tracing::warn!` and treats it the same as "no candidates" — that's a herdr protocol surprise
-/// worth knowing about (via `$HERDR_LINEAR_LOG_FILE`, see `main.rs::init_tracing`), not silently
-/// indistinguishable from herdr legitimately having nothing to suggest.
+/// `candidates` is present but isn't a JSON array at all, this logs a `tracing::warn!` and treats
+/// it the same as "no candidates" (empty). If it *is* an array but contains non-string entries,
+/// only those entries are dropped (also with a `tracing::warn!`) — any remaining valid string
+/// candidates are still returned and still available to the retry loop, so this is a partial
+/// list in that case, not an empty one. Either way, a malformed response is a herdr protocol
+/// surprise worth knowing about (via `$HERDR_LINEAR_LOG_FILE`, see `main.rs::init_tracing`), not
+/// silently indistinguishable from herdr legitimately having nothing (more) to suggest.
 fn parse_agent_name_taken_error(error_obj: Option<&Value>) -> Option<Error> {
     let code = error_obj?.get("code")?.as_str()?;
     if code != "agent_name_taken" {
@@ -360,19 +370,42 @@ pub async fn agent_start(
                 candidates,
             }) => match next_name_taken_retry(&candidates, &tried, attempt) {
                 Some(candidate) => {
+                    tracing::debug!(
+                        "agent_start: name {attempt_name:?} taken ({message}), retrying with \
+                             {candidate:?} (attempt {})",
+                        attempt + 1
+                    );
                     attempt_name = candidate.to_string();
                     tried.insert(attempt_name.clone());
                     attempt += 1;
                 }
                 None => {
+                    // `next_name_taken_retry` returns `None` for two different reasons that must
+                    // not be conflated in the message: the retry *budget* ran out (some of
+                    // `candidates` were never attempted), or every candidate herdr has ever
+                    // suggested is already in `tried`. Reporting an untried candidate as "already
+                    // tried" would send the user chasing a name that was never actually attempted.
+                    let untried: Vec<&str> = candidates
+                        .iter()
+                        .map(String::as_str)
+                        .filter(|c| !tried.contains(*c))
+                        .collect();
                     let remedy = if candidates.is_empty() {
                         "herdr suggested no alternative name".to_string()
-                    } else {
+                    } else if untried.is_empty() {
                         format!(
                             "the suggested alternative{} ({}) {} already tried",
                             if candidates.len() == 1 { "" } else { "s" },
                             candidates.join(", "),
                             if candidates.len() == 1 { "was" } else { "were" }
+                        )
+                    } else {
+                        format!(
+                            "gave up after {attempt} retries; herdr's suggested alternative{} \
+                                 ({}) {} not yet tried",
+                            if untried.len() == 1 { "" } else { "s" },
+                            untried.join(", "),
+                            if untried.len() == 1 { "was" } else { "were" }
                         )
                     };
                     return Err(Error::Internal(format!(
@@ -696,6 +729,28 @@ mod tests {
     }
 
     #[test]
+    fn interpret_output_maps_agent_name_taken_even_on_a_zero_exit_with_no_message_field() {
+        // herdr could in principle report an `agent_name_taken` collision with a successful exit
+        // code and no `message` field at all — `agent_name_taken` detection must not depend on
+        // the outer "is this a failure at all" gate (`!status_success || error_message.is_some()`),
+        // since that gate is exactly what a clean-exit, message-less error body slips past.
+        let result = interpret_output(
+            "herdr agent start hr --cwd . --focus -- zsh",
+            true,
+            r#"{"error":{"code":"agent_name_taken","candidates":["hr-2"]}}"#,
+            "",
+            true,
+        );
+
+        match result.unwrap_err() {
+            Error::AgentNameTaken { candidates, .. } => {
+                assert_eq!(candidates, vec!["hr-2".to_string()])
+            }
+            other => panic!("expected AgentNameTaken, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn interpret_output_ignores_agent_name_taken_when_not_checking_for_it() {
         // TF-590 follow-up: `interpret_output` only maps `agent_name_taken` when the caller
         // (only `agent_start`, via `run_for_agent_start`) opts in — every other `herdr`
@@ -950,6 +1005,146 @@ exit 1
         assert!(
             !message.contains("already tried"),
             "message shouldn't claim alternatives were tried when none were offered: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_start_does_not_claim_an_untried_candidate_was_already_tried_when_the_budget_runs_out_first(
+    ) {
+        // Three distinct candidates every time, but AGENT_START_NAME_TAKEN_MAX_RETRIES (2) means
+        // the retry *budget* is exhausted after two retries, before the loop ever gets to try the
+        // third candidate. Regression test for the give-up message previously claiming every
+        // candidate herdr ever suggested (including ones the loop never attempted) was "already
+        // tried".
+        let (_dir, script) = write_fake_herdr_script(
+            r#"
+name="$3"
+echo "{\"error\":{\"code\":\"agent_name_taken\",\"message\":\"agent name $name is already used\",\"candidates\":[\"hr-2\",\"hr-3\",\"hr-4\"]}}"
+exit 1
+"#,
+        );
+
+        let err = agent_start(
+            script.to_str().unwrap(),
+            "hr",
+            Path::new("/tmp"),
+            &["zsh".to_string()],
+        )
+        .await
+        .expect_err("agent_start should give up once the retry budget is exhausted");
+
+        let message = err.to_string();
+        // hr-4 is never attempted: attempt 0 tries hr-2, attempt 1 tries hr-3, and the budget
+        // (2 retries) is exhausted before a third retry would try hr-4.
+        assert!(
+            !message.contains("hr-4) were already tried")
+                && !message.contains("hr-2, hr-3, hr-4) were already tried"),
+            "hr-4 was never attempted and must not be reported as already tried: {message}"
+        );
+        assert!(
+            message.contains("hr-4"),
+            "the untried candidate should still be surfaced, just not as \"already tried\": {message}"
+        );
+        assert!(
+            message.contains("close the other agent tab"),
+            "give-up message should include a remedy: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_start_retries_twice_before_succeeding_on_the_final_attempt() {
+        // Rejects the first two names and succeeds on the third — exercises whether `tried`/
+        // `attempt` actually accumulate correctly across multiple loop iterations, not just a
+        // single retry (the exact kind of wiring bug TF-590's own fixup commit addressed).
+        let (_dir, script) = write_fake_herdr_script(
+            r#"
+name="$3"
+if [ "$name" = "hr" ]; then
+  echo '{"error":{"code":"agent_name_taken","message":"agent name hr is already used","candidates":["hr-2"]}}'
+  exit 1
+elif [ "$name" = "hr-2" ]; then
+  echo '{"error":{"code":"agent_name_taken","message":"agent name hr-2 is already used","candidates":["hr-3"]}}'
+  exit 1
+elif [ "$name" = "hr-3" ]; then
+  echo '{"result":{"agent":{"pane_id":"p1","tab_id":"t1"}}}'
+  exit 0
+else
+  echo "{\"error\":{\"message\":\"unexpected name: $name\"}}"
+  exit 1
+fi
+"#,
+        );
+
+        let started = agent_start(
+            script.to_str().unwrap(),
+            "hr",
+            Path::new("/tmp"),
+            &["zsh".to_string()],
+        )
+        .await
+        .expect("agent_start should retry twice and succeed on the third attempt");
+
+        assert_eq!(started.pane_id.as_str(), "p1");
+        assert_eq!(started.tab_id.as_str(), "t1");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_start_succeeds_on_the_first_attempt_without_retrying() {
+        // Guards the `Ok(result) => return parse_agent_started(&result)` arm against a future
+        // refactor of the retry loop accidentally requiring at least one retry.
+        let (_dir, script) = write_fake_herdr_script(
+            r#"
+echo '{"result":{"agent":{"pane_id":"p1","tab_id":"t1"}}}'
+exit 0
+"#,
+        );
+
+        let started = agent_start(
+            script.to_str().unwrap(),
+            "hr",
+            Path::new("/tmp"),
+            &["zsh".to_string()],
+        )
+        .await
+        .expect("agent_start should succeed on the very first attempt");
+
+        assert_eq!(started.pane_id.as_str(), "p1");
+        assert_eq!(started.tab_id.as_str(), "t1");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_start_propagates_a_non_agent_name_taken_error_without_retrying() {
+        // Guards the `Err(err) => return Err(err)` arm, new code introduced by wrapping the
+        // single `herdr agent start` call in a loop: a genuine, non-collision failure (bad
+        // `--cwd`, herdr not running, ...) must return immediately, not enter the retry loop.
+        let (_dir, script) = write_fake_herdr_script(
+            r#"
+echo '{"error":{"message":"no such pane"}}'
+exit 1
+"#,
+        );
+
+        let err = agent_start(
+            script.to_str().unwrap(),
+            "hr",
+            Path::new("/tmp"),
+            &["zsh".to_string()],
+        )
+        .await
+        .expect_err("agent_start should propagate a non-collision error immediately");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("no such pane"),
+            "unexpected message: {message}"
+        );
+        assert!(
+            !message.contains("agent_name_taken"),
+            "a plain error must not be reported as a name collision: {message}"
         );
     }
 
