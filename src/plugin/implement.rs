@@ -186,7 +186,8 @@ pub fn prompt_landed(pane_text: &str, prompt: &str) -> bool {
 /// `command` plus the issue's identifier, instead of the bare `command` string being reused
 /// verbatim across every issue.
 ///
-/// Sanitized via [`sanitize_agent_name`] since `command` can itself contain spaces/flags (e.g.
+/// Sanitized (lowercased, non-alphanumeric runs collapsed to a single hyphen) since `command`
+/// can itself contain spaces/flags (e.g.
 /// `"headroom wrap claude --memory"`) and issue identifiers use uppercase (e.g. `"TF-579"`),
 /// neither of which herdr's agent names are known to accept.
 pub fn build_agent_name(command: &str, issue_identifier: &str) -> String {

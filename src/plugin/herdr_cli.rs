@@ -248,7 +248,7 @@ fn next_name_taken_retry(candidates: &[String], attempt: u32) -> Option<&str> {
 /// If herdr rejects `name` with `agent_name_taken` (TF-590 — e.g. because a previous issue's
 /// agent tab is still running under a name that collides with this one), retries
 /// automatically with one of herdr's suggested `candidates` instead of surfacing the raw
-/// collision to the caller — see [`next_name_taken_retry`].
+/// collision to the caller — see `next_name_taken_retry`.
 pub async fn agent_start(
     herdr_bin: &str,
     name: &str,
