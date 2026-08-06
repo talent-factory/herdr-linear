@@ -40,6 +40,16 @@ pub enum Error {
 
     #[error("Configuration error: {0}")]
     ConfigError(String),
+
+    /// A `herdr` CLI response that parsed as JSON, exited 0, and carried no top-level `error`
+    /// body, but was missing the `result` field its own schema declares required. Kept as a
+    /// distinct variant (rather than folded into [`Error::Internal`]) so callers like
+    /// [`crate::plugin::herdr_cli::agent_wait`]'s retry-on-this-specific-bug logic can match on
+    /// the variant itself instead of pattern-matching a substring of the formatted message —
+    /// the message text can change (rewording, localization) without silently breaking that
+    /// retry decision.
+    #[error("{0}")]
+    MissingResultField(String),
 }
 
 /// Helper function to create GraphQL error responses

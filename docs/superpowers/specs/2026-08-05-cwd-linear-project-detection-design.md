@@ -3,6 +3,16 @@
 **Linear issue**: [TF-577](https://linear.app/talent-factory/issue/TF-577) — CWD → Linear-Projekt erkennen
 **Blocks**: TF-578 ("Project Issues" view)
 
+> **Follow-up (TF-584 branch):** `detect_repo_name`'s "current working directory" below turned
+> out to mean the plugin *process's* `std::env::current_dir()` — which is always the plugin's
+> own install directory, since herdr resolves the manifest's relative `[[panes]]` command
+> against the plugin root, not the workspace the user has focused. In practice this meant the
+> "Project Issues" panel always showed this repo's (herdr-linear's) own issues, regardless of
+> which herdr space was active. Fixed by reading the herdr-injected `HERDR_PLUGIN_CONTEXT_JSON`
+> launch context (`plugin::host::resolve_cwd`, mirroring `herdr-file-viewer`'s host adapter)
+> instead of the bare process cwd — see `start_implementation`'s equivalent fix in
+> `2026-08-05-implement-on-enter-design.md`'s "Out of scope / open items".
+
 ## Problem
 
 Linear has no native git-repo↔project link. For the plugin to know which Linear project

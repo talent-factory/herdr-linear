@@ -1,10 +1,10 @@
 //! Rendering for the plugin TUI: a view-selection menu, a loading message, an error
 //! message with a retry hint, or a two-pane issue list + detail view.
 
-use crate::plugin::app::{App, Screen, ViewKind, ViewState, MENU_OPTIONS};
+use crate::plugin::app::{App, Screen, Status, ViewKind, ViewState, MENU_OPTIONS};
 use ratatui::{
     layout::{Constraint, Direction, Layout},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Text},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
@@ -13,7 +13,7 @@ use ratatui::{
 pub fn draw(frame: &mut Frame, app: &App) {
     match app.screen() {
         Screen::Menu { selected } => draw_menu(frame, *selected),
-        Screen::View(kind, view_state) => draw_view(frame, *kind, view_state),
+        Screen::View(kind, view_state) => draw_view(frame, *kind, view_state, app.status()),
     }
 }
 
@@ -63,7 +63,7 @@ impl tui_markdown::StyleSheet for MarkdownStyleSheet {
     }
 }
 
-fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState) {
+fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState, status: Option<&Status>) {
     match view_state {
         ViewState::Loading => {
             let paragraph = Paragraph::new("Loading issues...")
@@ -81,10 +81,34 @@ fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState) {
             frame.render_widget(paragraph, frame.area());
         }
         ViewState::Loaded { issues, selected } => {
+            let area = if let Some(status) = status {
+                let outer = Layout::default()
+                    .direction(Direction::Vertical)
+                    // 3 rows (not 1) so a long error message — these can nest a whole
+                    // underlying `herdr`/Linear error plus a manual-fallback prompt — wraps
+                    // instead of being silently truncated at terminal width.
+                    .constraints([Constraint::Min(3), Constraint::Length(3)])
+                    .split(frame.area());
+                let style = if status.is_error() {
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Green)
+                };
+                frame.render_widget(
+                    Paragraph::new(status.text())
+                        .style(style)
+                        .wrap(Wrap { trim: false }),
+                    outer[1],
+                );
+                outer[0]
+            } else {
+                frame.area()
+            };
+
             let chunks = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(frame.area());
+                .split(area);
 
             let items: Vec<ListItem> = issues
                 .iter()
@@ -303,6 +327,40 @@ mod tests {
 
     #[test]
     fn renders_issue_identifier_and_title_in_the_list() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+
+        let text = rendered_text(&app);
+        assert!(text.contains("ENG-1"));
+        assert!(text.contains("Title for ENG-1"));
+    }
+
+    #[test]
+    fn renders_the_status_banner_when_present() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        app.set_status(Status::Ok(
+            "ENG-1: tab opened, agent started, set to In Progress.".to_string(),
+        ));
+
+        let text = rendered_text(&app);
+        assert!(text.contains("ENG-1: tab opened, agent started, set to In Progress."));
+    }
+
+    #[test]
+    fn renders_an_error_status_banner() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        app.set_status(Status::Error(
+            "ENG-1: failed to start agent tab: boom".to_string(),
+        ));
+
+        let text = rendered_text(&app);
+        assert!(text.contains("ENG-1: failed to start agent tab: boom"));
+    }
+
+    #[test]
+    fn renders_without_a_status_banner_when_none_is_set() {
         let mut app = app_in_my_issues_view();
         app.set_issues(vec![sample_issue("ENG-1")]);
 

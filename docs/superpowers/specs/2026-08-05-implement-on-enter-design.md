@@ -75,7 +75,8 @@ Pure functions, unit-tested:
   never reports one, so no self-exclusion is needed), and returns the most frequent value, ties
   broken by first-seen order. Malformed JSON or an empty list → `None` (falls through to config).
 - `resolve_agent_command(derived: Option<&str>, config_override: Option<&str>) -> String` —
-  precedence: `derived` → `config_override` → `"hr"`.
+  precedence: `config_override` → `derived` → `"hr"`. (Originally `derived → config_override →
+  "hr"`; reversed post-launch — see "Out of scope / open items" below.)
 - `build_shell_argv(shell: &str, command: &str) -> Vec<String>` → `[shell, "-i", "-c", command]`.
   Always shell-wrapped, uniformly for both a bare derived binary (`claude`) and a config alias
   (`hr`, confirmed to be a zsh alias — `alias hr='headroom wrap claude --memory --code-graph'` —
@@ -168,3 +169,33 @@ call site.
 - No handling for a team with *zero* workflow states of any kind (`get_workflow_states` returning
   empty) beyond `pick_in_progress_state` returning `None`, which is folded into the same "state
   update failed" warning path as any other lookup miss.
+- `cwd = std::env::current_dir()` (data flow step 7) was only correct when the panel was opened
+  via the split action — herdr seeds a split pane's cwd from the pane it was split from, but a
+  fresh tab started in the plugin's own install directory instead.
+  **Resolved** (see the cwd-linear-project-detection follow-up): herdr already threads the
+  invoking pane's directory through as the `HERDR_PLUGIN_CONTEXT_JSON` env var it injects at
+  launch — this plugin just wasn't reading it. `plugin::host::resolve_cwd()` now parses that
+  context (`focused_pane_cwd` > `workspace_cwd` > `cwd`, mirroring `herdr-file-viewer`'s
+  `src/host.rs` adapter for the same problem) and both `repo::detect_repo_name` and
+  `start_implementation` use it instead of the bare process cwd. Split and tab placement now
+  behave identically; the README/`main.rs` caveats were updated accordingly.
+- `resolve_agent_command`'s original precedence (`derived` → `config_override` → `"hr"`) made
+  an explicit `agent_command` (or the `"hr"` default) practically unreachable: herdr's `agent
+  list` can only report the underlying binary a pane runs, never the alias/wrapper used to
+  launch it, so a pane started via `hr` (which execs `claude`) is indistinguishable from one
+  started bare — `derived` resolves to `"claude"` either way, and always won.
+  **Resolved**: flipped to `config_override` → `derived` → `"hr"` — an explicit config choice
+  is no longer overridable by inference the plugin can't actually distinguish from the thing
+  it's meant to override. `derived` still serves its original purpose (matching whichever
+  agent *family*, e.g. `codex`, you're already running elsewhere) when no override is set.
+- `herdr agent wait --status idle` (herdr v0.7.3) has a reproducible bug: its underlying
+  `events.subscribe` stream closes as soon as the target pane's *agent identity* is first
+  detected (`previous_agent=None → agent=Some(Claude)`), not when its *status* actually
+  reaches the requested value — confirmed via `herdr-server.log` on 4/4 observed
+  `agent.start` calls, each followed ~200ms later by `outcome="stream_closed"` well before
+  Claude could plausibly be idle. The CLI then exits 0 with valid JSON missing the `result`
+  field its own schema (`herdr api schema --json`) declares `required`.
+  **Resolved** (workaround, pending an upstream herdr fix): `herdr_cli::agent_wait` now
+  retries (bounded, budget-aware) specifically on this "missing `result` field" response. The
+  identity-transition event fires at most once per pane, so the retried call reliably
+  observes the real status change instead.

@@ -90,6 +90,31 @@ pub enum Screen {
     View(ViewKind, ViewState),
 }
 
+/// A transient status banner shown under an issue list — separate from `ViewState::Error` so
+/// it doesn't discard an already-loaded issue list. Set by the `Action::Implement`
+/// orchestration in `main.rs` as it progresses through the implement-on-Enter flow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Status {
+    /// A success/progress message, e.g. "tab opened, agent started, set to In Progress.".
+    Ok(String),
+    /// A failure message, rendered distinctly from `Ok` so it's clearly actionable.
+    Error(String),
+}
+
+impl Status {
+    /// The banner text, regardless of variant.
+    pub fn text(&self) -> &str {
+        match self {
+            Status::Ok(text) | Status::Error(text) => text,
+        }
+    }
+
+    /// True for `Status::Error`.
+    pub fn is_error(&self) -> bool {
+        matches!(self, Status::Error(_))
+    }
+}
+
 /// The main application state container.
 ///
 /// Manages transitions between the menu and views, and navigation within a loaded
@@ -97,6 +122,8 @@ pub enum Screen {
 pub struct App {
     /// The current screen.
     screen: Screen,
+    /// The current status banner, if any. See [`Status`].
+    status: Option<Status>,
 }
 
 impl App {
@@ -104,6 +131,7 @@ impl App {
     pub fn new() -> Self {
         Self {
             screen: Screen::Menu { selected: 0 },
+            status: None,
         }
     }
 
@@ -145,12 +173,14 @@ impl App {
             return None;
         }
         self.screen = Screen::View(option.kind, ViewState::Loading);
+        self.clear_status();
         Some(Action::EnterView)
     }
 
     /// Returns to the menu, selection reset to the first option.
     pub fn return_to_menu(&mut self) {
         self.screen = Screen::Menu { selected: 0 };
+        self.clear_status();
     }
 
     /// The kind of the currently entered view, or `None` if on the menu.
@@ -188,11 +218,13 @@ impl App {
         }
     }
 
-    /// Transitions the current view back to its loading state. No-op if not
+    /// Transitions the current view back to its loading state, clearing any stale status
+    /// banner (matching `return_to_menu`/`enter_selected_menu_option`). No-op if not
     /// currently in a view.
     pub fn retry(&mut self) {
         if let Some(kind) = self.current_view() {
             self.screen = Screen::View(kind, ViewState::Loading);
+            self.clear_status();
         }
     }
 
@@ -230,6 +262,21 @@ impl App {
             _ => None,
         }
     }
+
+    /// The current status banner, if any.
+    pub fn status(&self) -> Option<&Status> {
+        self.status.as_ref()
+    }
+
+    /// Sets the status banner, replacing any existing one.
+    pub fn set_status(&mut self, status: Status) {
+        self.status = Some(status);
+    }
+
+    /// Clears the status banner.
+    pub fn clear_status(&mut self) {
+        self.status = None;
+    }
 }
 
 impl Default for App {
@@ -239,6 +286,11 @@ impl Default for App {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+// `Issue` is the largest variant by far; boxing it would ripple into every call site that
+// constructs or matches `Action::Implement`, and the implement-on-Enter flow (`main.rs`'s
+// `start_implementation`) needs the full `Issue` — not just its id — to build the prompt and
+// resolve the in-progress workflow state, so a bare `Issue` is the right shape here.
+#[allow(clippy::large_enum_variant)]
 pub enum Action {
     Quit,
     OpenInBrowser(String),
@@ -246,6 +298,10 @@ pub enum Action {
     /// A menu option was entered; the caller should trigger a data fetch for the
     /// now-current view (see [`App::current_view`]).
     EnterView,
+    /// `<Enter>` was pressed on a selected issue: open a herdr tab, start the preferred
+    /// coding agent, set the issue to "In Progress", and inject the implement prompt once
+    /// ready. Orchestrated in `main.rs`'s `start_implementation`.
+    Implement(Issue),
 }
 
 /// Map a key press to an [`Action`], applying any state change (menu navigation,
@@ -289,6 +345,9 @@ pub fn handle_key(app: &mut App, key: crossterm::event::KeyCode) -> Option<Actio
         KeyCode::Char('o') => app
             .selected_issue()
             .map(|issue| Action::OpenInBrowser(issue.url.clone())),
+        KeyCode::Enter => app
+            .selected_issue()
+            .map(|issue| Action::Implement(issue.clone())),
         KeyCode::Char('r') => {
             if app.is_view_error() {
                 app.retry();
@@ -584,6 +643,83 @@ mod tests {
         app.set_issues(vec![]);
 
         assert_eq!(handle_key(&mut app, KeyCode::Char('o')), None);
+    }
+
+    #[test]
+    fn enter_key_returns_implement_action_with_the_selected_issue() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
+
+        let action = handle_key(&mut app, KeyCode::Enter);
+
+        assert_eq!(action, Some(Action::Implement(sample_issue("ENG-1"))));
+    }
+
+    #[test]
+    fn enter_key_in_a_view_on_an_empty_list_returns_no_action() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![]);
+
+        assert_eq!(handle_key(&mut app, KeyCode::Enter), None);
+    }
+
+    #[test]
+    fn app_starts_with_no_status() {
+        let app = App::new();
+        assert_eq!(app.status(), None);
+    }
+
+    #[test]
+    fn set_status_stores_the_message_and_error_flag() {
+        let mut app = App::new();
+
+        app.set_status(Status::Ok("started".to_string()));
+        assert_eq!(app.status(), Some(&Status::Ok("started".to_string())));
+
+        app.set_status(Status::Error("boom".to_string()));
+        assert_eq!(app.status(), Some(&Status::Error("boom".to_string())));
+    }
+
+    #[test]
+    fn clear_status_removes_it() {
+        let mut app = App::new();
+        app.set_status(Status::Ok("started".to_string()));
+
+        app.clear_status();
+
+        assert_eq!(app.status(), None);
+    }
+
+    #[test]
+    fn returning_to_the_menu_clears_status() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        app.set_status(Status::Ok("started".to_string()));
+
+        handle_key(&mut app, KeyCode::Esc);
+
+        assert_eq!(app.status(), None);
+    }
+
+    #[test]
+    fn entering_a_view_from_the_menu_clears_status() {
+        let mut app = App::new();
+        app.set_status(Status::Error("stale".to_string()));
+
+        app.enter_selected_menu_option();
+
+        assert_eq!(app.status(), None);
+    }
+
+    #[test]
+    fn retry_clears_a_stale_status_banner() {
+        let mut app = app_in_my_issues_view();
+        app.set_error("boom".to_string());
+        app.set_status(Status::Error("stale implement status".to_string()));
+
+        app.retry();
+
+        assert_eq!(app.status(), None);
     }
 
     #[test]
