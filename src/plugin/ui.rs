@@ -82,7 +82,11 @@ fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState, status: 
             );
             frame.render_widget(paragraph, frame.area());
         }
-        ViewState::Loaded { issues, selected } => {
+        ViewState::Loaded {
+            issues,
+            selected,
+            marked,
+        } => {
             let area = if let Some(status) = status {
                 let outer = Layout::default()
                     .direction(Direction::Vertical)
@@ -114,7 +118,13 @@ fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState, status: 
 
             let items: Vec<ListItem> = issues
                 .iter()
-                .map(|issue| ListItem::new(format!("{} {}", issue.identifier, issue.title)))
+                .enumerate()
+                .map(|(i, issue)| {
+                    // TF-590: a checkbox prefix makes multi-select marks (`<Space>`) visible
+                    // in the list, not just implicit in `App`'s internal state.
+                    let checkbox = if marked.contains(&i) { "[x]" } else { "[ ]" };
+                    ListItem::new(format!("{checkbox} {} {}", issue.identifier, issue.title))
+                })
                 .collect();
             let list = List::new(items)
                 .block(Block::default().borders(Borders::ALL).title(kind.label()))
@@ -335,6 +345,18 @@ mod tests {
         let text = rendered_text(&app);
         assert!(text.contains("ENG-1"));
         assert!(text.contains("Title for ENG-1"));
+    }
+
+    #[test]
+    fn renders_a_checkbox_prefix_reflecting_the_marked_state() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
+        app.move_selection_down();
+        app.toggle_mark(); // marks ENG-2 only
+
+        let text = rendered_text(&app);
+        assert!(text.contains("[ ] ENG-1"));
+        assert!(text.contains("[x] ENG-2"));
     }
 
     #[test]

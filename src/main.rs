@@ -267,34 +267,67 @@ async fn send_prompt_until_visible(
     Err(last_err.unwrap_or_else(|| "failed to send implement command".to_string()))
 }
 
-async fn start_implementation(
-    app: &mut plugin::app::App,
-    client: &herdr_linear::LinearClient,
-    issue: herdr_linear::Issue,
-) {
-    let herdr_bin = plugin::herdr_cli::herdr_bin();
+/// Outcome of running the "implement this issue" flow for a single issue ([`implement_one`]),
+/// independent of how many issues are being processed in this run (TF-590 added
+/// [`start_implementation_many`] alongside the pre-existing single-issue
+/// [`start_implementation`], and both share this type so they can't drift on what counts as
+/// success).
+///
+/// `Warn` is kept distinct from `Ok` rather than folded into it because a non-fatal warning
+/// (tab rename, workflow-state lookup/transition) still means the agent is up and the prompt
+/// landed — [`start_implementation_many`]'s "N/M started" count treats it as a start — but the
+/// single-issue path still surfaces it as an actionable (red) status, matching pre-TF-590
+/// behavior exactly.
+enum ImplementOutcome {
+    /// Everything succeeded cleanly. Carries the trailing half of the status message (e.g.
+    /// `"tab opened, agent started, set to In Progress."`).
+    Ok(String),
+    /// The agent started and the prompt landed, but a non-fatal step along the way failed.
+    /// Carries the trailing half of the status message (already includes the warnings).
+    Warn(String),
+    /// A fatal step failed; the agent never became usable for this issue. Carries the
+    /// trailing half of the status message.
+    Err(String),
+}
 
-    let agent_list_json = match plugin::herdr_cli::agent_list(&herdr_bin).await {
+/// Runs the full "implement this issue" flow for one issue: resolve the preferred coding
+/// agent, open a herdr tab running it under a name unique to this issue (TF-590, see
+/// [`plugin::implement::build_agent_name`]), set the issue to its team's "In Progress" state,
+/// wait for the agent to become ready, then inject the implement prompt. Never propagates —
+/// every failure becomes an [`ImplementOutcome::Err`] so both callers ([`start_implementation`]
+/// for the single-issue case, [`start_implementation_many`] for the marked-multiple case) can
+/// turn it into whatever status banner fits their situation, mirroring `ensure_loaded`'s
+/// "inline error instead of crashing" philosophy. Any non-fatal warnings collected along the
+/// way (tab rename, workflow-state lookup, the actual state transition) are preserved in
+/// *every* terminal outcome, not just the final success case — a failure late in the flow
+/// (e.g. `agent_wait` timing out) must not hide an earlier one (e.g. the issue never actually
+/// reaching "In Progress"). See docs/superpowers/specs/2026-08-05-implement-on-enter-design.md
+/// for the full data flow this extends.
+///
+/// The agent is spawned in [`plugin::host::resolve_cwd`]'s directory — the herdr-injected
+/// launch context's working directory, not the plugin process's own `std::env::current_dir()`
+/// (which is always the plugin's own install directory, split or tab placement alike; see
+/// `host`'s module doc). This resolves correctly regardless of whether the panel was opened via
+/// `open-split.sh` or `open-tab.sh`, as long as herdr reports a launch context — see
+/// README.md's "Use" section and the design doc's "Out of scope / open items" for the prior
+/// split-only caveat this replaces. `resolve_cwd` itself never fails outright (see its own
+/// doc), so this function separately guards against the one case that matters here: both its
+/// launch-context parse *and* its `current_dir()` fallback failing, which would otherwise pass
+/// an empty `--cwd` straight through to `agent_start`.
+async fn implement_one(
+    herdr_bin: &str,
+    client: &herdr_linear::LinearClient,
+    issue: &herdr_linear::Issue,
+) -> ImplementOutcome {
+    let agent_list_json = match plugin::herdr_cli::agent_list(herdr_bin).await {
         Ok(json) => json,
-        Err(err) => {
-            app.set_status(plugin::app::Status::Error(format!(
-                "{}: {err}",
-                issue.identifier
-            )));
-            return;
-        }
+        Err(err) => return ImplementOutcome::Err(err.to_string()),
     };
     let derived = plugin::implement::resolve_preferred_agent(&agent_list_json);
 
     let config_override = match plugin::config::load_agent_command_override() {
         Ok(value) => value,
-        Err(err) => {
-            app.set_status(plugin::app::Status::Error(format!(
-                "{}: {err}",
-                issue.identifier
-            )));
-            return;
-        }
+        Err(err) => return ImplementOutcome::Err(err.to_string()),
     };
 
     let command =
@@ -302,42 +335,37 @@ async fn start_implementation(
     let command = match plugin::implement::ValidatedAgentCommand::parse(command) {
         Ok(command) => command,
         Err(command) => {
-            app.set_status(plugin::app::Status::Error(format!(
-                "{}: agent command {command:?} contains unexpected characters — refusing to run it",
-                issue.identifier
-            )));
-            return;
+            return ImplementOutcome::Err(format!(
+                "agent command {command:?} contains unexpected characters — refusing to run it"
+            ));
         }
     };
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
     let argv = plugin::implement::build_shell_argv(&shell, &command);
     let cwd = plugin::host::resolve_cwd();
     if cwd.as_os_str().is_empty() {
-        app.set_status(plugin::app::Status::Error(format!(
-            "{}: couldn't determine your working directory (herdr's launch context is missing \
+        return ImplementOutcome::Err(
+            "couldn't determine your working directory (herdr's launch context is missing \
              and the plugin's own process directory is unreadable) — see README.md's \"Use\" \
-             section",
-            issue.identifier
-        )));
-        return;
+             section"
+                .to_string(),
+        );
     }
 
-    let started =
-        match plugin::herdr_cli::agent_start(&herdr_bin, command.as_str(), &cwd, &argv).await {
-            Ok(started) => started,
-            Err(err) => {
-                app.set_status(plugin::app::Status::Error(format!(
-                    "{}: failed to start agent tab: {err}",
-                    issue.identifier
-                )));
-                return;
-            }
-        };
+    // TF-590: a per-issue name, not the bare `command`, so starting a second issue while the
+    // first's agent tab is still running under the same `agent_command` doesn't collide on
+    // herdr's side with `agent_name_taken` (which `agent_start` itself also retries once —
+    // this is what makes that retry attempt something other than the exact same losing name).
+    let agent_name = plugin::implement::build_agent_name(command.as_str(), &issue.identifier);
+    let started = match plugin::herdr_cli::agent_start(herdr_bin, &agent_name, &cwd, &argv).await {
+        Ok(started) => started,
+        Err(err) => return ImplementOutcome::Err(format!("failed to start agent tab: {err}")),
+    };
 
     let mut warnings = Vec::new();
 
     if let Err(err) =
-        plugin::herdr_cli::tab_rename(&herdr_bin, &started.tab_id, &issue.identifier).await
+        plugin::herdr_cli::tab_rename(herdr_bin, &started.tab_id, &issue.identifier).await
     {
         warnings.push(format!("failed to rename tab: {err}"));
     }
@@ -360,36 +388,92 @@ async fn start_implementation(
     // From here on, every early return must still report `warnings` — a failure below doesn't
     // undo (or excuse hiding) a warning collected above it.
     if let Err(err) =
-        plugin::herdr_cli::agent_wait(&herdr_bin, &started.pane_id, "idle", 30_000).await
+        plugin::herdr_cli::agent_wait(herdr_bin, &started.pane_id, "idle", 30_000).await
     {
-        app.set_status(plugin::app::Status::Error(status_with_warnings(
-            format!(
-                "{}: agent didn't become ready ({err}) — run manually: {prompt}",
-                issue.identifier
-            ),
+        return ImplementOutcome::Err(status_with_warnings(
+            format!("agent didn't become ready ({err}) — run manually: {prompt}"),
             &warnings,
-        )));
-        return;
+        ));
     }
 
-    if let Err(err) = send_prompt_until_visible(&herdr_bin, &started.pane_id, &prompt).await {
-        app.set_status(plugin::app::Status::Error(status_with_warnings(
-            format!("{}: {err} — run manually: {prompt}", issue.identifier),
+    if let Err(err) = send_prompt_until_visible(herdr_bin, &started.pane_id, &prompt).await {
+        return ImplementOutcome::Err(status_with_warnings(
+            format!("{err} — run manually: {prompt}"),
             &warnings,
-        )));
-        return;
+        ));
     }
 
     if warnings.is_empty() {
-        app.set_status(plugin::app::Status::Ok(format!(
-            "{}: tab opened, agent started, set to In Progress.",
-            issue.identifier
-        )));
+        ImplementOutcome::Ok("tab opened, agent started, set to In Progress.".to_string())
+    } else {
+        ImplementOutcome::Warn(format!("started, but {}", warnings.join("; ")))
+    }
+}
+
+/// Single-issue `<Enter>` flow (unmarked selection — [`plugin::app::Action::Implement`]).
+/// Status wording is unchanged from before TF-590: `implement_one` does the work, this just
+/// prefixes its outcome with the issue identifier and picks `Ok`/`Error` the same way the
+/// inlined version used to.
+async fn start_implementation(
+    app: &mut plugin::app::App,
+    client: &herdr_linear::LinearClient,
+    issue: herdr_linear::Issue,
+) {
+    let herdr_bin = plugin::herdr_cli::herdr_bin();
+    match implement_one(&herdr_bin, client, &issue).await {
+        ImplementOutcome::Ok(message) => {
+            app.set_status(plugin::app::Status::Ok(format!(
+                "{}: {message}",
+                issue.identifier
+            )));
+        }
+        ImplementOutcome::Warn(message) | ImplementOutcome::Err(message) => {
+            app.set_status(plugin::app::Status::Error(format!(
+                "{}: {message}",
+                issue.identifier
+            )));
+        }
+    }
+}
+
+/// Multi-issue `<Enter>` flow (TF-590, one or more issues marked —
+/// [`plugin::app::Action::ImplementMany`]): runs [`implement_one`] for every issue
+/// sequentially — not concurrently, since each run drives the same interactive `herdr agent
+/// wait`/`agent send`/`agent read` cycle main.rs already serializes for a single issue, and
+/// herdr's own per-pane semantics aren't documented as safe to interleave — then summarizes
+/// the results in one status banner (`"N/M started"`, plus every issue that didn't start or
+/// finished with a warning, each on its own `"<identifier>: <message>"` line joined with the
+/// summary) instead of one banner per issue.
+async fn start_implementation_many(
+    app: &mut plugin::app::App,
+    client: &herdr_linear::LinearClient,
+    issues: Vec<herdr_linear::Issue>,
+) {
+    let herdr_bin = plugin::herdr_cli::herdr_bin();
+    let total = issues.len();
+    let mut started = 0usize;
+    let mut details = Vec::new();
+
+    for issue in &issues {
+        match implement_one(&herdr_bin, client, issue).await {
+            ImplementOutcome::Ok(_) => started += 1,
+            ImplementOutcome::Warn(message) => {
+                started += 1;
+                details.push(format!("{}: {message}", issue.identifier));
+            }
+            ImplementOutcome::Err(message) => {
+                details.push(format!("{}: {message}", issue.identifier));
+            }
+        }
+    }
+
+    let summary = format!("{started}/{total} started");
+    if details.is_empty() {
+        app.set_status(plugin::app::Status::Ok(summary));
     } else {
         app.set_status(plugin::app::Status::Error(format!(
-            "{}: started, but {}",
-            issue.identifier,
-            warnings.join("; ")
+            "{summary}, {}",
+            details.join("; ")
         )));
     }
 }
@@ -403,6 +487,28 @@ fn status_with_warnings(message: String, warnings: &[String]) -> String {
     } else {
         format!("{message} (also: {})", warnings.join("; "))
     }
+}
+
+/// Drains any input events that arrived while a blocking multi-step flow
+/// (`Action::Implement` / `Action::ImplementMany`) ran, so a buffered `<Enter>` doesn't replay
+/// as a fresh action once we're back to polling. Every step in that flow has its own bound —
+/// `agent_wait`'s own budget (up to 30s plus retry buffer), `get_workflow_states`/
+/// `update_issue`'s 30s HTTP timeout each, and the other `herdr` subprocess calls (agent_list,
+/// agent_start, tab_rename, agent_send) at `DEFAULT_CLI_TIMEOUT` (15s) each — but they're
+/// sequential (and, for `Action::ImplementMany`, repeated once per marked issue — TF-590), so
+/// the flow as a whole can run well past any single step's bound in the worst case. A buffered
+/// `q` is honored instead of silently discarded (returns `true`), since the user very plausibly
+/// pressed it because the panel looked hung.
+fn flush_buffered_quit() -> std::io::Result<bool> {
+    let mut quit_requested = false;
+    while crossterm::event::poll(std::time::Duration::from_millis(0))? {
+        if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+            if key.code == crossterm::event::KeyCode::Char('q') {
+                quit_requested = true;
+            }
+        }
+    }
+    Ok(quit_requested)
 }
 
 async fn event_loop(
@@ -474,27 +580,25 @@ async fn event_loop(
                                 ))),
                             }
 
-                            // Flush any input that arrived while the flow above was blocking.
-                            // Every step now has its own bound — agent_wait's own budget (up to
-                            // 30s plus retry buffer), get_workflow_states/update_issue's 30s HTTP
-                            // timeout each, and the other `herdr` subprocess calls (agent_list,
-                            // agent_start, tab_rename, agent_send) at `DEFAULT_CLI_TIMEOUT` (15s)
-                            // each — but they're sequential, so the flow as a whole can still run
-                            // well past "~31s" in the worst case. A buffered <Enter> must not
-                            // replay as a fresh action once we're back to polling, so it's
-                            // dropped; a buffered `q` is honored instead of silently discarded,
-                            // since the user very plausibly pressed it because the panel looked
-                            // hung.
-                            let mut quit_requested = false;
-                            while crossterm::event::poll(std::time::Duration::from_millis(0))? {
-                                if let crossterm::event::Event::Key(key) = crossterm::event::read()?
-                                {
-                                    if key.code == crossterm::event::KeyCode::Char('q') {
-                                        quit_requested = true;
-                                    }
-                                }
+                            if flush_buffered_quit()? {
+                                break;
                             }
-                            if quit_requested {
+                        }
+                        plugin::app::Action::ImplementMany(issues) => {
+                            app.set_status(plugin::app::Status::Ok(format!(
+                                "Starting implementation for {} issues…",
+                                issues.len()
+                            )));
+                            terminal.draw(|frame| plugin::ui::draw(frame, app))?;
+                            match client.as_ref() {
+                                Some(c) => start_implementation_many(app, c, issues).await,
+                                None => app.set_status(plugin::app::Status::Error(
+                                    "not connected to Linear yet — try again.".to_string(),
+                                )),
+                            }
+                            app.clear_marks();
+
+                            if flush_buffered_quit()? {
                                 break;
                             }
                         }
