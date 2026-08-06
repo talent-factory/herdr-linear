@@ -71,13 +71,15 @@ fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState, status: 
             frame.render_widget(paragraph, frame.area());
         }
         ViewState::Error { message } => {
-            let paragraph = Paragraph::new(format!("{message}\n\nPress r to retry."))
-                .wrap(Wrap { trim: true })
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("Linear - Error"),
-                );
+            let paragraph = Paragraph::new(format!(
+                "{message}\n\nPress c to edit config.toml · Press r to retry."
+            ))
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Linear - Error"),
+            );
             frame.render_widget(paragraph, frame.area());
         }
         ViewState::Loaded { issues, selected } => {
