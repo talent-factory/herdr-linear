@@ -267,6 +267,20 @@ was reversed: herdr's tab list can only report the underlying binary a pane runs
 one started bare. Under the old precedence, `agent_command = "hr"` could never actually take
 effect once any other Claude Code tab was open.)
 
+"Team Issues" shows a Linear team's open issues. Unlike a project, a team has no
+repo-derived name to match, so it needs an explicit default: set `team_id` in the same
+`config.toml`.
+
+```toml
+team_id = "linear-team-id"
+```
+
+You only need this if your workspace has more than one team — a single-team workspace
+resolves automatically. If `team_id` is unset and the workspace has more than one team,
+entering "Team Issues" shows an error naming every team (so you can see which id to use)
+and pointing at `config.toml`; press `c` on that error screen to open it, same as for the
+project-matching errors above.
+
 ### Use
 
 Bind keys to the plugin's actions in `~/.config/herdr/config.toml`:
@@ -286,21 +300,24 @@ description = "Open Linear panel (tab)"
 ```
 
 Reload the config, then press the bound key to open the plugin. The panel opens on a
-menu with three options: "My Issues" (available), "Project Issues" (coming soon),
-and "Team Issues" (coming soon). From the menu, use `↑`/`↓` to navigate options,
+menu with three options — "My Issues", "Project Issues", and "Team Issues" — all
+available. From the menu, use `↑`/`↓` to navigate options,
 `Enter` to open the highlighted view, and `q` or `Esc` to quit. Once inside a view,
-use `↑`/`↓` to navigate the issue list, `o` to open the selected issue in your browser,
-`<Space>` to mark/unmark the selected issue (shown with a `[x]`/`[ ]` checkbox prefix),
-`<Enter>` to implement it — with no issues marked, implements just the selected one;
-with one or more marked, implements every marked issue in list order, one after another
-(each opens a herdr tab, starts the preferred coding agent, sets the issue to "In
-Progress", and injects an implement prompt once the agent is ready; the status banner
-then summarizes how many started, e.g. "3/4 started", plus a per-issue message for any
-that failed or finished with a warning) — `r` to retry after an error, `c` to open
-`config.toml` from an error screen (see "Configure" above — creates the file if it
-doesn't exist yet), and `Esc` to return to the menu. Press `q` to quit the panel from
-anywhere (menu or view). Pressing the key again focuses the panel if it's open
-elsewhere, or closes it if it's already focused.
+use `↑`/`↓` to navigate the issue list, `/` to filter it by title or identifier (type to
+narrow, `↑`/`↓` still navigate the narrowed list live, `<Enter>` confirms and keeps the
+filter applied, `Esc` cancels and restores the full list), `o` to open the selected issue
+in your browser, `<Space>` to mark/unmark the selected issue (shown with a `[x]`/`[ ]`
+checkbox prefix — independent of the active filter, so a mark survives narrowing and
+clearing the filter), `<Enter>` to implement it — with no issues marked, implements just
+the selected one; with one or more marked, implements every marked issue in list order,
+one after another (each opens a herdr tab, starts the preferred coding agent, sets the
+issue to "In Progress", and injects an implement prompt once the agent is ready; the
+status banner then summarizes how many started, e.g. "3/4 started", plus a per-issue
+message for any that failed or finished with a warning) — `r` to retry after an error,
+`c` to open `config.toml` from an error screen (see "Configure" above — creates the file
+if it doesn't exist yet), and `Esc` to return to the menu (or, while filtering, to cancel
+the filter first). Press `q` to quit the panel from anywhere (menu or view). Pressing the
+key again focuses the panel if it's open elsewhere, or closes it if it's already focused.
 
 > [!NOTE]
 > Each issue's agent tab is started under a name unique to that issue (the resolved

@@ -17,7 +17,7 @@ pub enum ViewKind {
     MyIssues,
     /// All open issues in the current project.
     ProjectIssues,
-    /// All open issues in a team (not yet implemented — see TF-579).
+    /// All open issues in a team.
     TeamIssues,
 }
 
@@ -41,8 +41,7 @@ pub struct MenuOption {
     pub available: bool,
 }
 
-/// The menu options in display order. `TeamIssues` becomes available once TF-579
-/// implements its data fetching — until then the menu shows but disables it.
+/// The menu options in display order. All three are available as of TF-579.
 pub const MENU_OPTIONS: [MenuOption; 3] = [
     MenuOption {
         kind: ViewKind::MyIssues,
@@ -54,7 +53,7 @@ pub const MENU_OPTIONS: [MenuOption; 3] = [
     },
     MenuOption {
         kind: ViewKind::TeamIssues,
-        available: false,
+        available: true,
     },
 ];
 
@@ -70,18 +69,63 @@ pub enum ViewState {
     Loaded {
         /// The list of loaded issues.
         issues: Vec<Issue>,
-        /// The index of the currently selected issue (0-indexed).
+        /// The index of the currently selected issue within the *filtered* subset
+        /// (see [`matching_issue_indices`]) — not a raw index into `issues`. With no
+        /// active filter the two coincide, since every issue matches.
         selected: usize,
         /// Indices (into `issues`) marked for a multi-issue `<Enter>` (see
         /// [`App::toggle_mark`], `Action::ImplementMany`). Empty means the single-issue
-        /// `<Enter>` behavior applies to `selected` instead — see `handle_key`.
+        /// `<Enter>` behavior applies to `selected` instead — see `handle_key`. Independent
+        /// of the active filter: marking targets `issues` directly (via `toggle_mark`'s own
+        /// filtered-to-raw-index translation), so marks survive a filter change instead of
+        /// being invalidated by it.
         marked: HashSet<usize>,
+        /// Type-to-filter state for this view's list. See [`FilterState`].
+        filter: FilterState,
     },
     /// An error occurred.
     Error {
         /// The error message.
         message: String,
     },
+}
+
+/// Type-to-filter state for a loaded view's issue list (TF-580). `/` opens editing;
+/// `Enter` confirms (query stays applied, keystrokes stop being captured); `Esc` while
+/// editing cancels and clears the query, restoring the full list — distinct from `Esc`
+/// outside editing, which returns to the menu as before.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FilterState {
+    /// True while `/` has been pressed and not yet confirmed (`Enter`) or cancelled
+    /// (`Esc`) — character keys are captured into `query` instead of triggering their
+    /// usual view bindings (`q`, `o`, `r`, ...) while this is set.
+    pub editing: bool,
+    /// The current filter text. Empty matches every issue, so a view with no filter
+    /// ever applied (or one just cancelled) behaves exactly as before this feature.
+    pub query: String,
+}
+
+/// Returns the indices into `issues` of every issue whose title or identifier contains
+/// `query` as a case-insensitive substring, in original order. An empty `query` matches
+/// everything — the no-filter case degenerates to `0..issues.len()` rather than an
+/// empty result, so callers don't need a separate branch for "no filter active".
+///
+/// Pure and independent of `App`/`ViewState` so it's directly unit-testable, mirroring
+/// the `assignee_open_filter`/`project_open_filter` pattern in `data.rs`.
+pub fn matching_issue_indices(issues: &[Issue], query: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return (0..issues.len()).collect();
+    }
+    let query = query.to_lowercase();
+    issues
+        .iter()
+        .enumerate()
+        .filter(|(_, issue)| {
+            issue.title.to_lowercase().contains(&query)
+                || issue.identifier.to_lowercase().contains(&query)
+        })
+        .map(|(index, _)| index)
+        .collect()
 }
 
 /// What the UI should currently display: the view-selection menu, or an entered view.
@@ -203,7 +247,7 @@ impl App {
     }
 
     /// Sets the loaded issues on the current view and resets selection to the first
-    /// issue, with nothing marked. No-op if not currently in a view.
+    /// issue, with nothing marked and no filter applied. No-op if not currently in a view.
     pub fn set_issues(&mut self, issues: Vec<Issue>) {
         if let Some(kind) = self.current_view() {
             self.screen = Screen::View(
@@ -212,6 +256,7 @@ impl App {
                     issues,
                     selected: 0,
                     marked: HashSet::new(),
+                    filter: FilterState::default(),
                 },
             );
         }
@@ -235,24 +280,28 @@ impl App {
         }
     }
 
-    /// Moves the selection down one position if there are more issues below.
-    /// No-op outside a loaded view.
+    /// Moves the selection down one position within the filtered subset, if there are
+    /// more matching issues below. No-op outside a loaded view.
     pub fn move_selection_down(&mut self) {
         if let Screen::View(
             _,
             ViewState::Loaded {
-                issues, selected, ..
+                issues,
+                selected,
+                filter,
+                ..
             },
         ) = &mut self.screen
         {
-            if !issues.is_empty() && *selected + 1 < issues.len() {
+            let matched = matching_issue_indices(issues, &filter.query).len();
+            if matched > 0 && *selected + 1 < matched {
                 *selected += 1;
             }
         }
     }
 
-    /// Moves the selection up one position if there are issues above. No-op
-    /// outside a loaded view.
+    /// Moves the selection up one position within the filtered subset, if there are
+    /// matching issues above. No-op outside a loaded view.
     pub fn move_selection_up(&mut self) {
         if let Screen::View(_, ViewState::Loaded { selected, .. }) = &mut self.screen {
             if *selected > 0 {
@@ -261,22 +310,35 @@ impl App {
         }
     }
 
-    /// Returns a reference to the currently selected issue, if any.
+    /// Returns a reference to the currently selected issue — `selected` indexes the
+    /// filtered subset (see [`matching_issue_indices`]), not `issues` directly — or
+    /// `None` if nothing is selected (outside a loaded view, or the filter matches
+    /// nothing).
     pub fn selected_issue(&self) -> Option<&Issue> {
         match &self.screen {
             Screen::View(
                 _,
                 ViewState::Loaded {
-                    issues, selected, ..
+                    issues,
+                    selected,
+                    filter,
+                    ..
                 },
-            ) => issues.get(*selected),
+            ) => {
+                let matched = matching_issue_indices(issues, &filter.query);
+                matched.get(*selected).and_then(|&index| issues.get(index))
+            }
             _ => None,
         }
     }
 
     /// Toggles whether the currently selected issue is marked, for the multi-select
-    /// `<Enter>` flow (TF-590, see `Action::ImplementMany`). No-op outside a loaded view or
-    /// on an empty list.
+    /// `<Enter>` flow (TF-590, see `Action::ImplementMany`). `selected` indexes the filtered
+    /// subset the same way `selected_issue` does (see `matching_issue_indices`), so this
+    /// resolves it to `issues`'s raw index before marking — marking under an active filter
+    /// must mark the right issue in `issues`, not whatever raw index `selected` happens to
+    /// equal. No-op outside a loaded view, on an empty list, or when the filter matches
+    /// nothing.
     pub fn toggle_mark(&mut self) {
         if let Screen::View(
             _,
@@ -284,14 +346,16 @@ impl App {
                 issues,
                 selected,
                 marked,
+                filter,
             },
         ) = &mut self.screen
         {
-            if issues.is_empty() {
+            let matched = matching_issue_indices(issues, &filter.query);
+            let Some(&raw_index) = matched.get(*selected) else {
                 return;
-            }
-            if !marked.remove(selected) {
-                marked.insert(*selected);
+            };
+            if !marked.remove(&raw_index) {
+                marked.insert(raw_index);
             }
         }
     }
@@ -326,6 +390,87 @@ impl App {
     pub fn clear_marks(&mut self) {
         if let Screen::View(_, ViewState::Loaded { marked, .. }) = &mut self.screen {
             marked.clear();
+        }
+    }
+
+    /// True while the current view's filter is being edited (`/` pressed, not yet
+    /// confirmed or cancelled). False outside a loaded view.
+    fn is_filtering(&self) -> bool {
+        matches!(
+            &self.screen,
+            Screen::View(_, ViewState::Loaded { filter, .. }) if filter.editing
+        )
+    }
+
+    /// Opens filter editing (bound to `/`) — an existing query, if any, stays and can be
+    /// extended or erased rather than resetting, so pressing `/` again after `Enter`
+    /// resumes editing the same filter. No-op outside a loaded view.
+    pub fn start_filtering(&mut self) {
+        if let Screen::View(_, ViewState::Loaded { filter, .. }) = &mut self.screen {
+            filter.editing = true;
+        }
+    }
+
+    /// Appends `c` to the filter query and resets selection to the first match — a
+    /// narrower query invalidates whatever the old index pointed at. No-op unless
+    /// currently editing.
+    pub fn push_filter_char(&mut self, c: char) {
+        if let Screen::View(
+            _,
+            ViewState::Loaded {
+                filter, selected, ..
+            },
+        ) = &mut self.screen
+        {
+            if filter.editing {
+                filter.query.push(c);
+                *selected = 0;
+            }
+        }
+    }
+
+    /// Removes the last character of the filter query, if any, and resets selection.
+    /// No-op unless currently editing.
+    pub fn pop_filter_char(&mut self) {
+        if let Screen::View(
+            _,
+            ViewState::Loaded {
+                filter, selected, ..
+            },
+        ) = &mut self.screen
+        {
+            if filter.editing {
+                filter.query.pop();
+                *selected = 0;
+            }
+        }
+    }
+
+    /// Confirms the current filter (bound to `Enter` while editing): stops capturing
+    /// keystrokes but leaves the query — and therefore the narrowed list — applied.
+    /// No-op unless currently editing.
+    pub fn confirm_filter(&mut self) {
+        if let Screen::View(_, ViewState::Loaded { filter, .. }) = &mut self.screen {
+            filter.editing = false;
+        }
+    }
+
+    /// Cancels filtering (bound to `Esc` while editing): stops capturing keystrokes and
+    /// clears the query, restoring the full issue list. Resets selection since it was
+    /// indexing the now-discarded filtered subset. No-op unless currently editing.
+    pub fn cancel_filter(&mut self) {
+        if let Screen::View(
+            _,
+            ViewState::Loaded {
+                filter, selected, ..
+            },
+        ) = &mut self.screen
+        {
+            if filter.editing {
+                filter.editing = false;
+                filter.query.clear();
+                *selected = 0;
+            }
         }
     }
 
@@ -391,6 +536,12 @@ pub enum Action {
 /// `c` now triggers `Action::OpenConfig` (filesystem writes + spawning an external opener).
 /// The interrupt reflex is handled unconditionally, before any screen-specific dispatch, so
 /// it always quits rather than ever being reinterpreted as a screen's own binding.
+///
+/// `/` opens type-to-filter on a loaded view's issue list (TF-580); once editing, this
+/// function's own filtering branch takes over key dispatch entirely (see
+/// `App::is_filtering`) until `Enter` confirms or `Esc` cancels, so none of the
+/// ordinary view bindings below (`q`, `o`, `r`, `Enter`-to-implement, ...) fire on a
+/// character typed into the filter.
 pub fn handle_key(
     app: &mut App,
     key: crossterm::event::KeyCode,
@@ -420,8 +571,48 @@ pub fn handle_key(
         };
     }
 
+    // While the filter is being edited, character keys are captured into the query
+    // instead of dispatching their usual view bindings (`q` would otherwise quit
+    // instead of typing a "q"; `Enter` would otherwise trigger `Implement` instead of
+    // confirming the filter). This must come before the general view match below so it
+    // takes priority. Navigation (`Up`/`Down`) still works while editing, so the list
+    // narrows live as you type without losing the ability to move the highlight.
+    if app.is_filtering() {
+        return match key {
+            KeyCode::Enter => {
+                app.confirm_filter();
+                None
+            }
+            KeyCode::Esc => {
+                app.cancel_filter();
+                None
+            }
+            KeyCode::Backspace => {
+                app.pop_filter_char();
+                None
+            }
+            KeyCode::Down => {
+                app.move_selection_down();
+                None
+            }
+            KeyCode::Up => {
+                app.move_selection_up();
+                None
+            }
+            KeyCode::Char(c) => {
+                app.push_filter_char(c);
+                None
+            }
+            _ => None,
+        };
+    }
+
     match key {
         KeyCode::Char('q') => Some(Action::Quit),
+        KeyCode::Char('/') => {
+            app.start_filtering();
+            None
+        }
         KeyCode::Esc => {
             app.return_to_menu();
             None
@@ -598,15 +789,19 @@ mod tests {
     }
 
     #[test]
-    fn entering_an_unavailable_option_does_nothing() {
+    fn entering_the_team_issues_option_transitions_to_loading_and_returns_enter_view() {
         let mut app = App::new();
         app.move_menu_selection_down();
-        app.move_menu_selection_down(); // -> Team Issues, unavailable
+        app.move_menu_selection_down(); // -> Team Issues, available since TF-579
 
         let action = app.enter_selected_menu_option();
 
-        assert_eq!(action, None);
-        assert!(matches!(app.screen, Screen::Menu { selected: 2 }));
+        assert_eq!(action, Some(Action::EnterView));
+        assert!(matches!(
+            app.screen,
+            Screen::View(ViewKind::TeamIssues, ViewState::Loading)
+        ));
+        assert_eq!(app.current_view(), Some(ViewKind::TeamIssues));
     }
 
     #[test]
@@ -1004,15 +1199,18 @@ mod tests {
     }
 
     #[test]
-    fn enter_key_on_an_unavailable_menu_option_does_nothing() {
+    fn enter_key_on_the_team_issues_menu_selection_enters_team_issues() {
         let mut app = App::new();
         handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
-        handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE); // -> Team Issues, unavailable
+        handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE); // -> Team Issues, available since TF-579
 
         let action = handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
 
-        assert_eq!(action, None);
-        assert!(matches!(app.screen, Screen::Menu { selected: 2 }));
+        assert_eq!(action, Some(Action::EnterView));
+        assert!(matches!(
+            app.screen,
+            Screen::View(ViewKind::TeamIssues, ViewState::Loading)
+        ));
     }
 
     #[test]
@@ -1203,5 +1401,216 @@ mod tests {
             handle_key(&mut app, KeyCode::Char('c'), KeyModifiers::ALT),
             None
         );
+    }
+
+    // TF-580: type-to-filter. `matching_issue_indices` is tested directly as a pure
+    // function first (mirrors `assignee_open_filter`/`project_open_filter` in
+    // `data.rs`), then the `App`/`handle_key` integration around it.
+
+    #[test]
+    fn matching_issue_indices_returns_every_index_in_order_for_an_empty_query() {
+        let issues = vec![sample_issue("ENG-1"), sample_issue("ENG-2")];
+
+        assert_eq!(matching_issue_indices(&issues, ""), vec![0, 1]);
+    }
+
+    #[test]
+    fn matching_issue_indices_matches_by_title_case_insensitively() {
+        let mut issues = vec![sample_issue("ENG-1"), sample_issue("ENG-2")];
+        issues[0].title = "Fix login bug".to_string();
+        issues[1].title = "Add dark mode".to_string();
+
+        assert_eq!(matching_issue_indices(&issues, "LOGIN"), vec![0]);
+    }
+
+    #[test]
+    fn matching_issue_indices_matches_by_identifier() {
+        let issues = vec![sample_issue("ENG-1"), sample_issue("BUG-2")];
+
+        assert_eq!(matching_issue_indices(&issues, "bug"), vec![1]);
+    }
+
+    #[test]
+    fn matching_issue_indices_excludes_issues_matching_neither_field() {
+        let issues = vec![sample_issue("ENG-1"), sample_issue("ENG-2")];
+
+        assert_eq!(
+            matching_issue_indices(&issues, "nonexistent"),
+            Vec::<usize>::new()
+        );
+    }
+
+    #[test]
+    fn slash_key_starts_filtering() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+
+        let action = handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+
+        assert_eq!(action, None);
+        assert!(app.is_filtering());
+    }
+
+    #[test]
+    fn slash_key_outside_a_loaded_view_does_nothing() {
+        let mut app = app_in_my_issues_view(); // still Loading, not Loaded
+
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+
+        assert!(!app.is_filtering());
+    }
+
+    #[test]
+    fn typing_while_filtering_appends_to_the_query_instead_of_triggering_its_usual_binding() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+
+        // 'q' would normally quit — while filtering it must be captured as text instead.
+        let action = handle_key(&mut app, KeyCode::Char('q'), KeyModifiers::NONE);
+
+        assert_eq!(action, None);
+        assert!(app.is_filtering());
+    }
+
+    #[test]
+    fn filtering_narrows_the_list_and_resets_selection() {
+        let mut app = app_in_my_issues_view();
+        let mut issues = vec![sample_issue("ENG-1"), sample_issue("ENG-2")];
+        issues[0].title = "Fix login bug".to_string();
+        issues[1].title = "Add dark mode".to_string();
+        app.set_issues(issues);
+        app.move_selection_down(); // select ENG-2 before narrowing
+
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        for c in "login".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+
+        assert_eq!(app.selected_issue().unwrap().identifier, "ENG-1");
+    }
+
+    #[test]
+    fn backspace_while_filtering_removes_the_last_character() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('x'), KeyModifiers::NONE); // matches nothing
+
+        handle_key(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+
+        // Query is empty again — everything matches, same as no filter at all.
+        assert_eq!(app.selected_issue().unwrap().identifier, "ENG-1");
+    }
+
+    #[test]
+    fn enter_confirms_the_filter_and_leaves_the_narrowed_list_applied() {
+        let mut app = app_in_my_issues_view();
+        let mut issues = vec![sample_issue("ENG-1"), sample_issue("ENG-2")];
+        issues[0].title = "Fix login bug".to_string();
+        app.set_issues(issues);
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        for c in "login".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+
+        let action = handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        // Confirming must not trigger `Implement` — Enter's usual view-level meaning —
+        // while still leaving the filter (and therefore the narrowed selection) applied.
+        assert_eq!(action, None);
+        assert!(!app.is_filtering());
+        assert_eq!(app.selected_issue().unwrap().identifier, "ENG-1");
+    }
+
+    #[test]
+    fn navigation_after_confirming_a_filter_still_moves_within_the_narrowed_subset() {
+        let mut app = app_in_my_issues_view();
+        let mut issues = vec![
+            sample_issue("ENG-1"),
+            sample_issue("ENG-2"),
+            sample_issue("ENG-3"),
+        ];
+        issues[0].title = "match one".to_string();
+        issues[1].title = "no hit".to_string();
+        issues[2].title = "match two".to_string();
+        app.set_issues(issues);
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        for c in "match".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+
+        // ENG-2 ("no hit") is skipped entirely — Down moves to the next *matching* issue.
+        assert_eq!(app.selected_issue().unwrap().identifier, "ENG-3");
+    }
+
+    #[test]
+    fn esc_while_filtering_cancels_and_restores_the_full_list() {
+        let mut app = app_in_my_issues_view();
+        let mut issues = vec![sample_issue("ENG-1"), sample_issue("ENG-2")];
+        issues[0].title = "Fix login bug".to_string();
+        app.set_issues(issues);
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        for c in "login".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+
+        let action = handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+        assert_eq!(action, None);
+        assert!(!app.is_filtering());
+        // Back to the full, unfiltered list — Esc-to-cancel took priority over Esc's
+        // usual "return to the menu" binding.
+        assert_eq!(app.selected_issue().unwrap().identifier, "ENG-1");
+        app.move_selection_down();
+        assert_eq!(app.selected_issue().unwrap().identifier, "ENG-2");
+        assert_eq!(app.current_view(), Some(ViewKind::MyIssues));
+    }
+
+    #[test]
+    fn esc_after_confirming_a_filter_returns_to_the_menu_as_usual() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('1'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE); // confirm, stop editing
+
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+        // No longer editing, so Esc falls through to its ordinary view-level binding.
+        assert!(matches!(app.screen, Screen::Menu { selected: 0 }));
+    }
+
+    #[test]
+    fn selected_issue_is_none_when_the_filter_matches_nothing() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        for c in "nonexistent".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+
+        assert_eq!(app.selected_issue(), None);
+    }
+
+    #[test]
+    fn reentering_a_view_clears_any_previous_filter() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('x'), KeyModifiers::NONE); // matches nothing
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE); // cancel filter
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE); // back to menu
+
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE); // re-enter My Issues
+        app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
+
+        assert!(!app.is_filtering());
+        assert_eq!(app.selected_issue().unwrap().identifier, "ENG-1");
     }
 }

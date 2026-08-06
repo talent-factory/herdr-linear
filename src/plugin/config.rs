@@ -1,7 +1,8 @@
-//! Resolves the Linear API key, the repo-scoped Linear project override, and the
-//! `agent_command` override for the plugin: the plugin's own config file first, falling
-//! back to environment variables (API key only — there's no environment-variable form of
-//! the project or `agent_command` override).
+//! Resolves the Linear API key, the repo-scoped Linear project override, the
+//! `agent_command` override, and the `team_id` default (TF-579) for the plugin: the
+//! plugin's own config file first, falling back to environment variables (API key only —
+//! there's no environment-variable form of the project, `agent_command`, or `team_id`
+//! override).
 
 use crate::{Error, Result};
 use std::collections::BTreeMap;
@@ -27,6 +28,12 @@ struct ConfigFile {
     #[serde(default)]
     project_overrides: BTreeMap<String, String>,
     agent_command: Option<String>,
+    /// Default team id for the Team Issues view (TF-579). Unlike `project_overrides`,
+    /// this isn't repo-scoped: Linear teams aren't tied to a single repo the way
+    /// projects are, so there's no repo-derived signal to key a table by — see
+    /// [`crate::plugin::data::resolve_team_id`] for when this is used (only when the
+    /// workspace has more than one team; a single-team workspace never needs it).
+    team_id: Option<String>,
 }
 
 /// Reads and parses `config_dir/config.toml`, if `config_dir` is given and the file
@@ -158,6 +165,20 @@ pub fn resolve_agent_command_override(config_dir: Option<&Path>) -> Result<Optio
     Ok(agent_command)
 }
 
+/// Resolve a `team_id` default (TF-579): `config_dir/config.toml`'s `team_id` field, if
+/// set and non-empty. `Ok(None)` means "no default configured" (callers fall back to
+/// resolving the team from the workspace's team list — see
+/// `crate::plugin::data::resolve_team_id`), which only errors if that list isn't
+/// exactly one team. Pure function — callers own reading the real environment (see
+/// [`load_team_id_override`]).
+pub fn resolve_team_id_override(config_dir: Option<&Path>) -> Result<Option<String>> {
+    let team_id = read_config_file(config_dir)?
+        .and_then(|file| file.team_id)
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty());
+    Ok(team_id)
+}
+
 /// Resolve the Linear API key from the real environment: `$HERDR_PLUGIN_CONFIG_DIR/config.toml`
 /// then `$LINEAR_API_KEY`. Thin wrapper around [`resolve_api_key`] used by the binary.
 pub fn load() -> Result<String> {
@@ -183,6 +204,15 @@ pub fn load_agent_command_override() -> Result<Option<String>> {
     resolve_agent_command_override(config_dir.as_deref())
 }
 
+/// Resolve the `team_id` default (TF-579) from the real environment:
+/// `$HERDR_PLUGIN_CONFIG_DIR/config.toml`. Thin wrapper around
+/// [`resolve_team_id_override`]; called from
+/// `crate::plugin::data::resolve_team_id`.
+pub fn load_team_id_override() -> Result<Option<String>> {
+    let config_dir = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR").map(std::path::PathBuf::from);
+    resolve_team_id_override(config_dir.as_deref())
+}
+
 /// [`config_path_hint`] resolved against the real environment's `HERDR_PLUGIN_CONFIG_DIR`.
 /// Thin wrapper so callers outside this module (e.g.
 /// [`crate::plugin::data::fetch_current_project_issues`]'s error-message building, and the
@@ -197,7 +227,7 @@ pub fn current_config_path_hint() -> String {
 mod tests {
     use super::{
         config_path_hint, resolve_agent_command_override, resolve_api_key,
-        resolve_project_id_override,
+        resolve_project_id_override, resolve_team_id_override,
     };
     use std::fs;
 
@@ -551,6 +581,78 @@ mod tests {
         fs::write(dir.path().join("config.toml"), "this is [invalid toml\n").unwrap();
 
         let err = resolve_agent_command_override(Some(dir.path())).unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("not valid TOML"));
+        assert!(message.contains(dir.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn reads_team_id_from_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.toml"), "team_id = \"team-123\"\n").unwrap();
+
+        let team_id = resolve_team_id_override(Some(dir.path())).unwrap();
+
+        assert_eq!(team_id, Some("team-123".to_string()));
+    }
+
+    #[test]
+    fn team_id_is_trimmed() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.toml"),
+            "team_id = \"  team-123  \"\n",
+        )
+        .unwrap();
+
+        let team_id = resolve_team_id_override(Some(dir.path())).unwrap();
+
+        assert_eq!(team_id, Some("team-123".to_string()));
+    }
+
+    #[test]
+    fn returns_none_when_config_file_missing_for_team_id() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let team_id = resolve_team_id_override(Some(dir.path())).unwrap();
+
+        assert_eq!(team_id, None);
+    }
+
+    #[test]
+    fn returns_none_when_team_id_is_empty_or_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.toml"), "team_id = \"   \"\n").unwrap();
+
+        let team_id = resolve_team_id_override(Some(dir.path())).unwrap();
+
+        assert_eq!(team_id, None);
+    }
+
+    #[test]
+    fn returns_none_when_config_file_has_no_team_id() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.toml"), "api_key = \"lin_api_x\"\n").unwrap();
+
+        let team_id = resolve_team_id_override(Some(dir.path())).unwrap();
+
+        assert_eq!(team_id, None);
+    }
+
+    #[test]
+    fn returns_none_when_config_dir_is_unknown_for_team_id() {
+        let team_id = resolve_team_id_override(None).unwrap();
+
+        assert_eq!(team_id, None);
+    }
+
+    #[test]
+    fn errors_immediately_on_malformed_toml_for_team_id() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.toml"), "this is [invalid toml\n").unwrap();
+
+        let err = resolve_team_id_override(Some(dir.path())).unwrap_err();
 
         let message = err.to_string();
         assert!(message.contains("not valid TOML"));

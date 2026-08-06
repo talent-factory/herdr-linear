@@ -112,13 +112,11 @@ async fn load_issues(app: &mut plugin::app::App, client: &herdr_linear::LinearCl
                 Err(err) => app.set_error(err.to_string()),
             }
         }
-        Some(kind) => {
-            // The menu only lets an `available` `MENU_OPTIONS` entry be entered, so
-            // this arm should be unreachable today — but it's one flipped `bool`
-            // away from becoming reachable the moment TF-579 lands without this
-            // match also being updated. Degrade to the same error screen a fetch
-            // failure would produce rather than panicking the whole TUI.
-            app.set_error(format!("{} isn't available yet.", kind.label()));
+        Some(plugin::app::ViewKind::TeamIssues) => {
+            match plugin::data::fetch_current_team_issues(client).await {
+                Ok(issues) => app.set_issues(issues),
+                Err(err) => app.set_error(err.to_string()),
+            }
         }
         None => {}
     }
@@ -177,6 +175,7 @@ const CONFIG_TEMPLATE: &str = r#"# herdr-linear plugin config. See README.md for
 
 # api_key = "lin_api_..."
 # agent_command = "hr"
+# team_id = "linear-team-id"
 
 # [project_overrides]
 # "repo-name" = "linear-project-id"
