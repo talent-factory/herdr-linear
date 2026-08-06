@@ -179,6 +179,42 @@ pub fn prompt_landed(pane_text: &str, prompt: &str) -> bool {
     strip_whitespace(pane_text).contains(&strip_whitespace(prompt))
 }
 
+/// Build the per-issue name passed to `herdr agent start` (see
+/// [`crate::plugin::herdr_cli::agent_start`]) so starting a second issue's agent tab while the
+/// first is still running under the same `agent_command` doesn't collide with herdr's
+/// `agent_name_taken` error (TF-590): every issue gets its own name derived from the resolved
+/// `command` plus the issue's identifier, instead of the bare `command` string being reused
+/// verbatim across every issue.
+///
+/// Sanitized via [`sanitize_agent_name`] since `command` can itself contain spaces/flags (e.g.
+/// `"headroom wrap claude --memory"`) and issue identifiers use uppercase (e.g. `"TF-579"`),
+/// neither of which herdr's agent names are known to accept.
+pub fn build_agent_name(command: &str, issue_identifier: &str) -> String {
+    sanitize_agent_name(&format!("{command}-{issue_identifier}"))
+}
+
+/// Lowercases `raw` and collapses every run of one-or-more characters outside `[a-z0-9]` into
+/// a single hyphen, trimming leading/trailing hyphens — the character set herdr's own
+/// generated retry `candidates` (e.g. `"hr-2"`) follow, assumed here to be the same set herdr
+/// accepts for `agent start <name>` itself. Falls back to `"agent"` if nothing alphanumeric
+/// survives, so this never returns an empty string.
+fn sanitize_agent_name(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "agent".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Pick the workflow state to move an issue to when starting implementation: a
 /// case-insensitive name match on `"In Progress"` first, else the first `type == "started"`
 /// state, else `None`.
@@ -335,6 +371,34 @@ mod tests {
         let pane_text = "❯ Implement Linear Issue TF-579 using a new git wor\n  ktree\n";
 
         assert!(prompt_landed(pane_text, &prompt));
+    }
+
+    #[test]
+    fn build_agent_name_combines_command_and_issue_identifier() {
+        assert_eq!(build_agent_name("hr", "TF-579"), "hr-tf-579");
+    }
+
+    #[test]
+    fn build_agent_name_is_unique_per_issue() {
+        // The whole point of TF-590: two issues started under the same `agent_command` must
+        // not collide on the name passed to `herdr agent start`.
+        let a = build_agent_name("hr", "TF-579");
+        let b = build_agent_name("hr", "TF-588");
+
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn build_agent_name_sanitizes_spaces_and_flags_in_the_command() {
+        assert_eq!(
+            build_agent_name("headroom wrap claude --memory", "TF-579"),
+            "headroom-wrap-claude-memory-tf-579"
+        );
+    }
+
+    #[test]
+    fn build_agent_name_falls_back_when_nothing_alphanumeric_survives() {
+        assert_eq!(build_agent_name("!!!", "###"), "agent");
     }
 
     #[test]
