@@ -294,6 +294,37 @@ fn parse_agent_started(result: &Value) -> Result<AgentStarted> {
     })
 }
 
+/// Extract the created [`TabId`] from a `herdr tab create` call's already-unwrapped `result`
+/// value. Split out from [`tab_create`] for the same testability reason as
+/// [`parse_agent_started`].
+fn parse_tab_created(result: &Value) -> Result<TabId> {
+    result
+        .get("tab")
+        .and_then(|t| t.get("tab_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| TabId(s.to_string()))
+        .ok_or_else(|| Error::Internal("tab.create response missing tab.tab_id".to_string()))
+}
+
+/// `herdr tab create --cwd <cwd> --label <label> --focus` — creates a fresh, focused tab that is
+/// already labeled `label`, and returns its [`TabId`]. Labeling at creation time (rather than via
+/// a follow-up `tab rename`) means the label is correct from the very first frame, with no window
+/// in which the tab could be confused with — or have its label stolen by — a different,
+/// already-running tab. See
+/// docs/superpowers/specs/2026-08-06-guaranteed-tab-per-issue-design.md for why this replaced a
+/// `tab_rename`-after-`agent_start` sequence.
+pub async fn tab_create(herdr_bin: &str, cwd: &Path, label: &str) -> Result<TabId> {
+    let cwd_str = cwd.to_string_lossy().to_string();
+    let result = run(
+        herdr_bin,
+        &[
+            "tab", "create", "--cwd", &cwd_str, "--label", label, "--focus",
+        ],
+    )
+    .await?;
+    parse_tab_created(&result)
+}
+
 /// Max retries [`agent_start`] makes after its initial call when herdr reports
 /// `agent_name_taken` (TF-590, see [`Error::AgentNameTaken`]) before giving up and reporting
 /// the collision to the caller. Bounds how many round-trips to herdr the retry loop makes,
@@ -1181,6 +1212,34 @@ exit 1
         let result = serde_json::json!({"id": "cli:agent:start"});
 
         assert!(parse_agent_started(&result).is_err());
+    }
+
+    #[test]
+    fn parse_tab_created_extracts_the_tab_id() {
+        let result = serde_json::json!({
+            "tab": {"tab_id": "wY:t2D", "label": "TF-579"},
+            "root_pane": {"pane_id": "wY:p31"}
+        });
+
+        let tab_id = parse_tab_created(&result).unwrap();
+
+        assert_eq!(tab_id.as_str(), "wY:t2D");
+    }
+
+    #[test]
+    fn parse_tab_created_errors_when_tab_id_is_missing() {
+        let result = serde_json::json!({"tab": {"label": "TF-579"}});
+
+        let err = parse_tab_created(&result).unwrap_err().to_string();
+
+        assert!(err.contains("tab.tab_id"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn parse_tab_created_errors_when_the_tab_object_is_missing_entirely() {
+        let result = serde_json::json!({"root_pane": {"pane_id": "wY:p31"}});
+
+        assert!(parse_tab_created(&result).is_err());
     }
 
     #[test]
