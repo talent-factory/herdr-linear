@@ -197,7 +197,8 @@ pub fn load_project_id_override(repo_name: &str) -> Result<Option<String>> {
 
 /// Resolve the `agent_command` override from the real environment:
 /// `$HERDR_PLUGIN_CONFIG_DIR/config.toml`. Thin wrapper around
-/// [`resolve_agent_command_override`]; called from `main.rs`'s `start_implementation`.
+/// [`resolve_agent_command_override`]; called from `main.rs`'s `implement_one` (shared by both
+/// the single- and multi-issue "implement this issue" callers).
 pub fn load_agent_command_override() -> Result<Option<String>> {
     let config_dir = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR").map(std::path::PathBuf::from);
     resolve_agent_command_override(config_dir.as_deref())

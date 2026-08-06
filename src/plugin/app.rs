@@ -7,6 +7,7 @@
 //! loaded issues, error) and navigation within its issue list.
 
 use crate::Issue;
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 /// The views selectable from the menu.
@@ -72,6 +73,13 @@ pub enum ViewState {
         /// (see [`matching_issue_indices`]) — not a raw index into `issues`. With no
         /// active filter the two coincide, since every issue matches.
         selected: usize,
+        /// Indices (into `issues`) marked for a multi-issue `<Enter>` (see
+        /// [`App::toggle_mark`], `Action::ImplementMany`). Empty means the single-issue
+        /// `<Enter>` behavior applies to `selected` instead — see `handle_key`. Independent
+        /// of the active filter: marking targets `issues` directly (via `toggle_mark`'s own
+        /// filtered-to-raw-index translation), so marks survive a filter change instead of
+        /// being invalidated by it.
+        marked: HashSet<usize>,
         /// Type-to-filter state for this view's list. See [`FilterState`].
         filter: FilterState,
     },
@@ -239,7 +247,7 @@ impl App {
     }
 
     /// Sets the loaded issues on the current view and resets selection to the first
-    /// issue, with no filter applied. No-op if not currently in a view.
+    /// issue, with nothing marked and no filter applied. No-op if not currently in a view.
     pub fn set_issues(&mut self, issues: Vec<Issue>) {
         if let Some(kind) = self.current_view() {
             self.screen = Screen::View(
@@ -247,6 +255,7 @@ impl App {
                 ViewState::Loaded {
                     issues,
                     selected: 0,
+                    marked: HashSet::new(),
                     filter: FilterState::default(),
                 },
             );
@@ -280,6 +289,7 @@ impl App {
                 issues,
                 selected,
                 filter,
+                ..
             },
         ) = &mut self.screen
         {
@@ -312,12 +322,74 @@ impl App {
                     issues,
                     selected,
                     filter,
+                    ..
                 },
             ) => {
                 let matched = matching_issue_indices(issues, &filter.query);
                 matched.get(*selected).and_then(|&index| issues.get(index))
             }
             _ => None,
+        }
+    }
+
+    /// Toggles whether the currently selected issue is marked, for the multi-select
+    /// `<Enter>` flow (TF-590, see `Action::ImplementMany`). `selected` indexes the filtered
+    /// subset the same way `selected_issue` does (see `matching_issue_indices`), so this
+    /// resolves it to `issues`'s raw index before marking — marking under an active filter
+    /// must mark the right issue in `issues`, not whatever raw index `selected` happens to
+    /// equal. No-op outside a loaded view, on an empty list, or when the filter matches
+    /// nothing.
+    pub fn toggle_mark(&mut self) {
+        if let Screen::View(
+            _,
+            ViewState::Loaded {
+                issues,
+                selected,
+                marked,
+                filter,
+            },
+        ) = &mut self.screen
+        {
+            let matched = matching_issue_indices(issues, &filter.query);
+            let Some(&raw_index) = matched.get(*selected) else {
+                return;
+            };
+            if !marked.remove(&raw_index) {
+                marked.insert(raw_index);
+            }
+        }
+    }
+
+    /// True if the issue at `index` is currently marked. False outside a loaded view.
+    pub fn is_marked(&self, index: usize) -> bool {
+        match &self.screen {
+            Screen::View(_, ViewState::Loaded { marked, .. }) => marked.contains(&index),
+            _ => false,
+        }
+    }
+
+    /// The currently marked issues, in list order (not mark order) — empty outside a loaded
+    /// view or when nothing is marked.
+    pub fn marked_issues(&self) -> Vec<Issue> {
+        match &self.screen {
+            Screen::View(_, ViewState::Loaded { issues, marked, .. }) => {
+                let mut indices: Vec<&usize> = marked.iter().collect();
+                indices.sort();
+                indices
+                    .into_iter()
+                    .filter_map(|&i| issues.get(i).cloned())
+                    .collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Clears all marked issues without otherwise changing the view. Used after dispatching
+    /// `Action::ImplementMany` so a completed multi-select run doesn't leave stale checkboxes
+    /// behind. No-op outside a loaded view.
+    pub fn clear_marks(&mut self) {
+        if let Screen::View(_, ViewState::Loaded { marked, .. }) = &mut self.screen {
+            marked.clear();
         }
     }
 
@@ -437,10 +509,15 @@ pub enum Action {
     /// A menu option was entered; the caller should trigger a data fetch for the
     /// now-current view (see [`App::current_view`]).
     EnterView,
-    /// `<Enter>` was pressed on a selected issue: open a herdr tab, start the preferred
-    /// coding agent, set the issue to "In Progress", and inject the implement prompt once
-    /// ready. Orchestrated in `main.rs`'s `start_implementation`.
+    /// `<Enter>` was pressed on a selected issue with nothing marked: open a herdr tab,
+    /// start the preferred coding agent, set the issue to "In Progress", and inject the
+    /// implement prompt once ready. Orchestrated in `main.rs`'s `start_implementation`.
     Implement(Issue),
+    /// `<Enter>` was pressed with one or more issues marked (TF-590, see
+    /// [`App::toggle_mark`]): run the same flow as `Implement` for each marked issue,
+    /// sequentially, and summarize the results in one status banner. Orchestrated in
+    /// `main.rs`'s `start_implementation_many`.
+    ImplementMany(Vec<Issue>),
     /// `c` was pressed on the error screen: open `config.toml` (creating the directory and
     /// a starter file first if either is missing) in the user's editor. Handled in
     /// `main.rs`'s `event_loop`, mirroring the existing `OpenInBrowser` → `open::that`
@@ -551,9 +628,19 @@ pub fn handle_key(
         KeyCode::Char('o') => app
             .selected_issue()
             .map(|issue| Action::OpenInBrowser(issue.url.clone())),
-        KeyCode::Enter => app
-            .selected_issue()
-            .map(|issue| Action::Implement(issue.clone())),
+        KeyCode::Char(' ') => {
+            app.toggle_mark();
+            None
+        }
+        KeyCode::Enter => {
+            let marked = app.marked_issues();
+            if marked.is_empty() {
+                app.selected_issue()
+                    .map(|issue| Action::Implement(issue.clone()))
+            } else {
+                Some(Action::ImplementMany(marked))
+            }
+        }
         KeyCode::Char('r') => {
             if app.is_view_error() {
                 app.retry();
@@ -885,6 +972,127 @@ mod tests {
         let action = handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
 
         assert_eq!(action, Some(Action::Implement(sample_issue("ENG-1"))));
+    }
+
+    #[test]
+    fn space_key_toggles_the_mark_on_the_selected_issue_and_returns_no_action() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+
+        let action = handle_key(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+
+        assert_eq!(action, None);
+        assert!(app.is_marked(0));
+
+        let action = handle_key(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+
+        assert_eq!(action, None);
+        assert!(!app.is_marked(0));
+    }
+
+    #[test]
+    fn space_key_on_an_empty_list_does_not_panic() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![]);
+
+        let action = handle_key(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+
+        assert_eq!(action, None);
+        assert!(!app.is_marked(0));
+    }
+
+    #[test]
+    fn marked_issues_returns_marks_in_list_order_not_mark_order() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![
+            sample_issue("ENG-1"),
+            sample_issue("ENG-2"),
+            sample_issue("ENG-3"),
+        ]);
+
+        // Mark ENG-3 first, then ENG-1 — the result must still come back list-ordered.
+        app.move_selection_down();
+        app.move_selection_down();
+        app.toggle_mark();
+        app.move_selection_up();
+        app.move_selection_up();
+        app.toggle_mark();
+
+        let identifiers: Vec<String> = app
+            .marked_issues()
+            .iter()
+            .map(|issue| issue.identifier.clone())
+            .collect();
+        assert_eq!(identifiers, vec!["ENG-1".to_string(), "ENG-3".to_string()]);
+    }
+
+    #[test]
+    fn clear_marks_removes_every_mark() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
+        app.toggle_mark();
+        app.move_selection_down();
+        app.toggle_mark();
+
+        app.clear_marks();
+
+        assert!(app.marked_issues().is_empty());
+        assert!(!app.is_marked(0));
+        assert!(!app.is_marked(1));
+    }
+
+    #[test]
+    fn set_issues_clears_marks_left_over_from_a_previous_list() {
+        // Regression guard: a second `set_issues` call (e.g. a retry/re-fetch) must reset
+        // `marked` alongside `issues`/`selected`, not just on first entry into the view —
+        // otherwise a stale index could point at the wrong issue (or past the end) in the new
+        // list.
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
+        app.toggle_mark();
+        assert!(app.is_marked(0));
+
+        app.set_issues(vec![sample_issue("ENG-3")]);
+
+        assert!(app.marked_issues().is_empty());
+        assert!(!app.is_marked(0));
+    }
+
+    #[test]
+    fn enter_key_with_marked_issues_returns_implement_many_in_list_order() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![
+            sample_issue("ENG-1"),
+            sample_issue("ENG-2"),
+            sample_issue("ENG-3"),
+        ]);
+        app.move_selection_down();
+        handle_key(&mut app, KeyCode::Char(' '), KeyModifiers::NONE); // marks ENG-2
+        app.move_selection_down();
+        handle_key(&mut app, KeyCode::Char(' '), KeyModifiers::NONE); // marks ENG-3
+
+        let action = handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(
+            action,
+            Some(Action::ImplementMany(vec![
+                sample_issue("ENG-2"),
+                sample_issue("ENG-3")
+            ]))
+        );
+    }
+
+    #[test]
+    fn enter_key_with_nothing_marked_falls_back_to_the_single_issue_action() {
+        // Regression guard: unmarked `<Enter>` behavior must stay exactly the pre-TF-590
+        // single-issue case, regardless of which issue is currently selected.
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
+        app.move_selection_down();
+
+        let action = handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(action, Some(Action::Implement(sample_issue("ENG-2"))));
     }
 
     #[test]

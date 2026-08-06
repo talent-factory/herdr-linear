@@ -6,7 +6,8 @@
 //! bare `std::env::current_dir()` inside the plugin therefore always resolves to the plugin's
 //! own checkout, regardless of which herdr space/tab is active — this is what made both the
 //! "Project Issues" view (`repo::detect_repo_name`) and implement-on-Enter
-//! (`main.rs`'s `start_implementation`) pick the wrong repo/directory.
+//! (`main.rs`'s `implement_one`, shared by both the single- and multi-issue callers)
+//! pick the wrong repo/directory.
 //!
 //! herdr instead threads the real directory through an injected `HERDR_PLUGIN_CONTEXT_JSON`
 //! env var. This is modeled on `herdr-file-viewer`'s `src/host.rs` host adapter — same env var,
@@ -49,11 +50,12 @@ pub fn parse_context_cwd(json: Option<&str>) -> Option<PathBuf> {
 /// Resolve the real working directory from the actual environment: `$HERDR_PLUGIN_CONTEXT_JSON`
 /// first, falling back to the plugin process's own `std::env::current_dir()` when the env var
 /// is absent, malformed, or empty. Thin wrapper around [`parse_context_cwd`]; called from
-/// [`crate::plugin::repo::detect_repo_name`] and `main.rs`'s `start_implementation`. Never
-/// fails outright — an unreadable process cwd falls back to an empty [`PathBuf`], modeled on
+/// [`crate::plugin::repo::detect_repo_name`] and `main.rs`'s `implement_one` (shared by both
+/// the single- and multi-issue "implement this issue" callers). Never fails outright — an
+/// unreadable process cwd falls back to an empty [`PathBuf`], modeled on
 /// `herdr-file-viewer`'s `host::from_env`. Callers that need the working directory to actually
 /// be usable (not just non-panicking) are responsible for checking for that empty case
-/// themselves; `start_implementation` does.
+/// themselves; `implement_one` does.
 pub fn resolve_cwd() -> PathBuf {
     let json = std::env::var("HERDR_PLUGIN_CONTEXT_JSON").ok();
     parse_context_cwd(json.as_deref())

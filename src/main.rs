@@ -147,27 +147,6 @@ async fn ensure_loaded(
     }
 }
 
-/// Runs the full "implement this issue" flow triggered by `<Enter>` on a selected issue:
-/// resolve the preferred coding agent, open a herdr tab running it, set the issue to its
-/// team's "In Progress" state, wait for the agent to become ready, then inject the implement
-/// prompt. Every failure sets a specific, actionable status banner on `app` instead of
-/// propagating — mirrors `ensure_loaded`'s "inline error instead of crashing" philosophy. Any
-/// non-fatal warnings collected along the way (tab rename, workflow-state lookup, the actual
-/// state transition) are preserved in *every* terminal status, not just the final success case
-/// — a failure late in the flow (e.g. `agent_wait` timing out) must not hide an earlier one
-/// (e.g. the issue never actually reaching "In Progress"). See
-/// docs/superpowers/specs/2026-08-05-implement-on-enter-design.md for the full data flow.
-///
-/// The agent is spawned in [`plugin::host::resolve_cwd`]'s directory — the herdr-injected
-/// launch context's working directory, not the plugin process's own `std::env::current_dir()`
-/// (which is always the plugin's own install directory, split or tab placement alike; see
-/// `host`'s module doc). This resolves correctly regardless of whether the panel was opened via
-/// `open-split.sh` or `open-tab.sh`, as long as herdr reports a launch context — see
-/// README.md's "Use" section and the design doc's "Out of scope / open items" for the prior
-/// split-only caveat this replaces. `resolve_cwd` itself never fails outright (see its own
-/// doc), so this function separately guards against the one case that matters here: both its
-/// launch-context parse *and* its `current_dir()` fallback failing, which would otherwise pass
-/// an empty `--cwd` straight through to `agent_start`.
 /// How many times [`send_prompt_until_visible`] will (re)send the implement prompt before
 /// giving up.
 const PROMPT_SEND_ATTEMPTS: u32 = 5;
@@ -266,77 +245,123 @@ async fn send_prompt_until_visible(
     Err(last_err.unwrap_or_else(|| "failed to send implement command".to_string()))
 }
 
-async fn start_implementation(
-    app: &mut plugin::app::App,
-    client: &herdr_linear::LinearClient,
-    issue: herdr_linear::Issue,
-) {
-    let herdr_bin = plugin::herdr_cli::herdr_bin();
+/// Outcome of running the "implement this issue" flow for a single issue ([`implement_one`]),
+/// independent of how many issues are being processed in this run (TF-590 added
+/// [`start_implementation_many`] alongside the pre-existing single-issue
+/// [`start_implementation`], and both share this type so they can't drift on what counts as
+/// success).
+///
+/// `StartedWithWarnings` is kept distinct from `Started` rather than folded into it because a
+/// non-fatal warning (tab rename, workflow-state lookup/transition) still means the agent is up
+/// and the prompt landed — [`start_implementation_many`]'s "N/M started" count (and its
+/// all-started determination) treats it as a start — but the single-issue path still surfaces
+/// it as an actionable (red) status, matching pre-TF-590 behavior exactly.
+///
+/// Named `Started`/`StartedWithWarnings`/`Failed` rather than `Ok`/`Warn`/`Err`: this is a
+/// three-way classification, not a `std::result::Result`, and reusing `Ok`/`Err` invited reading
+/// `Warn` as an intermediate point on a binary success/failure axis when its actual meaning is
+/// caller-defined (folded into "started" by one caller, into "failed" by the other).
+enum ImplementOutcome {
+    /// Everything succeeded cleanly. Carries the trailing half of the status message (e.g.
+    /// `"tab opened, agent started, set to In Progress."`).
+    Started(String),
+    /// The agent started and the prompt landed, but a non-fatal step along the way failed.
+    /// Carries the trailing half of the status message (already includes the warnings).
+    StartedWithWarnings(String),
+    /// A fatal step failed; the agent never became usable for this issue. Carries the
+    /// trailing half of the status message.
+    Failed(String),
+}
 
-    let agent_list_json = match plugin::herdr_cli::agent_list(&herdr_bin).await {
-        Ok(json) => json,
-        Err(err) => {
-            app.set_status(plugin::app::Status::Error(format!(
-                "{}: {err}",
-                issue.identifier
-            )));
-            return;
-        }
-    };
+/// Resolves and validates the coding-agent command to launch — once per `<Enter>` press, not
+/// once per issue (TF-590 hardening). This used to be re-run by [`implement_one`] itself for
+/// every marked issue in [`start_implementation_many`]'s loop, and after the first issue's tab
+/// exists, `herdr agent list` can only ever report its *underlying binary* (e.g. `"claude"`),
+/// never the shell alias/wrapper actually used to launch it (see
+/// [`plugin::implement::resolve_agent_command`]'s own doc) — so a later issue in the same batch
+/// could silently resolve to, and launch under, a different command than the first. Resolving
+/// once, before any tab in this run exists, keeps every issue in one `<Enter>` press on the same
+/// command.
+async fn resolve_validated_agent_command(
+    herdr_bin: &str,
+) -> std::result::Result<plugin::implement::ValidatedAgentCommand, String> {
+    let agent_list_json = plugin::herdr_cli::agent_list(herdr_bin)
+        .await
+        .map_err(|err| err.to_string())?;
     let derived = plugin::implement::resolve_preferred_agent(&agent_list_json);
 
-    let config_override = match plugin::config::load_agent_command_override() {
-        Ok(value) => value,
-        Err(err) => {
-            app.set_status(plugin::app::Status::Error(format!(
-                "{}: {err}",
-                issue.identifier
-            )));
-            return;
-        }
-    };
+    let config_override =
+        plugin::config::load_agent_command_override().map_err(|err| err.to_string())?;
 
     let command =
         plugin::implement::resolve_agent_command(derived.as_deref(), config_override.as_deref());
-    let command = match plugin::implement::ValidatedAgentCommand::parse(command) {
-        Ok(command) => command,
-        Err(command) => {
-            app.set_status(plugin::app::Status::Error(format!(
-                "{}: agent command {command:?} contains unexpected characters — refusing to run it",
-                issue.identifier
-            )));
-            return;
-        }
-    };
+    plugin::implement::ValidatedAgentCommand::parse(command).map_err(|command| {
+        format!("agent command {command:?} contains unexpected characters — refusing to run it")
+    })
+}
+
+/// Runs the full "implement this issue" flow for one issue: open a herdr tab running `command`
+/// under a name unique to this issue (TF-590, see [`plugin::implement::build_agent_name`]), set
+/// the issue to its team's "In Progress" state, wait for the agent to become ready, then inject
+/// the implement prompt. `command` is resolved once per run by
+/// [`resolve_validated_agent_command`] — not here — so every issue processed in the same
+/// `<Enter>` press (single or [`start_implementation_many`]'s marked-multiple case) launches
+/// under the same command; see that function's doc for why re-resolving per issue was a bug.
+/// Never propagates — every failure becomes an [`ImplementOutcome::Failed`] so both callers
+/// ([`start_implementation`] for the single-issue case, [`start_implementation_many`] for the
+/// marked-multiple case) can turn it into whatever status banner fits their situation,
+/// mirroring `ensure_loaded`'s "inline error instead of crashing" philosophy. Any non-fatal
+/// warnings collected along the way (tab rename, workflow-state lookup, the actual state
+/// transition) are preserved in *every* terminal outcome, not just the final success case — a
+/// failure late in the flow (e.g. `agent_wait` timing out) must not hide an earlier one (e.g.
+/// the issue never actually reaching "In Progress"). See
+/// docs/superpowers/specs/2026-08-05-implement-on-enter-design.md for the full data flow this
+/// extends.
+///
+/// The agent is spawned in [`plugin::host::resolve_cwd`]'s directory — the herdr-injected
+/// launch context's working directory, not the plugin process's own `std::env::current_dir()`
+/// (which is always the plugin's own install directory, split or tab placement alike; see
+/// `host`'s module doc). This resolves correctly regardless of whether the panel was opened via
+/// `open-split.sh` or `open-tab.sh`, as long as herdr reports a launch context — see
+/// README.md's "Use" section and the design doc's "Out of scope / open items" for the prior
+/// split-only caveat this replaces. `resolve_cwd` itself never fails outright (see its own
+/// doc), so this function separately guards against the one case that matters here: both its
+/// launch-context parse *and* its `current_dir()` fallback failing, which would otherwise pass
+/// an empty `--cwd` straight through to `agent_start`.
+async fn implement_one(
+    herdr_bin: &str,
+    client: &herdr_linear::LinearClient,
+    issue: &herdr_linear::Issue,
+    command: &plugin::implement::ValidatedAgentCommand,
+) -> ImplementOutcome {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-    let argv = plugin::implement::build_shell_argv(&shell, &command);
+    let argv = plugin::implement::build_shell_argv(&shell, command);
     let cwd = plugin::host::resolve_cwd();
     if cwd.as_os_str().is_empty() {
-        app.set_status(plugin::app::Status::Error(format!(
-            "{}: couldn't determine your working directory (herdr's launch context is missing \
+        return ImplementOutcome::Failed(
+            "couldn't determine your working directory (herdr's launch context is missing \
              and the plugin's own process directory is unreadable) — see README.md's \"Use\" \
-             section",
-            issue.identifier
-        )));
-        return;
+             section"
+                .to_string(),
+        );
     }
 
-    let started =
-        match plugin::herdr_cli::agent_start(&herdr_bin, command.as_str(), &cwd, &argv).await {
-            Ok(started) => started,
-            Err(err) => {
-                app.set_status(plugin::app::Status::Error(format!(
-                    "{}: failed to start agent tab: {err}",
-                    issue.identifier
-                )));
-                return;
-            }
-        };
+    // TF-590: a per-issue name, not the bare `command`, so starting a second issue while the
+    // first's agent tab is still running under the same `agent_command` doesn't collide on
+    // herdr's side with `agent_name_taken` (which `agent_start` itself also retries
+    // automatically, up to `AGENT_START_NAME_TAKEN_MAX_RETRIES` times, with a different
+    // suggested name each time — this is what makes those retries something other than the
+    // exact same losing name).
+    let agent_name = plugin::implement::build_agent_name(command.as_str(), &issue.identifier);
+    let started = match plugin::herdr_cli::agent_start(herdr_bin, &agent_name, &cwd, &argv).await {
+        Ok(started) => started,
+        Err(err) => return ImplementOutcome::Failed(format!("failed to start agent tab: {err}")),
+    };
 
     let mut warnings = Vec::new();
 
     if let Err(err) =
-        plugin::herdr_cli::tab_rename(&herdr_bin, &started.tab_id, &issue.identifier).await
+        plugin::herdr_cli::tab_rename(herdr_bin, &started.tab_id, &issue.identifier).await
     {
         warnings.push(format!("failed to rename tab: {err}"));
     }
@@ -359,38 +384,185 @@ async fn start_implementation(
     // From here on, every early return must still report `warnings` — a failure below doesn't
     // undo (or excuse hiding) a warning collected above it.
     if let Err(err) =
-        plugin::herdr_cli::agent_wait(&herdr_bin, &started.pane_id, "idle", 30_000).await
+        plugin::herdr_cli::agent_wait(herdr_bin, &started.pane_id, "idle", 30_000).await
     {
-        app.set_status(plugin::app::Status::Error(status_with_warnings(
-            format!(
-                "{}: agent didn't become ready ({err}) — run manually: {prompt}",
-                issue.identifier
-            ),
+        return ImplementOutcome::Failed(status_with_warnings(
+            format!("agent didn't become ready ({err}) — run manually: {prompt}"),
             &warnings,
-        )));
-        return;
+        ));
     }
 
-    if let Err(err) = send_prompt_until_visible(&herdr_bin, &started.pane_id, &prompt).await {
-        app.set_status(plugin::app::Status::Error(status_with_warnings(
-            format!("{}: {err} — run manually: {prompt}", issue.identifier),
+    if let Err(err) = send_prompt_until_visible(herdr_bin, &started.pane_id, &prompt).await {
+        return ImplementOutcome::Failed(status_with_warnings(
+            format!("{err} — run manually: {prompt}"),
             &warnings,
-        )));
-        return;
+        ));
     }
 
     if warnings.is_empty() {
-        app.set_status(plugin::app::Status::Ok(format!(
-            "{}: tab opened, agent started, set to In Progress.",
-            issue.identifier
-        )));
+        ImplementOutcome::Started("tab opened, agent started, set to In Progress.".to_string())
     } else {
-        app.set_status(plugin::app::Status::Error(format!(
-            "{}: started, but {}",
-            issue.identifier,
-            warnings.join("; ")
-        )));
+        ImplementOutcome::StartedWithWarnings(format!("started, but {}", warnings.join("; ")))
     }
+}
+
+/// Single-issue `<Enter>` flow (unmarked selection — [`plugin::app::Action::Implement`]).
+/// Status wording is unchanged from before TF-590: `implement_one` does the work, this just
+/// prefixes its outcome with the issue identifier and picks `Ok`/`Error` the same way the
+/// inlined version used to.
+async fn start_implementation(
+    app: &mut plugin::app::App,
+    client: &herdr_linear::LinearClient,
+    issue: herdr_linear::Issue,
+) {
+    let herdr_bin = plugin::herdr_cli::herdr_bin();
+    let command = match resolve_validated_agent_command(&herdr_bin).await {
+        Ok(command) => command,
+        Err(message) => {
+            app.set_status(plugin::app::Status::Error(format!(
+                "{}: {message}",
+                issue.identifier
+            )));
+            return;
+        }
+    };
+    match implement_one(&herdr_bin, client, &issue, &command).await {
+        ImplementOutcome::Started(message) => {
+            app.set_status(plugin::app::Status::Ok(format!(
+                "{}: {message}",
+                issue.identifier
+            )));
+        }
+        ImplementOutcome::StartedWithWarnings(message) | ImplementOutcome::Failed(message) => {
+            app.set_status(plugin::app::Status::Error(format!(
+                "{}: {message}",
+                issue.identifier
+            )));
+        }
+    }
+}
+
+/// Max per-issue detail segments [`summarize_many`] includes verbatim in the status banner
+/// before switching to a `"(+K more)"` suffix. `plugin::ui::draw`'s banner area grows with the
+/// message (see `status_banner_height`), but an unmarked/unbounded number of marked issues
+/// could still in principle produce a message so long it's impractical to read at any
+/// reasonable terminal height — this caps that without ever *silently* dropping detail: the
+/// `"(+K more)"` suffix always says how many were left out.
+const MAX_STATUS_DETAILS: usize = 8;
+
+/// Pure aggregation of [`start_implementation_many`]'s per-issue outcomes into one status
+/// banner, plus whether every issue started — split out so this decision (counting,
+/// `StartedWithWarnings` counting as started, wording, and the all-started determination the
+/// caller uses to decide whether to clear the marked-issue selection) is unit-testable without
+/// spawning a process or a Linear client, the same way [`status_with_warnings`] already is.
+///
+/// `results` is `(issue.identifier, outcome)` pairs in the order the issues were processed
+/// (list order — see `App::marked_issues`). The summary is `"N/M started"`; every issue that
+/// didn't start or finished with a warning is appended as a semicolon-separated
+/// `"<identifier>: <message>"` segment after it (up to [`MAX_STATUS_DETAILS`], see its doc),
+/// rather than one banner per issue. Within that detail list, `Failed` entries are always kept
+/// ahead of `StartedWithWarnings` ones (each group otherwise in its own list order) — the two
+/// truncate together against the same [`MAX_STATUS_DETAILS`] cap, and a `Failed` entry (the
+/// agent never started; needs a retry) is what the user needs to see, whereas
+/// `StartedWithWarnings` (the agent is up, something merely non-fatal happened along the way)
+/// is comparatively safe to push into the truncated "(+K more)" tail.
+fn summarize_many(
+    total: usize,
+    results: Vec<(String, ImplementOutcome)>,
+) -> (plugin::app::Status, bool) {
+    let mut started = 0usize;
+    let mut failed_details = Vec::new();
+    let mut warned_details = Vec::new();
+
+    for (identifier, outcome) in results {
+        match outcome {
+            ImplementOutcome::Started(_) => started += 1,
+            ImplementOutcome::StartedWithWarnings(message) => {
+                started += 1;
+                warned_details.push(format!("{identifier}: {message}"));
+            }
+            ImplementOutcome::Failed(message) => {
+                failed_details.push(format!("{identifier}: {message}"));
+            }
+        }
+    }
+
+    let summary = format!("{started}/{total} started");
+    let mut details = failed_details;
+    details.extend(warned_details);
+    let status = if details.is_empty() {
+        plugin::app::Status::Ok(summary)
+    } else {
+        let hidden = details.len().saturating_sub(MAX_STATUS_DETAILS);
+        details.truncate(MAX_STATUS_DETAILS);
+        let details_text = if hidden > 0 {
+            format!("{} (+{hidden} more)", details.join("; "))
+        } else {
+            details.join("; ")
+        };
+        plugin::app::Status::Error(format!("{summary}, {details_text}"))
+    };
+    (status, started == total)
+}
+
+/// Multi-issue `<Enter>` flow (TF-590, one or more issues marked —
+/// [`plugin::app::Action::ImplementMany`]): resolves the coding-agent command once via
+/// [`resolve_validated_agent_command`] (not once per issue — see that function's doc for the
+/// cross-issue command drift this avoids), then runs [`implement_one`] for every issue under
+/// that one command, sequentially — not concurrently, since each run drives the same interactive
+/// `herdr agent wait`/`agent send`/`agent read` cycle main.rs already serializes for a single
+/// issue, and herdr's own per-pane semantics aren't documented as safe to interleave — then
+/// summarizes the results in one status banner via [`summarize_many`] instead of one banner per
+/// issue. Returns whether every issue started, so the caller (`event_loop`'s
+/// `Action::ImplementMany` arm) only clears the marked-issue selection on a fully successful run
+/// — a partial or total failure leaves the marks intact so the user can retry without re-marking
+/// everything (TF-590).
+async fn start_implementation_many(
+    app: &mut plugin::app::App,
+    client: &herdr_linear::LinearClient,
+    issues: Vec<herdr_linear::Issue>,
+) -> bool {
+    let herdr_bin = plugin::herdr_cli::herdr_bin();
+    let total = issues.len();
+
+    let command = match resolve_validated_agent_command(&herdr_bin).await {
+        Ok(command) => command,
+        Err(message) => {
+            // Resolution failed before any issue could be attempted — every marked issue gets
+            // the same failure so `summarize_many`'s "N/M started" count and per-issue detail
+            // list still reflect what actually happened (nothing), rather than silently
+            // skipping the whole run with no status at all.
+            let results = issues
+                .into_iter()
+                .map(|issue| (issue.identifier, ImplementOutcome::Failed(message.clone())))
+                .collect();
+            let (status, all_started) = summarize_many(total, results);
+            app.set_status(status);
+            return all_started;
+        }
+    };
+
+    let mut results = Vec::with_capacity(total);
+    for issue in issues {
+        let outcome = implement_one(&herdr_bin, client, &issue, &command).await;
+        results.push((issue.identifier, outcome));
+    }
+
+    let (status, all_started) = summarize_many(total, results);
+    app.set_status(status);
+    all_started
+}
+
+/// Whether `event_loop`'s `Action::ImplementMany` arm should clear the marked-issue selection
+/// after a run, given [`start_implementation_many`]'s `all_started` return value. Pulled out as
+/// its own named, unit-tested function — rather than left as the inline `if` it used to be —
+/// specifically so a future edit to that match arm (inverting the condition, or calling
+/// `app.clear_marks()` unconditionally "for consistency") fails an explicit test instead of
+/// silently reintroducing a bug: clearing marks after a partial/total failure would force the
+/// user to re-mark every issue by hand to retry, which is exactly what leaving marks intact on
+/// failure (TF-590) exists to avoid.
+fn should_clear_marks_after_implementing_many(all_started: bool) -> bool {
+    all_started
 }
 
 /// Appends `warnings` (if any) to `message` as an `" (also: ...")` suffix. Used to make sure a
@@ -402,6 +574,58 @@ fn status_with_warnings(message: String, warnings: &[String]) -> String {
     } else {
         format!("{message} (also: {})", warnings.join("; "))
     }
+}
+
+/// Returns true for a key/modifiers combination that should be honored as a quit request when
+/// it turns up in [`flush_buffered_quit`]'s drain — bare `q`, or Ctrl+C (which crossterm reports
+/// as `KeyCode::Char('c')` plus `KeyModifiers::CONTROL`, not a dedicated key code, so it's
+/// indistinguishable from bare `c` — `Action::OpenConfig` — without checking the modifier).
+/// Mirrors [`plugin::app::handle_key`]'s own unconditional interrupt reflex, so an interrupt
+/// buffered during a blocking flow is honored the same way one delivered live would be.
+fn is_buffered_quit_key(
+    key: crossterm::event::KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+) -> bool {
+    key == crossterm::event::KeyCode::Char('q')
+        || (modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+            && key == crossterm::event::KeyCode::Char('c'))
+}
+
+/// Drains any input events that arrived while a blocking multi-step flow
+/// (`Action::Implement` / `Action::ImplementMany`) ran, so a buffered `<Enter>` doesn't replay
+/// as a fresh action once we're back to polling. Every step in that flow has its own bound —
+/// `agent_wait`'s own budget (up to 30s plus retry buffer), `get_workflow_states`/
+/// `update_issue`'s 30s HTTP timeout each, `tab_rename`/`agent_send`/`agent_list` at
+/// `DEFAULT_CLI_TIMEOUT` (15s) each, and `agent_start` at up to `DEFAULT_CLI_TIMEOUT` times
+/// `1 + AGENT_START_NAME_TAKEN_MAX_RETRIES` (TF-590's `agent_name_taken` retry loop, ~45s
+/// worst case, not a flat 15s) — but they're sequential (and, for `Action::ImplementMany`,
+/// repeated once per marked issue — TF-590), so the flow as a whole can run well past any
+/// single step's bound in the worst case. A buffered `q` *or* Ctrl+C (see
+/// [`is_buffered_quit_key`]) is honored instead of silently discarded (returns `true`), since
+/// the user very plausibly pressed one of them because the panel looked hung. Every other
+/// buffered key (Space, `r`, `c`, arrows, ...) is intentionally dropped with no replay — the
+/// screen state they'd act on has already moved on — but the count is still noted via
+/// `tracing::debug!` (see `main.rs::init_tracing`) so a log-enabled session has a trail instead
+/// of those keypresses vanishing with zero trace anywhere.
+fn flush_buffered_quit() -> std::io::Result<bool> {
+    let mut quit_requested = false;
+    let mut discarded = 0u32;
+    while crossterm::event::poll(std::time::Duration::from_millis(0))? {
+        if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+            if is_buffered_quit_key(key.code, key.modifiers) {
+                quit_requested = true;
+            } else {
+                discarded += 1;
+            }
+        }
+    }
+    if discarded > 0 {
+        tracing::debug!(
+            "flushed {discarded} buffered input event(s) (non-quit) after a blocking implement \
+                 flow"
+        );
+    }
+    Ok(quit_requested)
 }
 
 async fn event_loop(
@@ -473,27 +697,34 @@ async fn event_loop(
                                 ))),
                             }
 
-                            // Flush any input that arrived while the flow above was blocking.
-                            // Every step now has its own bound — agent_wait's own budget (up to
-                            // 30s plus retry buffer), get_workflow_states/update_issue's 30s HTTP
-                            // timeout each, and the other `herdr` subprocess calls (agent_list,
-                            // agent_start, tab_rename, agent_send) at `DEFAULT_CLI_TIMEOUT` (15s)
-                            // each — but they're sequential, so the flow as a whole can still run
-                            // well past "~31s" in the worst case. A buffered <Enter> must not
-                            // replay as a fresh action once we're back to polling, so it's
-                            // dropped; a buffered `q` is honored instead of silently discarded,
-                            // since the user very plausibly pressed it because the panel looked
-                            // hung.
-                            let mut quit_requested = false;
-                            while crossterm::event::poll(std::time::Duration::from_millis(0))? {
-                                if let crossterm::event::Event::Key(key) = crossterm::event::read()?
-                                {
-                                    if key.code == crossterm::event::KeyCode::Char('q') {
-                                        quit_requested = true;
+                            if flush_buffered_quit()? {
+                                break;
+                            }
+                        }
+                        plugin::app::Action::ImplementMany(issues) => {
+                            app.set_status(plugin::app::Status::Ok(format!(
+                                "Starting implementation for {} issues…",
+                                issues.len()
+                            )));
+                            terminal.draw(|frame| plugin::ui::draw(frame, app))?;
+                            // Only clear the marked-issue selection once every issue actually
+                            // started — not connected (nothing attempted) and a partial/total
+                            // failure both leave the marks in place, so the user can retry
+                            // without re-marking everything (TF-590).
+                            match client.as_ref() {
+                                Some(c) => {
+                                    let all_started =
+                                        start_implementation_many(app, c, issues).await;
+                                    if should_clear_marks_after_implementing_many(all_started) {
+                                        app.clear_marks();
                                     }
                                 }
+                                None => app.set_status(plugin::app::Status::Error(
+                                    "not connected to Linear yet — try again.".to_string(),
+                                )),
                             }
-                            if quit_requested {
+
+                            if flush_buffered_quit()? {
                                 break;
                             }
                         }
@@ -509,6 +740,95 @@ async fn event_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    fn write_fake_herdr_script(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("herdr");
+        std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (dir, script)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolve_validated_agent_command_resolves_from_agent_list_without_a_config_override() {
+        let (_dir, script) = write_fake_herdr_script(
+            r#"
+echo '{"result":{"agents":[{"agent":"claude"}]}}'
+exit 0
+"#,
+        );
+
+        let command = resolve_validated_agent_command(script.to_str().unwrap())
+            .await
+            .expect("should resolve a command from the fake herdr agent list output");
+
+        assert_eq!(command.as_str(), "claude");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolve_validated_agent_command_surfaces_a_failed_agent_list_call() {
+        // TF-590 hardening: this is the piece that must run exactly once per `<Enter>` press,
+        // not once per marked issue — a failure here must surface as a plain error message the
+        // caller can turn into a status banner, the same as before the extraction.
+        let (_dir, script) = write_fake_herdr_script(
+            r#"
+echo '{"error":{"message":"herdr is not running"}}'
+exit 1
+"#,
+        );
+
+        let err = resolve_validated_agent_command(script.to_str().unwrap())
+            .await
+            .expect_err("a failed `agent list` call must not resolve a command");
+
+        assert!(
+            err.contains("herdr is not running"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn is_buffered_quit_key_recognizes_bare_q() {
+        assert!(is_buffered_quit_key(KeyCode::Char('q'), KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn is_buffered_quit_key_recognizes_ctrl_c() {
+        // Regression test: a buffered Ctrl+C arrives as `Char('c')` + `CONTROL`, not a
+        // dedicated key code — `flush_buffered_quit` previously only matched bare `q` and
+        // silently swallowed a buffered Ctrl+C during a long `ImplementMany` run.
+        assert!(is_buffered_quit_key(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        ));
+    }
+
+    #[test]
+    fn is_buffered_quit_key_does_not_treat_bare_c_as_quit() {
+        // Without the modifier, `c` is `Action::OpenConfig` — must not be conflated with Ctrl+C.
+        assert!(!is_buffered_quit_key(
+            KeyCode::Char('c'),
+            KeyModifiers::NONE
+        ));
+    }
+
+    #[test]
+    fn is_buffered_quit_key_ignores_unrelated_keys() {
+        assert!(!is_buffered_quit_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!is_buffered_quit_key(
+            KeyCode::Char(' '),
+            KeyModifiers::NONE
+        ));
+        assert!(!is_buffered_quit_key(
+            KeyCode::Char('r'),
+            KeyModifiers::NONE
+        ));
+    }
 
     #[test]
     fn dispatches_split_launch_decision() {
@@ -558,5 +878,212 @@ mod tests {
             status_with_warnings("agent didn't become ready".to_string(), &warnings),
             "agent didn't become ready (also: failed to rename tab: boom; failed to set state to In Progress: boom)"
         );
+    }
+
+    #[test]
+    fn summarize_many_reports_a_clean_sweep_as_ok_and_all_started() {
+        let results = vec![
+            (
+                "ENG-1".to_string(),
+                ImplementOutcome::Started("ok".to_string()),
+            ),
+            (
+                "ENG-2".to_string(),
+                ImplementOutcome::Started("ok".to_string()),
+            ),
+        ];
+
+        let (status, all_started) = summarize_many(2, results);
+
+        assert_eq!(status, plugin::app::Status::Ok("2/2 started".to_string()));
+        assert!(all_started);
+    }
+
+    #[test]
+    fn summarize_many_counts_warnings_as_started_but_still_lists_them() {
+        let results = vec![
+            (
+                "ENG-1".to_string(),
+                ImplementOutcome::Started("ok".to_string()),
+            ),
+            (
+                "ENG-2".to_string(),
+                ImplementOutcome::StartedWithWarnings("started, but slow".to_string()),
+            ),
+        ];
+
+        let (status, all_started) = summarize_many(2, results);
+
+        assert_eq!(
+            status,
+            plugin::app::Status::Error("2/2 started, ENG-2: started, but slow".to_string())
+        );
+        // StartedWithWarnings counts toward "started" for the all-started determination too —
+        // otherwise a merely-noisy run would never let the caller clear the marked selection.
+        assert!(all_started);
+    }
+
+    #[test]
+    fn summarize_many_reports_failures_in_list_order_and_is_not_all_started() {
+        let results = vec![
+            (
+                "ENG-1".to_string(),
+                ImplementOutcome::Failed("boom".to_string()),
+            ),
+            (
+                "ENG-2".to_string(),
+                ImplementOutcome::Started("ok".to_string()),
+            ),
+            (
+                "ENG-3".to_string(),
+                ImplementOutcome::Failed("bang".to_string()),
+            ),
+        ];
+
+        let (status, all_started) = summarize_many(3, results);
+
+        assert_eq!(
+            status,
+            plugin::app::Status::Error("1/3 started, ENG-1: boom; ENG-3: bang".to_string())
+        );
+        assert!(!all_started);
+    }
+
+    #[test]
+    fn summarize_many_on_a_total_failure_is_not_all_started() {
+        let results = vec![(
+            "ENG-1".to_string(),
+            ImplementOutcome::Failed("boom".to_string()),
+        )];
+
+        let (status, all_started) = summarize_many(1, results);
+
+        assert_eq!(
+            status,
+            plugin::app::Status::Error("0/1 started, ENG-1: boom".to_string())
+        );
+        assert!(!all_started);
+    }
+
+    #[test]
+    fn summarize_many_caps_details_and_notes_how_many_were_hidden() {
+        // Never silently truncate: past MAX_STATUS_DETAILS, the banner must still say how many
+        // were left out rather than just dropping them.
+        let total = MAX_STATUS_DETAILS + 3;
+        let results: Vec<(String, ImplementOutcome)> = (0..total)
+            .map(|i| {
+                (
+                    format!("ENG-{i}"),
+                    ImplementOutcome::Failed("boom".to_string()),
+                )
+            })
+            .collect();
+
+        let (status, all_started) = summarize_many(total, results);
+
+        let plugin::app::Status::Error(text) = status else {
+            panic!("expected an error status");
+        };
+        assert_eq!(text.matches("boom").count(), MAX_STATUS_DETAILS);
+        assert!(text.ends_with("(+3 more)"), "unexpected text: {text}");
+        assert!(!all_started);
+    }
+
+    #[test]
+    fn summarize_many_shows_all_details_with_no_suffix_when_exactly_at_the_cap() {
+        // Boundary case: exactly MAX_STATUS_DETAILS failures. None should be hidden, and there
+        // must be no "(+K more)" suffix at all — `details.len().saturating_sub(...)` is exactly
+        // the kind of expression an off-by-one slips into.
+        let total = MAX_STATUS_DETAILS;
+        let results: Vec<(String, ImplementOutcome)> = (0..total)
+            .map(|i| {
+                (
+                    format!("ENG-{i}"),
+                    ImplementOutcome::Failed("boom".to_string()),
+                )
+            })
+            .collect();
+
+        let (status, all_started) = summarize_many(total, results);
+
+        let plugin::app::Status::Error(text) = status else {
+            panic!("expected an error status");
+        };
+        assert_eq!(text.matches("boom").count(), MAX_STATUS_DETAILS);
+        assert!(!text.contains("more)"), "unexpected suffix: {text}");
+        assert!(!all_started);
+    }
+
+    #[test]
+    fn summarize_many_caps_details_and_says_one_more_when_exactly_one_over() {
+        // Boundary case one past the cap: exactly one entry hidden, singular wording is not
+        // asserted (the implementation doesn't special-case singular/plural for the count), just
+        // that the count itself is exactly 1, not 0 or 2.
+        let total = MAX_STATUS_DETAILS + 1;
+        let results: Vec<(String, ImplementOutcome)> = (0..total)
+            .map(|i| {
+                (
+                    format!("ENG-{i}"),
+                    ImplementOutcome::Failed("boom".to_string()),
+                )
+            })
+            .collect();
+
+        let (status, all_started) = summarize_many(total, results);
+
+        let plugin::app::Status::Error(text) = status else {
+            panic!("expected an error status");
+        };
+        assert_eq!(text.matches("boom").count(), MAX_STATUS_DETAILS);
+        assert!(text.ends_with("(+1 more)"), "unexpected text: {text}");
+        assert!(!all_started);
+    }
+
+    #[test]
+    fn should_clear_marks_after_implementing_many_mirrors_all_started_true() {
+        assert!(should_clear_marks_after_implementing_many(true));
+    }
+
+    #[test]
+    fn should_clear_marks_after_implementing_many_mirrors_all_started_false() {
+        // Marks must survive a partial/total failure so the user can retry without re-marking
+        // every issue — this is the exact guarantee an accidental inversion or an
+        // unconditional `clear_marks()` at the call site would silently break.
+        assert!(!should_clear_marks_after_implementing_many(false));
+    }
+
+    #[test]
+    fn summarize_many_prioritizes_failures_over_warnings_when_truncating() {
+        // MAX_STATUS_DETAILS warnings processed first, then 2 real failures — if truncation just
+        // kept processing order, both failures (the entries that actually need the user's
+        // attention — the agent never started) would fall into the "(+2 more)" bucket behind
+        // MAX_STATUS_DETAILS merely-noisy warnings. Failures must survive truncation first.
+        let mut results: Vec<(String, ImplementOutcome)> = (0..MAX_STATUS_DETAILS)
+            .map(|i| {
+                (
+                    format!("WARN-{i}"),
+                    ImplementOutcome::StartedWithWarnings("slow".to_string()),
+                )
+            })
+            .collect();
+        results.push((
+            "FAIL-1".to_string(),
+            ImplementOutcome::Failed("boom".to_string()),
+        ));
+        results.push((
+            "FAIL-2".to_string(),
+            ImplementOutcome::Failed("bang".to_string()),
+        ));
+        let total = results.len();
+
+        let (status, all_started) = summarize_many(total, results);
+
+        let plugin::app::Status::Error(text) = status else {
+            panic!("expected an error status");
+        };
+        assert!(text.contains("FAIL-1: boom"), "unexpected text: {text}");
+        assert!(text.contains("FAIL-2: bang"), "unexpected text: {text}");
+        assert!(text.ends_with("(+2 more)"), "unexpected text: {text}");
+        assert!(!all_started);
     }
 }

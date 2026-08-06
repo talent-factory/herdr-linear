@@ -306,13 +306,26 @@ available. From the menu, use `↑`/`↓` to navigate options,
 use `↑`/`↓` to navigate the issue list, `/` to filter it by title or identifier (type to
 narrow, `↑`/`↓` still navigate the narrowed list live, `<Enter>` confirms and keeps the
 filter applied, `Esc` cancels and restores the full list), `o` to open the selected issue
-in your browser, `<Enter>` to implement it (opens a herdr tab, starts the preferred coding
-agent, sets the issue to "In Progress", and injects an implement prompt once the agent is
-ready), `r` to retry after an error, `c` to open `config.toml` from an error screen (see
-"Configure" above — creates the file if it doesn't exist yet), and `Esc` to return to the
-menu. Press `q` to quit the
-panel from anywhere (menu or view). Pressing the key again focuses the panel if it's
-open elsewhere, or closes it if it's already focused.
+in your browser, `<Space>` to mark/unmark the selected issue (shown with a `[x]`/`[ ]`
+checkbox prefix — independent of the active filter, so a mark survives narrowing and
+clearing the filter), `<Enter>` to implement it — with no issues marked, implements just
+the selected one; with one or more marked, implements every marked issue in list order,
+one after another (each opens a herdr tab, starts the preferred coding agent, sets the
+issue to "In Progress", and injects an implement prompt once the agent is ready; the
+status banner then summarizes how many started, e.g. "3/4 started", plus a per-issue
+message for any that failed or finished with a warning) — `r` to retry after an error,
+`c` to open `config.toml` from an error screen (see "Configure" above — creates the file
+if it doesn't exist yet), and `Esc` to return to the menu (or, while filtering, to cancel
+the filter first). Press `q` to quit the panel from anywhere (menu or view). Pressing the
+key again focuses the panel if it's open elsewhere, or closes it if it's already focused.
+
+> [!NOTE]
+> Each issue's agent tab is started under a name unique to that issue (the resolved
+> agent command plus the issue's identifier, e.g. `hr--tf-579`), not the bare agent
+> command — otherwise starting a second issue while an earlier one's tab is still
+> running would collide on herdr's side. If herdr still reports the name as taken
+> (`agent_name_taken`), `<Enter>` retries automatically with one of herdr's suggested
+> alternatives before giving up.
 
 > [!NOTE]
 > `<Enter>` starts the coding agent in the directory herdr reports as your currently
