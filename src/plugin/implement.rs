@@ -162,6 +162,23 @@ pub fn build_implement_prompt(identifier: &str) -> String {
     format!("Implement Linear Issue {identifier} using a new git worktree")
 }
 
+/// True if `prompt` is visible anywhere in `pane_text` (a `herdr agent read` snapshot). Used by
+/// `main.rs`'s `send_prompt_until_visible` to confirm an [`crate::plugin::herdr_cli::agent_send`]
+/// actually reached the target's input box, rather than trusting `agent_wait`'s "idle" status
+/// alone — see [`crate::plugin::herdr_cli::agent_read`]'s docs for the race this guards against.
+///
+/// Strips *all* whitespace from both sides before comparing. The implement prompt is long
+/// enough (~55 chars) that a narrow `hr` pane — the common case, since it's usually a split
+/// column — hard-wraps it across multiple screen lines, observed live even splitting mid-word
+/// (no word-boundary wrapping) with a leading indent on continuation lines. A plain
+/// `pane_text.contains(prompt)` never matches a wrapped rendering, which was previously
+/// misread as "never landed" and triggered pointless resends (and, since `agent_send` appends
+/// rather than replacing, visible duplication) even though the prompt had genuinely arrived.
+pub fn prompt_landed(pane_text: &str, prompt: &str) -> bool {
+    let strip_whitespace = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    strip_whitespace(pane_text).contains(&strip_whitespace(prompt))
+}
+
 /// Pick the workflow state to move an issue to when starting implementation: a
 /// case-insensitive name match on `"In Progress"` first, else the first `type == "started"`
 /// state, else `None`.
@@ -276,6 +293,48 @@ mod tests {
             build_implement_prompt("TF-563"),
             "Implement Linear Issue TF-563 using a new git worktree"
         );
+    }
+
+    #[test]
+    fn prompt_landed_is_true_when_the_prompt_is_visible_in_the_pane() {
+        let prompt = build_implement_prompt("TF-579");
+        let pane_text = format!("some banner\n\n❯ {prompt}\n");
+
+        assert!(prompt_landed(&pane_text, &prompt));
+    }
+
+    #[test]
+    fn prompt_landed_is_false_when_the_prompt_is_absent() {
+        let prompt = build_implement_prompt("TF-579");
+        let pane_text = "❯ \n";
+
+        assert!(!prompt_landed(pane_text, &prompt));
+    }
+
+    #[test]
+    fn prompt_landed_is_false_on_empty_pane_text() {
+        let prompt = build_implement_prompt("TF-579");
+
+        assert!(!prompt_landed("", &prompt));
+    }
+
+    #[test]
+    fn prompt_landed_is_true_when_a_narrow_pane_word_wraps_the_prompt() {
+        let prompt = build_implement_prompt("TF-579");
+        // A narrow `hr` split column wraps the prompt across several lines with a leading
+        // indent on continuations — mirrors what a real ratatui `Wrap` produces.
+        let pane_text = "❯ Implement Linear\n  Issue TF-579 using\n  a new git worktree\n";
+
+        assert!(prompt_landed(pane_text, &prompt));
+    }
+
+    #[test]
+    fn prompt_landed_is_true_when_wrapping_splits_mid_word() {
+        let prompt = build_implement_prompt("TF-579");
+        // Observed live: some renders hard-wrap mid-token with no word-boundary awareness.
+        let pane_text = "❯ Implement Linear Issue TF-579 using a new git wor\n  ktree\n";
+
+        assert!(prompt_landed(pane_text, &prompt));
     }
 
     #[test]

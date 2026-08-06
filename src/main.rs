@@ -170,6 +170,90 @@ async fn ensure_loaded(
 /// doc), so this function separately guards against the one case that matters here: both its
 /// launch-context parse *and* its `current_dir()` fallback failing, which would otherwise pass
 /// an empty `--cwd` straight through to `agent_start`.
+/// How many times [`send_prompt_until_visible`] will (re)send the implement prompt before
+/// giving up.
+const PROMPT_SEND_ATTEMPTS: u32 = 5;
+
+/// How long [`send_prompt_until_visible`] waits after each `agent_send` before the first read
+/// back. `agent_wait`'s "idle" status (checked by the caller before this runs) has been observed
+/// resolving in as little as 5ms — long before a `headroom wrap claude ...`-style multi-process
+/// `agent_command` has actually started rendering — so the first attempt routinely lands in a
+/// window where nothing is reading the pty yet; this delay just gives the terminal a chance to
+/// catch up before checking.
+const PROMPT_SEND_SETTLE_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How long [`send_prompt_until_visible`] waits, after first seeing the prompt land, before
+/// re-reading to confirm it *stuck*. Required because the failure mode isn't only "never
+/// appeared" — live TF-579 repros showed the prompt appear, get counted as landed, and then
+/// silently vanish moments later, almost certainly wiped by the target's own slower async
+/// startup (e.g. memory/code-graph loading in `headroom wrap`) finishing and resetting the
+/// input widget after the prompt box had already been painted once.
+const PROMPT_SEND_CONFIRM_DELAY: std::time::Duration = std::time::Duration::from_millis(800);
+
+/// Sends `prompt` to `pane_id` and confirms it actually landed — and *stayed* landed — before
+/// returning success.
+///
+/// `agent_wait`'s "idle" status is a screen-scraped snapshot of what's currently *rendered*, not
+/// a guarantee the target's input loop has attached to the pty, or that its own startup has
+/// finished. Both gaps are real and were reproduced live against `hr`
+/// (`headroom wrap claude --memory --code-graph`) during the TF-579 investigation:
+/// - Sent too early: the keystrokes land in a pty nothing is reading yet and are silently
+///   dropped, not queued — the prompt never appears at all.
+/// - Sent into an intermediate "painted but not fully started" state: the prompt appears,
+///   passing a single, one-shot check — then the target's slower background init finishes and
+///   wipes the input widget, leaving the pane empty with no error and no trace.
+///
+/// This resends up to [`PROMPT_SEND_ATTEMPTS`] times. Each attempt waits
+/// [`PROMPT_SEND_SETTLE_DELAY`] before its first read; if the prompt is visible there, it waits
+/// [`PROMPT_SEND_CONFIRM_DELAY`] more and re-reads before declaring success — only a prompt that
+/// survives both checks counts as landed. Either check failing falls through to the next
+/// (re)send rather than trusting the single earlier sighting.
+async fn send_prompt_until_visible(
+    herdr_bin: &str,
+    pane_id: &plugin::herdr_cli::PaneId,
+    prompt: &str,
+) -> std::result::Result<(), String> {
+    let mut last_err = None;
+    for attempt in 1..=PROMPT_SEND_ATTEMPTS {
+        if let Err(err) = plugin::herdr_cli::agent_send(herdr_bin, pane_id, prompt).await {
+            last_err = Some(format!("failed to send implement command ({err})"));
+            continue;
+        }
+
+        tokio::time::sleep(PROMPT_SEND_SETTLE_DELAY).await;
+
+        match plugin::herdr_cli::agent_read(herdr_bin, pane_id, "visible", 60).await {
+            Ok(text) if plugin::implement::prompt_landed(&text, prompt) => {
+                tokio::time::sleep(PROMPT_SEND_CONFIRM_DELAY).await;
+
+                match plugin::herdr_cli::agent_read(herdr_bin, pane_id, "visible", 60).await {
+                    Ok(text) if plugin::implement::prompt_landed(&text, prompt) => return Ok(()),
+                    Ok(_) => {
+                        last_err = Some(format!(
+                            "the implement command appeared after attempt {attempt} but then \
+                             disappeared before it stuck"
+                        ));
+                    }
+                    Err(err) => {
+                        last_err =
+                            Some(format!("failed to confirm implement command stuck ({err})"));
+                    }
+                }
+            }
+            Ok(_) => {
+                last_err = Some(format!(
+                    "sent the implement command {attempt} time(s) but it never appeared in the pane"
+                ));
+            }
+            Err(err) => {
+                last_err = Some(format!("failed to verify implement command landed ({err})"));
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| "failed to send implement command".to_string()))
+}
+
 async fn start_implementation(
     app: &mut plugin::app::App,
     client: &herdr_linear::LinearClient,
@@ -275,12 +359,9 @@ async fn start_implementation(
         return;
     }
 
-    if let Err(err) = plugin::herdr_cli::agent_send(&herdr_bin, &started.pane_id, &prompt).await {
+    if let Err(err) = send_prompt_until_visible(&herdr_bin, &started.pane_id, &prompt).await {
         app.set_status(plugin::app::Status::Error(status_with_warnings(
-            format!(
-                "{}: failed to send implement command ({err}) — run manually: {prompt}",
-                issue.identifier
-            ),
+            format!("{}: {err} — run manually: {prompt}", issue.identifier),
             &warnings,
         )));
         return;
