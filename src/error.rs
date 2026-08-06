@@ -50,6 +50,16 @@ pub enum Error {
     /// retry decision.
     #[error("{0}")]
     MissingResultField(String),
+
+    /// A `herdr agent start <name> ...` call rejected because `name` collides with an
+    /// already-running agent tab (`error.code == "agent_name_taken"`, TF-590). Carries herdr's
+    /// suggested `candidates` (may be empty if herdr's response didn't include any) so
+    /// [`crate::plugin::herdr_cli::agent_start`]'s retry logic can pick one automatically
+    /// instead of surfacing this raw collision to the user. Kept distinct from
+    /// [`Error::Internal`] for the same reason as [`Error::MissingResultField`]: the retry
+    /// decision matches on the variant, not a substring of the formatted message.
+    #[error("agent name already in use; candidates: {}", candidates.join(", "))]
+    AgentNameTaken { candidates: Vec<String> },
 }
 
 /// Helper function to create GraphQL error responses

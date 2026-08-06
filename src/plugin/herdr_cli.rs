@@ -88,14 +88,17 @@ fn interpret_output(
 ) -> Result<Value> {
     let parsed: Option<Value> = serde_json::from_str(stdout.trim()).ok();
 
-    let error_message = parsed
-        .as_ref()
-        .and_then(|v| v.get("error"))
+    let error_obj = parsed.as_ref().and_then(|v| v.get("error"));
+    let error_message = error_obj
         .and_then(|e| e.get("message"))
         .and_then(|m| m.as_str())
         .map(str::to_string);
 
     if !status_success || error_message.is_some() {
+        if let Some(agent_name_taken) = parse_agent_name_taken_error(error_obj) {
+            return Err(agent_name_taken);
+        }
+
         let message = error_message.unwrap_or_else(|| {
             let stderr = stderr.trim();
             if stderr.is_empty() {
@@ -120,6 +123,27 @@ fn interpret_output(
         .get("result")
         .cloned()
         .ok_or_else(|| Error::MissingResultField(format!("`{command_desc}` had no `result` field")))
+}
+
+/// Extract [`Error::AgentNameTaken`] from a herdr error body's `error.code`/`error.candidates`
+/// fields (TF-590), if present. Split out from [`interpret_output`] so the one case
+/// `agent_start`'s retry logic cares about is unit-testable in isolation, the same way
+/// [`is_missing_result_response`]'s companion case is.
+fn parse_agent_name_taken_error(error_obj: Option<&Value>) -> Option<Error> {
+    let code = error_obj?.get("code")?.as_str()?;
+    if code != "agent_name_taken" {
+        return None;
+    }
+    let candidates = error_obj
+        .and_then(|e| e.get("candidates"))
+        .and_then(|c| c.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(Error::AgentNameTaken { candidates })
 }
 
 /// True if `error` is herdr's known "no `result` field" response — see the module docs for the
@@ -198,8 +222,33 @@ fn parse_agent_started(result: &Value) -> Result<AgentStarted> {
     })
 }
 
+/// Max retries [`agent_start`] makes after its initial call when herdr reports
+/// `agent_name_taken` (TF-590, see [`Error::AgentNameTaken`]) before giving up and reporting
+/// the collision to the caller. Bounds retries even against a degenerate/huge `candidates`
+/// list from herdr, since blindly working through an unbounded list could hang the flow.
+const AGENT_START_NAME_TAKEN_MAX_RETRIES: u32 = 2;
+
+/// Pick the next agent name to retry [`agent_start`] with after an `agent_name_taken`
+/// collision, given herdr's suggested `candidates` (from the error that just failed) and how
+/// many retries have already been attempted. Pure — no I/O — so the retry decision is
+/// unit-testable without spawning a process, the same way `agent_wait`'s
+/// [`next_retry_budget_ms`] is. Returns `None` once the retry budget
+/// ([`AGENT_START_NAME_TAKEN_MAX_RETRIES`]) is exhausted or herdr reported no candidates to
+/// try, in which case the caller gives up and reports the collision.
+fn next_name_taken_retry(candidates: &[String], attempt: u32) -> Option<&str> {
+    if attempt >= AGENT_START_NAME_TAKEN_MAX_RETRIES {
+        return None;
+    }
+    candidates.first().map(String::as_str)
+}
+
 /// `herdr agent start <name> --cwd <cwd> --focus -- <argv...>` — starts `name` (used by herdr
 /// for its own agent-status tracking) running `argv` in a fresh, focused tab at `cwd`.
+///
+/// If herdr rejects `name` with `agent_name_taken` (TF-590 — e.g. because a previous issue's
+/// agent tab is still running under a name that collides with this one), retries
+/// automatically with one of herdr's suggested `candidates` instead of surfacing the raw
+/// collision to the caller — see [`next_name_taken_retry`].
 pub async fn agent_start(
     herdr_bin: &str,
     name: &str,
@@ -207,12 +256,42 @@ pub async fn agent_start(
     argv: &[String],
 ) -> Result<AgentStarted> {
     let cwd_str = cwd.to_string_lossy().to_string();
-    let mut args: Vec<&str> = vec!["agent", "start", name, "--cwd", &cwd_str, "--focus", "--"];
-    for a in argv {
-        args.push(a.as_str());
+    let mut attempt_name = name.to_string();
+    let mut attempt = 0;
+
+    loop {
+        let mut args: Vec<&str> = vec![
+            "agent",
+            "start",
+            &attempt_name,
+            "--cwd",
+            &cwd_str,
+            "--focus",
+            "--",
+        ];
+        for a in argv {
+            args.push(a.as_str());
+        }
+
+        match run(herdr_bin, &args).await {
+            Ok(result) => return parse_agent_started(&result),
+            Err(Error::AgentNameTaken { candidates }) => {
+                match next_name_taken_retry(&candidates, attempt) {
+                    Some(candidate) => {
+                        attempt_name = candidate.to_string();
+                        attempt += 1;
+                    }
+                    None => {
+                        return Err(Error::Internal(format!(
+                            "agent_name_taken: `{name}` and every retry candidate herdr suggested \
+                         are already in use (last tried: `{attempt_name}`)"
+                        )));
+                    }
+                }
+            }
+            Err(err) => return Err(err),
+        }
     }
-    let result = run(herdr_bin, &args).await?;
-    parse_agent_started(&result)
 }
 
 /// `herdr tab rename <tab_id> <label>`.
@@ -465,6 +544,73 @@ mod tests {
         assert!(!is_missing_result_response(&failed));
         assert!(!is_missing_result_response(&unparseable));
         assert!(!is_missing_result_response(&spawn_failed));
+    }
+
+    #[test]
+    fn interpret_output_maps_agent_name_taken_to_a_structured_error_with_candidates() {
+        let result = interpret_output(
+            "herdr agent start hr --cwd . --focus -- zsh",
+            false,
+            r#"{"error":{"code":"agent_name_taken","message":"agent name hr is already used","candidates":["hr-2","hr-3"]}}"#,
+            "",
+        );
+
+        match result.unwrap_err() {
+            Error::AgentNameTaken { candidates } => {
+                assert_eq!(candidates, vec!["hr-2".to_string(), "hr-3".to_string()])
+            }
+            other => panic!("expected AgentNameTaken, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interpret_output_maps_agent_name_taken_with_no_candidates_to_an_empty_list() {
+        let result = interpret_output(
+            "herdr agent start hr --cwd . --focus -- zsh",
+            false,
+            r#"{"error":{"code":"agent_name_taken","message":"agent name hr is already used"}}"#,
+            "",
+        );
+
+        match result.unwrap_err() {
+            Error::AgentNameTaken { candidates } => assert!(candidates.is_empty()),
+            other => panic!("expected AgentNameTaken, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interpret_output_does_not_treat_other_error_codes_as_agent_name_taken() {
+        let result = interpret_output(
+            "herdr agent send bogus hi",
+            false,
+            r#"{"error":{"code":"no_such_pane","message":"no such pane"}}"#,
+            "",
+        );
+
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("no such pane"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn next_name_taken_retry_returns_the_first_candidate_within_budget() {
+        let candidates = vec!["hr-2".to_string(), "hr-3".to_string()];
+
+        assert_eq!(next_name_taken_retry(&candidates, 0), Some("hr-2"));
+    }
+
+    #[test]
+    fn next_name_taken_retry_stops_once_the_retry_cap_is_reached() {
+        let candidates = vec!["hr-2".to_string()];
+
+        assert_eq!(
+            next_name_taken_retry(&candidates, AGENT_START_NAME_TAKEN_MAX_RETRIES),
+            None
+        );
+    }
+
+    #[test]
+    fn next_name_taken_retry_returns_none_when_herdr_reports_no_candidates() {
+        assert_eq!(next_name_taken_retry(&[], 0), None);
     }
 
     #[test]
