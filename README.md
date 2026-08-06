@@ -304,7 +304,7 @@ elsewhere, or closes it if it's already focused.
 
 > [!NOTE]
 > Each issue's agent tab is started under a name unique to that issue (the resolved
-> agent command plus the issue's identifier, e.g. `hr-tf-579`), not the bare agent
+> agent command plus the issue's identifier, e.g. `hr--tf-579`), not the bare agent
 > command — otherwise starting a second issue while an earlier one's tab is still
 > running would collide on herdr's side. If herdr still reports the name as taken
 > (`agent_name_taken`), `<Enter>` retries automatically with one of herdr's suggested

@@ -53,13 +53,27 @@ pub enum Error {
 
     /// A `herdr agent start <name> ...` call rejected because `name` collides with an
     /// already-running agent tab (`error.code == "agent_name_taken"`, TF-590). Carries herdr's
-    /// suggested `candidates` (may be empty if herdr's response didn't include any) so
-    /// [`crate::plugin::herdr_cli::agent_start`]'s retry logic can pick one automatically
-    /// instead of surfacing this raw collision to the user. Kept distinct from
-    /// [`Error::Internal`] for the same reason as [`Error::MissingResultField`]: the retry
-    /// decision matches on the variant, not a substring of the formatted message.
-    #[error("agent name already in use; candidates: {}", candidates.join(", "))]
-    AgentNameTaken { candidates: Vec<String> },
+    /// own `message` (so a caller that gives up still has herdr's original explanation to show,
+    /// not just a generic collision notice) and its suggested `candidates` (may be empty if
+    /// herdr's response didn't include any) so [`crate::plugin::herdr_cli::agent_start`]'s retry
+    /// logic can pick one automatically instead of surfacing this raw collision to the user.
+    /// Kept distinct from [`Error::Internal`] for the same reason as
+    /// [`Error::MissingResultField`]: the retry decision matches on the variant, not a substring
+    /// of the formatted message. Only `agent_start` ever sees this variant — see
+    /// `crate::plugin::herdr_cli::interpret_output`'s docs for why the mapping is scoped to
+    /// that one call path rather than applied to every `herdr` subcommand.
+    #[error(
+        "{message}{}",
+        if candidates.is_empty() {
+            String::new()
+        } else {
+            format!("; candidates: {}", candidates.join(", "))
+        }
+    )]
+    AgentNameTaken {
+        message: String,
+        candidates: Vec<String>,
+    },
 }
 
 /// Helper function to create GraphQL error responses

@@ -1,6 +1,7 @@
 //! Thin subprocess wrapper around the `herdr` CLI's JSON socket protocol, used by the
-//! "implement this issue" flow (`main.rs`'s `start_implementation`) to open a tab, start an
-//! agent, wait for it to become ready, and inject text. The subprocess-spawning half is
+//! "implement this issue" flow (`main.rs`'s `implement_one`, shared by both the single- and
+//! multi-issue callers) to open a tab, start an agent, wait for it to become ready, and inject
+//! text. The subprocess-spawning half is
 //! deliberately untested at this layer — same status as the existing `open::that(url)` call for
 //! the `o` key; see docs/superpowers/specs/2026-08-05-implement-on-enter-design.md for why. The
 //! response-interpretation half (`interpret_output`) is pure and unit-tested below.
@@ -80,11 +81,21 @@ pub fn herdr_bin() -> String {
 /// the CLI's own error message (or raw stderr/stdout as a fallback) so failures are always
 /// actionable in the status banner they end up in. Split out from `run` so this logic — the part
 /// that actually decides success vs. failure — is unit-testable without spawning a process.
+///
+/// When `check_agent_name_taken` is set, an `error.code == "agent_name_taken"` body is mapped to
+/// [`Error::AgentNameTaken`] instead of the generic `Error::Internal` path (see
+/// [`parse_agent_name_taken_error`]) — only [`agent_start`] (via [`run_for_agent_start`]) passes
+/// `true`. Scoped this way rather than checked unconditionally for every `herdr` subcommand
+/// because `agent_name_taken` is meaningful only in the context of a `agent start` call; if any
+/// other subcommand (`tab_rename`, `agent_wait`, ...) ever received a response reusing that same
+/// code, treating it as the same structured error would surface the wrong candidates/remedy
+/// out of context, with no retry logic actually applying.
 fn interpret_output(
     command_desc: &str,
     status_success: bool,
     stdout: &str,
     stderr: &str,
+    check_agent_name_taken: bool,
 ) -> Result<Value> {
     let parsed: Option<Value> = serde_json::from_str(stdout.trim()).ok();
 
@@ -95,8 +106,10 @@ fn interpret_output(
         .map(str::to_string);
 
     if !status_success || error_message.is_some() {
-        if let Some(agent_name_taken) = parse_agent_name_taken_error(error_obj) {
-            return Err(agent_name_taken);
+        if check_agent_name_taken {
+            if let Some(agent_name_taken) = parse_agent_name_taken_error(error_obj) {
+                return Err(agent_name_taken);
+            }
         }
 
         let message = error_message.unwrap_or_else(|| {
@@ -125,25 +138,59 @@ fn interpret_output(
         .ok_or_else(|| Error::MissingResultField(format!("`{command_desc}` had no `result` field")))
 }
 
-/// Extract [`Error::AgentNameTaken`] from a herdr error body's `error.code`/`error.candidates`
-/// fields (TF-590), if present. Split out from [`interpret_output`] so the one case
-/// `agent_start`'s retry logic cares about is unit-testable in isolation, the same way
+/// Extract [`Error::AgentNameTaken`] from a herdr error body's `error.code`/`error.message`/
+/// `error.candidates` fields (TF-590), if present. Split out from [`interpret_output`] so the
+/// one case `agent_start`'s retry logic cares about is unit-testable in isolation, the same way
 /// [`is_missing_result_response`]'s companion case is.
+///
+/// `message` falls back to a generic notice if herdr's body omits it (shouldn't happen in
+/// practice, but the field is read the same optional way `candidates` already was). If
+/// `candidates` is present but isn't a JSON array, or contains non-string entries, this logs a
+/// `tracing::warn!` and treats it the same as "no candidates" — that's a herdr protocol surprise
+/// worth knowing about (via `$HERDR_LINEAR_LOG_FILE`, see `main.rs::init_tracing`), not silently
+/// indistinguishable from herdr legitimately having nothing to suggest.
 fn parse_agent_name_taken_error(error_obj: Option<&Value>) -> Option<Error> {
     let code = error_obj?.get("code")?.as_str()?;
     if code != "agent_name_taken" {
         return None;
     }
-    let candidates = error_obj
-        .and_then(|e| e.get("candidates"))
-        .and_then(|c| c.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-    Some(Error::AgentNameTaken { candidates })
+    let message = error_obj
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| "agent name already in use".to_string());
+    let candidates_field = error_obj.and_then(|e| e.get("candidates"));
+    let candidates = match candidates_field {
+        None => Vec::new(),
+        Some(value) => match value.as_array() {
+            Some(arr) => {
+                let candidates: Vec<String> = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect();
+                if candidates.len() != arr.len() {
+                    tracing::warn!(
+                        "herdr's agent_name_taken response had a `candidates` array with \
+                         non-string entries; dropped {} of {}",
+                        arr.len() - candidates.len(),
+                        arr.len()
+                    );
+                }
+                candidates
+            }
+            None => {
+                tracing::warn!(
+                    "herdr's agent_name_taken response had a `candidates` field that wasn't a \
+                     JSON array; treating as no candidates"
+                );
+                Vec::new()
+            }
+        },
+    };
+    Some(Error::AgentNameTaken {
+        message,
+        candidates,
+    })
 }
 
 /// True if `error` is herdr's known "no `result` field" response — see the module docs for the
@@ -165,7 +212,12 @@ const DEFAULT_CLI_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Run a `herdr` CLI subcommand, bounded by `call_timeout`, returning the parsed `result` field
 /// on success. See [`interpret_output`] for the success/failure mapping.
-async fn run_with_timeout(herdr_bin: &str, args: &[&str], call_timeout: Duration) -> Result<Value> {
+async fn run_with_timeout(
+    herdr_bin: &str,
+    args: &[&str],
+    call_timeout: Duration,
+    check_agent_name_taken: bool,
+) -> Result<Value> {
     let command_desc = format!("{herdr_bin} {}", args.join(" "));
 
     let output = tokio::time::timeout(call_timeout, Command::new(herdr_bin).args(args).output())
@@ -182,13 +234,23 @@ async fn run_with_timeout(herdr_bin: &str, args: &[&str], call_timeout: Duration
         output.status.success(),
         &String::from_utf8_lossy(&output.stdout),
         &String::from_utf8_lossy(&output.stderr),
+        check_agent_name_taken,
     )
 }
 
-/// [`run_with_timeout`] bounded by [`DEFAULT_CLI_TIMEOUT`] — used by every `herdr` subcommand
-/// except `agent_wait`.
+/// [`run_with_timeout`] bounded by [`DEFAULT_CLI_TIMEOUT`], with `agent_name_taken` mapping
+/// switched off — used by every `herdr` subcommand except `agent_wait` (which has its own
+/// budget) and `agent_start` (see [`run_for_agent_start`]).
 async fn run(herdr_bin: &str, args: &[&str]) -> Result<Value> {
-    run_with_timeout(herdr_bin, args, DEFAULT_CLI_TIMEOUT).await
+    run_with_timeout(herdr_bin, args, DEFAULT_CLI_TIMEOUT, false).await
+}
+
+/// [`run_with_timeout`] bounded by [`DEFAULT_CLI_TIMEOUT`], with `agent_name_taken` mapping
+/// switched on — used only by [`agent_start`], the one call site that knows how to retry an
+/// `agent_name_taken` collision (see [`interpret_output`]'s docs for why this is opt-in rather
+/// than global).
+async fn run_for_agent_start(herdr_bin: &str, args: &[&str]) -> Result<Value> {
+    run_with_timeout(herdr_bin, args, DEFAULT_CLI_TIMEOUT, true).await
 }
 
 /// `herdr agent list` — the raw JSON text of the `result` field, for
@@ -224,31 +286,47 @@ fn parse_agent_started(result: &Value) -> Result<AgentStarted> {
 
 /// Max retries [`agent_start`] makes after its initial call when herdr reports
 /// `agent_name_taken` (TF-590, see [`Error::AgentNameTaken`]) before giving up and reporting
-/// the collision to the caller. Bounds retries even against a degenerate/huge `candidates`
-/// list from herdr, since blindly working through an unbounded list could hang the flow.
+/// the collision to the caller. Bounds how many round-trips to herdr the retry loop makes,
+/// rather than how far into `candidates` it walks — [`next_name_taken_retry`] walks the full
+/// list each round looking for a name not yet tried, so an unusually long `candidates` list
+/// doesn't by itself cost extra round-trips, only an unusually long run of already-tried names
+/// would.
 const AGENT_START_NAME_TAKEN_MAX_RETRIES: u32 = 2;
 
 /// Pick the next agent name to retry [`agent_start`] with after an `agent_name_taken`
-/// collision, given herdr's suggested `candidates` (from the error that just failed) and how
-/// many retries have already been attempted. Pure — no I/O — so the retry decision is
-/// unit-testable without spawning a process, the same way `agent_wait`'s
+/// collision, given herdr's suggested `candidates` (from the error that just failed), the set
+/// of names already tried this call (`tried`), and how many retries have already been
+/// attempted. Skips any candidate already in `tried` so a herdr response that re-suggests an
+/// already-rejected name doesn't silently burn a retry making no progress. Pure — no I/O — so
+/// the retry decision is unit-testable without spawning a process, the same way `agent_wait`'s
 /// [`next_retry_budget_ms`] is. Returns `None` once the retry budget
-/// ([`AGENT_START_NAME_TAKEN_MAX_RETRIES`]) is exhausted or herdr reported no candidates to
-/// try, in which case the caller gives up and reports the collision.
-fn next_name_taken_retry(candidates: &[String], attempt: u32) -> Option<&str> {
+/// ([`AGENT_START_NAME_TAKEN_MAX_RETRIES`]) is exhausted or none of `candidates` is a name that
+/// hasn't already been tried, in which case the caller gives up and reports the collision.
+fn next_name_taken_retry<'a>(
+    candidates: &'a [String],
+    tried: &std::collections::HashSet<String>,
+    attempt: u32,
+) -> Option<&'a str> {
     if attempt >= AGENT_START_NAME_TAKEN_MAX_RETRIES {
         return None;
     }
-    candidates.first().map(String::as_str)
+    candidates
+        .iter()
+        .map(String::as_str)
+        .find(|candidate| !tried.contains(*candidate))
 }
 
 /// `herdr agent start <name> --cwd <cwd> --focus -- <argv...>` — starts `name` (used by herdr
 /// for its own agent-status tracking) running `argv` in a fresh, focused tab at `cwd`.
 ///
 /// If herdr rejects `name` with `agent_name_taken` (TF-590 — e.g. because a previous issue's
-/// agent tab is still running under a name that collides with this one), retries
-/// automatically with one of herdr's suggested `candidates` instead of surfacing the raw
-/// collision to the caller — see `next_name_taken_retry`.
+/// agent tab is still running under a name that collides with this one), retries automatically
+/// — up to `AGENT_START_NAME_TAKEN_MAX_RETRIES` times — with one of herdr's suggested
+/// `candidates` instead of surfacing the raw collision to the caller — see
+/// `next_name_taken_retry`. If every candidate is exhausted or already tried, gives up and
+/// returns an [`Error::Internal`] that carries herdr's own message from the *last* collision
+/// plus a concrete remedy, distinguishing "herdr suggested nothing" from "every suggestion was
+/// already tried" so the message doesn't overstate what was actually attempted.
 pub async fn agent_start(
     herdr_bin: &str,
     name: &str,
@@ -258,6 +336,8 @@ pub async fn agent_start(
     let cwd_str = cwd.to_string_lossy().to_string();
     let mut attempt_name = name.to_string();
     let mut attempt = 0;
+    let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
+    tried.insert(attempt_name.clone());
 
     loop {
         let mut args: Vec<&str> = vec![
@@ -273,22 +353,34 @@ pub async fn agent_start(
             args.push(a.as_str());
         }
 
-        match run(herdr_bin, &args).await {
+        match run_for_agent_start(herdr_bin, &args).await {
             Ok(result) => return parse_agent_started(&result),
-            Err(Error::AgentNameTaken { candidates }) => {
-                match next_name_taken_retry(&candidates, attempt) {
-                    Some(candidate) => {
-                        attempt_name = candidate.to_string();
-                        attempt += 1;
-                    }
-                    None => {
-                        return Err(Error::Internal(format!(
-                            "agent_name_taken: `{name}` and every retry candidate herdr suggested \
-                         are already in use (last tried: `{attempt_name}`)"
-                        )));
-                    }
+            Err(Error::AgentNameTaken {
+                message,
+                candidates,
+            }) => match next_name_taken_retry(&candidates, &tried, attempt) {
+                Some(candidate) => {
+                    attempt_name = candidate.to_string();
+                    tried.insert(attempt_name.clone());
+                    attempt += 1;
                 }
-            }
+                None => {
+                    let remedy = if candidates.is_empty() {
+                        "herdr suggested no alternative name".to_string()
+                    } else {
+                        format!(
+                            "the suggested alternative{} ({}) {} already tried",
+                            if candidates.len() == 1 { "" } else { "s" },
+                            candidates.join(", "),
+                            if candidates.len() == 1 { "was" } else { "were" }
+                        )
+                    };
+                    return Err(Error::Internal(format!(
+                        "agent_name_taken: {message} — {remedy}; close the other agent tab \
+                             or wait for it to finish, then retry"
+                    )));
+                }
+            },
             Err(err) => return Err(err),
         }
     }
@@ -364,6 +456,7 @@ pub async fn agent_wait(
                 &timeout_str,
             ],
             call_timeout,
+            false,
         )
         .await;
 
@@ -438,7 +531,13 @@ mod tests {
 
     #[test]
     fn interpret_output_returns_the_result_field_on_success() {
-        let result = interpret_output("herdr agent list", true, r#"{"result":{"agents":[]}}"#, "");
+        let result = interpret_output(
+            "herdr agent list",
+            true,
+            r#"{"result":{"agents":[]}}"#,
+            "",
+            false,
+        );
 
         assert_eq!(result.unwrap(), serde_json::json!({"agents": []}));
     }
@@ -450,6 +549,7 @@ mod tests {
             false,
             r#"{"error":{"message":"no such pane"}}"#,
             "",
+            false,
         );
 
         let err = result.unwrap_err().to_string();
@@ -463,6 +563,7 @@ mod tests {
             false,
             "",
             "timed out waiting for idle\n",
+            false,
         );
 
         let err = result.unwrap_err().to_string();
@@ -474,7 +575,7 @@ mod tests {
 
     #[test]
     fn interpret_output_errors_on_non_zero_exit_with_no_stderr_falling_back_to_stdout() {
-        let result = interpret_output("herdr bogus", false, "unknown option: --bogus\n", "");
+        let result = interpret_output("herdr bogus", false, "unknown option: --bogus\n", "", false);
 
         let err = result.unwrap_err().to_string();
         assert!(
@@ -492,6 +593,7 @@ mod tests {
             true,
             r#"{"error":{"message":"no such pane"}}"#,
             "",
+            false,
         );
 
         let err = result.unwrap_err().to_string();
@@ -500,7 +602,7 @@ mod tests {
 
     #[test]
     fn interpret_output_errors_on_unparseable_json_with_a_zero_exit() {
-        let result = interpret_output("herdr agent list", true, "not json", "");
+        let result = interpret_output("herdr agent list", true, "not json", "", false);
 
         let err = result.unwrap_err().to_string();
         assert!(
@@ -511,7 +613,13 @@ mod tests {
 
     #[test]
     fn interpret_output_errors_when_the_result_field_is_missing() {
-        let result = interpret_output("herdr agent list", true, r#"{"id":"cli:agent:list"}"#, "");
+        let result = interpret_output(
+            "herdr agent list",
+            true,
+            r#"{"id":"cli:agent:list"}"#,
+            "",
+            false,
+        );
 
         assert!(result.is_err());
     }
@@ -523,6 +631,7 @@ mod tests {
             true,
             r#"{"id":"x"}"#,
             "",
+            false,
         )
         .unwrap_err();
 
@@ -536,9 +645,11 @@ mod tests {
             false,
             r#"{"error":{"message":"no such pane"}}"#,
             "",
+            false,
         )
         .unwrap_err();
-        let unparseable = interpret_output("herdr agent list", true, "not json", "").unwrap_err();
+        let unparseable =
+            interpret_output("herdr agent list", true, "not json", "", false).unwrap_err();
         let spawn_failed = Error::Internal("Failed to run `herdr`: no such file".to_string());
 
         assert!(!is_missing_result_response(&failed));
@@ -553,10 +664,15 @@ mod tests {
             false,
             r#"{"error":{"code":"agent_name_taken","message":"agent name hr is already used","candidates":["hr-2","hr-3"]}}"#,
             "",
+            true,
         );
 
         match result.unwrap_err() {
-            Error::AgentNameTaken { candidates } => {
+            Error::AgentNameTaken {
+                message,
+                candidates,
+            } => {
+                assert_eq!(message, "agent name hr is already used");
                 assert_eq!(candidates, vec!["hr-2".to_string(), "hr-3".to_string()])
             }
             other => panic!("expected AgentNameTaken, got {other:?}"),
@@ -570,11 +686,35 @@ mod tests {
             false,
             r#"{"error":{"code":"agent_name_taken","message":"agent name hr is already used"}}"#,
             "",
+            true,
         );
 
         match result.unwrap_err() {
-            Error::AgentNameTaken { candidates } => assert!(candidates.is_empty()),
+            Error::AgentNameTaken { candidates, .. } => assert!(candidates.is_empty()),
             other => panic!("expected AgentNameTaken, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interpret_output_ignores_agent_name_taken_when_not_checking_for_it() {
+        // TF-590 follow-up: `interpret_output` only maps `agent_name_taken` when the caller
+        // (only `agent_start`, via `run_for_agent_start`) opts in — every other `herdr`
+        // subcommand must fall through to the generic error path even if herdr ever reused
+        // this code for a response unrelated to `agent start`.
+        let result = interpret_output(
+            "herdr tab rename wY:tW ENG-1",
+            false,
+            r#"{"error":{"code":"agent_name_taken","message":"agent name hr is already used","candidates":["hr-2"]}}"#,
+            "",
+            false,
+        );
+
+        match result.unwrap_err() {
+            Error::AgentNameTaken { .. } => panic!("agent_name_taken should not be checked here"),
+            other => assert!(
+                other.to_string().contains("agent name hr is already used"),
+                "unexpected message: {other}"
+            ),
         }
     }
 
@@ -585,6 +725,7 @@ mod tests {
             false,
             r#"{"error":{"code":"no_such_pane","message":"no such pane"}}"#,
             "",
+            true,
         );
 
         let err = result.unwrap_err().to_string();
@@ -592,25 +733,224 @@ mod tests {
     }
 
     #[test]
-    fn next_name_taken_retry_returns_the_first_candidate_within_budget() {
+    fn next_name_taken_retry_returns_the_first_untried_candidate_within_budget() {
         let candidates = vec!["hr-2".to_string(), "hr-3".to_string()];
+        let tried = std::collections::HashSet::new();
 
-        assert_eq!(next_name_taken_retry(&candidates, 0), Some("hr-2"));
+        assert_eq!(next_name_taken_retry(&candidates, &tried, 0), Some("hr-2"));
+    }
+
+    #[test]
+    fn next_name_taken_retry_skips_candidates_already_tried() {
+        // The whole point of tracking `tried`: a herdr response that re-suggests a name we
+        // already know is taken must not be picked again.
+        let candidates = vec!["hr-2".to_string(), "hr-3".to_string()];
+        let mut tried = std::collections::HashSet::new();
+        tried.insert("hr-2".to_string());
+
+        assert_eq!(next_name_taken_retry(&candidates, &tried, 0), Some("hr-3"));
+    }
+
+    #[test]
+    fn next_name_taken_retry_returns_none_when_every_candidate_was_already_tried() {
+        let candidates = vec!["hr-2".to_string(), "hr-3".to_string()];
+        let mut tried = std::collections::HashSet::new();
+        tried.insert("hr-2".to_string());
+        tried.insert("hr-3".to_string());
+
+        assert_eq!(next_name_taken_retry(&candidates, &tried, 0), None);
     }
 
     #[test]
     fn next_name_taken_retry_stops_once_the_retry_cap_is_reached() {
         let candidates = vec!["hr-2".to_string()];
+        let tried = std::collections::HashSet::new();
 
         assert_eq!(
-            next_name_taken_retry(&candidates, AGENT_START_NAME_TAKEN_MAX_RETRIES),
+            next_name_taken_retry(&candidates, &tried, AGENT_START_NAME_TAKEN_MAX_RETRIES),
             None
         );
     }
 
     #[test]
     fn next_name_taken_retry_returns_none_when_herdr_reports_no_candidates() {
-        assert_eq!(next_name_taken_retry(&[], 0), None);
+        let tried = std::collections::HashSet::new();
+        assert_eq!(next_name_taken_retry(&[], &tried, 0), None);
+    }
+
+    #[test]
+    fn next_name_taken_retry_still_works_at_a_mid_budget_attempt() {
+        // Regression guard: `attempt` only gates the budget check (`attempt >=
+        // AGENT_START_NAME_TAKEN_MAX_RETRIES`), it isn't used to index into `candidates` — a
+        // retry partway through the budget (not the first, not yet at the cap) must still pick
+        // a valid untried candidate.
+        let candidates = vec!["hr-2".to_string(), "hr-3".to_string()];
+        let mut tried = std::collections::HashSet::new();
+        tried.insert("hr-2".to_string());
+
+        assert_eq!(next_name_taken_retry(&candidates, &tried, 1), Some("hr-3"));
+    }
+
+    #[test]
+    fn parse_agent_name_taken_error_logs_and_drops_a_non_array_candidates_field() {
+        let error_obj = serde_json::json!({
+            "code": "agent_name_taken",
+            "message": "agent name hr is already used",
+            "candidates": "hr-2",
+        });
+
+        match parse_agent_name_taken_error(Some(&error_obj)).unwrap() {
+            Error::AgentNameTaken { candidates, .. } => assert!(candidates.is_empty()),
+            other => panic!("expected AgentNameTaken, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_agent_name_taken_error_drops_non_string_candidate_entries() {
+        let error_obj = serde_json::json!({
+            "code": "agent_name_taken",
+            "message": "agent name hr is already used",
+            "candidates": ["hr-2", 3, "hr-4"],
+        });
+
+        match parse_agent_name_taken_error(Some(&error_obj)).unwrap() {
+            Error::AgentNameTaken { candidates, .. } => {
+                assert_eq!(candidates, vec!["hr-2".to_string(), "hr-4".to_string()])
+            }
+            other => panic!("expected AgentNameTaken, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_agent_name_taken_error_falls_back_to_a_generic_message_when_absent() {
+        let error_obj = serde_json::json!({"code": "agent_name_taken"});
+
+        match parse_agent_name_taken_error(Some(&error_obj)).unwrap() {
+            Error::AgentNameTaken { message, .. } => {
+                assert_eq!(message, "agent name already in use")
+            }
+            other => panic!("expected AgentNameTaken, got {other:?}"),
+        }
+    }
+
+    /// Writes an executable fake `herdr` shell script (`#!/bin/sh` — Unix only, matching the
+    /// project's own `sh -i`/`/bin/bash` assumptions) into a fresh [`tempfile::TempDir`] and
+    /// returns both, so `agent_start`'s subprocess-spawning retry loop can be exercised
+    /// end-to-end without a real `herdr` daemon. `agent_start` takes `herdr_bin` directly as a
+    /// parameter (see `herdr_bin()`'s `$HERDR_BIN_PATH` override, which this mirrors), so the
+    /// script's path can be passed straight in — no env var indirection needed. The `TempDir`
+    /// must be kept alive by the caller for the duration of the test (dropping it deletes the
+    /// script).
+    #[cfg(unix)]
+    fn write_fake_herdr_script(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("herdr");
+        std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (dir, script)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_start_retries_with_herdrs_suggested_candidate_and_then_succeeds() {
+        // $3 is the `<name>` positional in `agent start <name> --cwd ... --focus -- ...`.
+        let (_dir, script) = write_fake_herdr_script(
+            r#"
+name="$3"
+if [ "$name" = "hr" ]; then
+  echo '{"error":{"code":"agent_name_taken","message":"agent name hr is already used","candidates":["hr-2"]}}'
+  exit 1
+elif [ "$name" = "hr-2" ]; then
+  echo '{"result":{"agent":{"pane_id":"p1","tab_id":"t1"}}}'
+  exit 0
+else
+  echo "{\"error\":{\"message\":\"unexpected name: $name\"}}"
+  exit 1
+fi
+"#,
+        );
+
+        let started = agent_start(
+            script.to_str().unwrap(),
+            "hr",
+            Path::new("/tmp"),
+            &["zsh".to_string()],
+        )
+        .await
+        .expect("agent_start should retry with herdr's suggested candidate and then succeed");
+
+        assert_eq!(started.pane_id.as_str(), "p1");
+        assert_eq!(started.tab_id.as_str(), "t1");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_start_gives_up_once_the_retry_budget_is_exhausted() {
+        // Always collides, and always re-suggests the same two candidates regardless of which
+        // name was just tried — this is exactly the "herdr keeps re-suggesting an already-tried
+        // name" scenario `next_name_taken_retry`'s `tried` tracking exists for.
+        let (_dir, script) = write_fake_herdr_script(
+            r#"
+name="$3"
+echo "{\"error\":{\"code\":\"agent_name_taken\",\"message\":\"agent name $name is already used\",\"candidates\":[\"hr-2\",\"hr-3\"]}}"
+exit 1
+"#,
+        );
+
+        let err = agent_start(
+            script.to_str().unwrap(),
+            "hr",
+            Path::new("/tmp"),
+            &["zsh".to_string()],
+        )
+        .await
+        .expect_err("agent_start should give up once every candidate has been tried");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("agent_name_taken"),
+            "unexpected message: {message}"
+        );
+        assert!(
+            message.contains("already tried"),
+            "unexpected message: {message}"
+        );
+        assert!(
+            message.contains("close the other agent tab"),
+            "give-up message should include a remedy: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_start_gives_up_immediately_when_herdr_suggests_no_alternative() {
+        let (_dir, script) = write_fake_herdr_script(
+            r#"
+echo '{"error":{"code":"agent_name_taken","message":"agent name hr is already used"}}'
+exit 1
+"#,
+        );
+
+        let err = agent_start(
+            script.to_str().unwrap(),
+            "hr",
+            Path::new("/tmp"),
+            &["zsh".to_string()],
+        )
+        .await
+        .expect_err("agent_start should give up when herdr offers no alternative");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("no alternative name"),
+            "unexpected message: {message}"
+        );
+        assert!(
+            !message.contains("already tried"),
+            "message shouldn't claim alternatives were tried when none were offered: {message}"
+        );
     }
 
     #[test]

@@ -63,6 +63,32 @@ impl tui_markdown::StyleSheet for MarkdownStyleSheet {
     }
 }
 
+/// Floor and ceiling for [`status_banner_height`]'s estimate: never shrink the banner below
+/// what a single short message needs (matches the fixed height this replaces), and never let a
+/// pathological message (in principle bounded by `main.rs::MAX_STATUS_DETAILS`, but this is a
+/// second, independent backstop) consume more than a third of a typical terminal.
+const STATUS_BANNER_MIN_HEIGHT: u16 = 3;
+const STATUS_BANNER_MAX_HEIGHT: u16 = 10;
+
+/// How many rows to reserve for the status banner at the bottom of `draw_view`'s loaded-issue
+/// layout, given the banner's `text` and the frame's `width`. Ratatui doesn't expose a stable
+/// API to precompute a `Paragraph`'s exact wrapped height (the same reason the issue-detail
+/// pane elsewhere in this module uses a single `Constraint::Min(0)` block instead of a fixed
+/// header height — see its own comment), so this is a deliberately generous overestimate
+/// (`ceil(chars / width) + 2` rows, clamped to `[STATUS_BANNER_MIN_HEIGHT,
+/// STATUS_BANNER_MAX_HEIGHT]`) rather than an exact line count: erring high just leaves a
+/// couple of blank trailing rows, erring low silently clips content — and a fixed `3` was sized
+/// for one short message, not TF-590's multi-issue failure banner, which can carry one
+/// `"<identifier>: <message>"` segment per failed issue.
+fn status_banner_height(text: &str, width: u16) -> u16 {
+    if width == 0 {
+        return STATUS_BANNER_MIN_HEIGHT;
+    }
+    let chars = text.chars().count() as u16;
+    let estimated = chars.div_ceil(width).saturating_add(2);
+    estimated.clamp(STATUS_BANNER_MIN_HEIGHT, STATUS_BANNER_MAX_HEIGHT)
+}
+
 fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState, status: Option<&Status>) {
     match view_state {
         ViewState::Loading => {
@@ -88,12 +114,15 @@ fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState, status: 
             marked,
         } => {
             let area = if let Some(status) = status {
+                let banner_height = status_banner_height(status.text(), frame.area().width);
                 let outer = Layout::default()
                     .direction(Direction::Vertical)
-                    // 3 rows (not 1) so a long error message — these can nest a whole
-                    // underlying `herdr`/Linear error plus a manual-fallback prompt — wraps
-                    // instead of being silently truncated at terminal width.
-                    .constraints([Constraint::Min(3), Constraint::Length(3)])
+                    // Sized from the message itself (see `status_banner_height`), not a fixed
+                    // `3`, so a long error message — these can nest a whole underlying
+                    // `herdr`/Linear error plus a manual-fallback prompt, or (TF-590) one
+                    // segment per failed issue in a multi-issue run — wraps instead of being
+                    // silently truncated at terminal width.
+                    .constraints([Constraint::Min(3), Constraint::Length(banner_height)])
                     .split(frame.area());
                 let style = if status.is_error() {
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
@@ -381,6 +410,55 @@ mod tests {
 
         let text = rendered_text(&app);
         assert!(text.contains("ENG-1: failed to start agent tab: boom"));
+    }
+
+    #[test]
+    fn status_banner_height_stays_at_the_floor_for_a_short_message() {
+        assert_eq!(
+            status_banner_height("started", 60),
+            STATUS_BANNER_MIN_HEIGHT
+        );
+    }
+
+    #[test]
+    fn status_banner_height_grows_with_message_length() {
+        let long = "x".repeat(500);
+        let height = status_banner_height(&long, 60);
+
+        assert!(height > STATUS_BANNER_MIN_HEIGHT);
+        assert!(height <= STATUS_BANNER_MAX_HEIGHT);
+    }
+
+    #[test]
+    fn status_banner_height_is_clamped_to_a_maximum() {
+        let huge = "x".repeat(10_000);
+        assert_eq!(status_banner_height(&huge, 60), STATUS_BANNER_MAX_HEIGHT);
+    }
+
+    #[test]
+    fn renders_a_long_multi_issue_failure_banner_without_clipping_the_tail() {
+        // Regression guard for the pre-TF-590-fix banner: a fixed 3-row area at width 60 (~180
+        // usable chars) would have clipped a message this long well before its last segment.
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        let details: Vec<String> = (0..8)
+            .map(|i| {
+                format!(
+                    "ENG-{i}: failed to start agent tab: some fairly long underlying herdr error"
+                )
+            })
+            .collect();
+        app.set_status(Status::Error(format!(
+            "2/8 started, {}",
+            details.join("; ")
+        )));
+
+        let text = rendered_text_with_size(&app, 60, 20);
+
+        assert!(
+            text.contains("ENG-7"),
+            "expected the banner's last detail segment to be visible, got: {text}"
+        );
     }
 
     #[test]

@@ -97,7 +97,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Implement-on-`<Enter>`: starting a second issue while an earlier issue's agent tab is
   still running under the same `agent_command` no longer fails with a raw
   `agent_name_taken` internal error. Each issue's `herdr agent start` call now uses a name
-  unique to that issue (the resolved command plus the issue identifier, e.g. `hr-tf-579`)
+  unique to that issue (the resolved command plus the issue identifier, e.g. `hr--tf-579`)
   instead of reusing the bare command string for every issue, and if herdr still reports
   the name as taken, the call retries automatically with one of herdr's suggested
   candidates before giving up (TF-590)

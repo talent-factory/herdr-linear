@@ -1,9 +1,11 @@
 //! Pure decision logic for the "implement this issue" flow triggered by `<Enter>` in an
 //! issue list: deriving the preferred coding agent from other open herdr tabs, resolving
 //! the final agent command, building the shell-wrapped argv to launch it, building the
-//! literal prompt injected once the agent is ready, and picking the right workflow state to
-//! move the issue to. No process/socket access here — see [`crate::plugin::herdr_cli`] for
-//! that; this module only ever sees JSON text and in-memory values.
+//! literal prompt injected once the agent is ready, picking the right workflow state to
+//! move the issue to, and building a per-issue `herdr agent start` name so two issues
+//! implemented under the same `agent_command` don't collide (TF-590, see [`build_agent_name`]).
+//! No process/socket access here — see [`crate::plugin::herdr_cli`] for that; this module only
+//! ever sees JSON text and in-memory values.
 
 use crate::IssueState;
 use serde::Deserialize;
@@ -186,19 +188,30 @@ pub fn prompt_landed(pane_text: &str, prompt: &str) -> bool {
 /// `command` plus the issue's identifier, instead of the bare `command` string being reused
 /// verbatim across every issue.
 ///
-/// Sanitized (lowercased, non-alphanumeric runs collapsed to a single hyphen) since `command`
-/// can itself contain spaces/flags (e.g.
-/// `"headroom wrap claude --memory"`) and issue identifiers use uppercase (e.g. `"TF-579"`),
-/// neither of which herdr's agent names are known to accept.
+/// `command` and `issue_identifier` are sanitized *independently* (see `sanitize_agent_name`)
+/// and joined with a `--` boundary, rather than concatenated first and sanitized as one string.
+/// Sanitizing them together would let the command/identifier boundary itself get swallowed by
+/// hyphen-collapsing, so two genuinely different `(command, issue_identifier)` pairs could
+/// collide on the same generated name — e.g. naively joining then sanitizing
+/// `("a b", "c")` and `("a", "b c")` both collapse to `"a-b-c"`. `sanitize_agent_name` never
+/// itself produces a `--` (it collapses every run of non-alphanumeric characters into a
+/// *single* hyphen and trims the ends), so the `--` here is unambiguously the boundary no
+/// matter what either half contains, and a `(command, issue_identifier)` pair can be recovered
+/// from the result by splitting on the first `--`.
 pub fn build_agent_name(command: &str, issue_identifier: &str) -> String {
-    sanitize_agent_name(&format!("{command}-{issue_identifier}"))
+    format!(
+        "{}--{}",
+        sanitize_agent_name(command),
+        sanitize_agent_name(issue_identifier)
+    )
 }
 
 /// Lowercases `raw` and collapses every run of one-or-more characters outside `[a-z0-9]` into
 /// a single hyphen, trimming leading/trailing hyphens — the character set herdr's own
 /// generated retry `candidates` (e.g. `"hr-2"`) follow, assumed here to be the same set herdr
 /// accepts for `agent start <name>` itself. Falls back to `"agent"` if nothing alphanumeric
-/// survives, so this never returns an empty string.
+/// survives, so this never returns an empty string. Never produces a `--`, which
+/// [`build_agent_name`] relies on to join two sanitized halves unambiguously.
 fn sanitize_agent_name(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for ch in raw.chars() {
@@ -376,7 +389,7 @@ mod tests {
 
     #[test]
     fn build_agent_name_combines_command_and_issue_identifier() {
-        assert_eq!(build_agent_name("hr", "TF-579"), "hr-tf-579");
+        assert_eq!(build_agent_name("hr", "TF-579"), "hr--tf-579");
     }
 
     #[test]
@@ -393,13 +406,28 @@ mod tests {
     fn build_agent_name_sanitizes_spaces_and_flags_in_the_command() {
         assert_eq!(
             build_agent_name("headroom wrap claude --memory", "TF-579"),
-            "headroom-wrap-claude-memory-tf-579"
+            "headroom-wrap-claude-memory--tf-579"
         );
     }
 
     #[test]
     fn build_agent_name_falls_back_when_nothing_alphanumeric_survives() {
-        assert_eq!(build_agent_name("!!!", "###"), "agent");
+        assert_eq!(build_agent_name("!!!", "###"), "agent--agent");
+    }
+
+    #[test]
+    fn build_agent_name_does_not_collide_across_different_command_identifier_boundaries() {
+        // Regression guard: naively sanitizing `"{command}-{issue_identifier}"` as one string
+        // let the command/identifier boundary get swallowed by hyphen-collapsing — different
+        // pairs could produce the same name (e.g. both of these used to sanitize to
+        // `"a-b-c"`). Sanitizing each half independently and joining with `--` (which
+        // `sanitize_agent_name` never itself produces) closes that gap.
+        let a = build_agent_name("a b", "c");
+        let b = build_agent_name("a", "b c");
+
+        assert_ne!(a, b);
+        assert_eq!(a, "a-b--c");
+        assert_eq!(b, "a--b-c");
     }
 
     #[test]

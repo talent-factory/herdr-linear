@@ -847,6 +847,23 @@ mod tests {
     }
 
     #[test]
+    fn set_issues_clears_marks_left_over_from_a_previous_list() {
+        // Regression guard: a second `set_issues` call (e.g. a retry/re-fetch) must reset
+        // `marked` alongside `issues`/`selected`, not just on first entry into the view —
+        // otherwise a stale index could point at the wrong issue (or past the end) in the new
+        // list.
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
+        app.toggle_mark();
+        assert!(app.is_marked(0));
+
+        app.set_issues(vec![sample_issue("ENG-3")]);
+
+        assert!(app.marked_issues().is_empty());
+        assert!(!app.is_marked(0));
+    }
+
+    #[test]
     fn enter_key_with_marked_issues_returns_implement_many_in_list_order() {
         let mut app = app_in_my_issues_view();
         app.set_issues(vec![
