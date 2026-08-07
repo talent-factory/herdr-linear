@@ -19,7 +19,36 @@ pub struct KeyBinding {
     /// Which screen/mode this binding applies in. Entries sharing a `context` must stay
     /// contiguous — `ui::keybindings_lines` groups by context via a single pass over
     /// this table, not a sort, so the table's own order is what's displayed.
-    pub context: &'static str,
+    pub context: BindingContext,
+}
+
+/// Which screen/mode a [`KeyBinding`] applies in. A small `Copy` enum rather than a
+/// free-form string (follow-up review fix, TF-585 code review): makes the "entries
+/// sharing a context must be contiguous" invariant a matter of comparing enum variants —
+/// immune to a near-duplicate string typo (e.g. `"Error screen"` vs `"Error Screen"`)
+/// silently producing a second, misplaced heading in the rendered Keybindings tab — and
+/// centralizes the heading text [`Self::label`] renders in one place instead of
+/// repeating it as a literal at every entry that shares a context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BindingContext {
+    Menu,
+    View,
+    Filtering,
+    ErrorScreen,
+    Global,
+}
+
+impl BindingContext {
+    /// The heading text shown above this context's bindings in the Keybindings tab.
+    pub fn label(self) -> &'static str {
+        match self {
+            BindingContext::Menu => "Menu",
+            BindingContext::View => "View",
+            BindingContext::Filtering => "Filtering",
+            BindingContext::ErrorScreen => "Error screen",
+            BindingContext::Global => "Global",
+        }
+    }
 }
 
 /// Every keybinding currently implemented in `app::handle_key`, grouped by context in
@@ -29,97 +58,97 @@ pub static KEYBINDINGS: &[KeyBinding] = &[
     KeyBinding {
         keys: "↑ / ↓",
         action: "Move selection",
-        context: "Menu",
+        context: BindingContext::Menu,
     },
     KeyBinding {
         keys: "<Enter>",
         action: "Open highlighted view",
-        context: "Menu",
+        context: BindingContext::Menu,
     },
     KeyBinding {
         keys: "q / Esc",
         action: "Quit",
-        context: "Menu",
+        context: BindingContext::Menu,
     },
     KeyBinding {
         keys: "↑ / ↓",
         action: "Move selection",
-        context: "View",
+        context: BindingContext::View,
     },
     KeyBinding {
         keys: "/",
         action: "Filter issues by title/identifier",
-        context: "View",
+        context: BindingContext::View,
     },
     KeyBinding {
         keys: "o",
         action: "Open selected issue in browser",
-        context: "View",
+        context: BindingContext::View,
     },
     KeyBinding {
         keys: "<Space>",
         action: "Mark/unmark issue for multi-select",
-        context: "View",
+        context: BindingContext::View,
     },
     KeyBinding {
         keys: "<Enter>",
         action: "Implement selected (or every marked) issue",
-        context: "View",
+        context: BindingContext::View,
     },
     KeyBinding {
         keys: "Esc",
         action: "Back to menu",
-        context: "View",
+        context: BindingContext::View,
     },
     KeyBinding {
         keys: "q",
         action: "Quit",
-        context: "View",
+        context: BindingContext::View,
     },
     KeyBinding {
         keys: "<Enter>",
         action: "Confirm filter",
-        context: "Filtering",
+        context: BindingContext::Filtering,
     },
     KeyBinding {
         keys: "Esc",
         action: "Cancel filter, restore full list",
-        context: "Filtering",
+        context: BindingContext::Filtering,
     },
     KeyBinding {
         keys: "Backspace",
         action: "Remove last filter character",
-        context: "Filtering",
+        context: BindingContext::Filtering,
     },
     KeyBinding {
         keys: "↑ / ↓",
         action: "Move selection while typing",
-        context: "Filtering",
+        context: BindingContext::Filtering,
     },
     KeyBinding {
         keys: "(any character)",
         action: "Add to filter query",
-        context: "Filtering",
+        context: BindingContext::Filtering,
     },
     KeyBinding {
         keys: "r",
         action: "Retry",
-        context: "Error screen",
+        context: BindingContext::ErrorScreen,
     },
     KeyBinding {
         keys: "c",
         action: "Open config.toml",
-        context: "Error screen",
+        context: BindingContext::ErrorScreen,
     },
     KeyBinding {
         keys: "?",
         action: "Toggle this help overlay",
-        context: "Global",
+        context: BindingContext::Global,
     },
     KeyBinding {
         keys: "Ctrl+C",
         action: "Quit",
-        context: "Global",
+        context: BindingContext::Global,
     },
 ];
 
@@ -129,14 +158,26 @@ mod tests {
 
     #[test]
     fn keybindings_is_non_empty_and_every_entry_has_no_blank_fields() {
+        // `context` needs no emptiness check since the follow-up review fix (TF-585):
+        // it's a `BindingContext` enum now, not a free-form string, so every value is
+        // one of a known, always-non-empty set of variants by construction.
         assert!(!KEYBINDINGS.is_empty());
         for binding in KEYBINDINGS {
             assert!(!binding.keys.is_empty(), "empty `keys` in {binding:?}");
             assert!(!binding.action.is_empty(), "empty `action` in {binding:?}");
-            assert!(
-                !binding.context.is_empty(),
-                "empty `context` in {binding:?}"
-            );
+        }
+    }
+
+    #[test]
+    fn every_binding_context_has_a_non_empty_label() {
+        for context in [
+            BindingContext::Menu,
+            BindingContext::View,
+            BindingContext::Filtering,
+            BindingContext::ErrorScreen,
+            BindingContext::Global,
+        ] {
+            assert!(!context.label().is_empty(), "empty label for {context:?}");
         }
     }
 

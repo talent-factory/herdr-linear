@@ -288,14 +288,14 @@ fn about_lines() -> Vec<String> {
 /// Global) is what's shown, not an alphabetized one.
 fn keybindings_lines() -> Vec<String> {
     let mut lines = Vec::new();
-    let mut last_context: Option<&str> = None;
+    let mut last_context: Option<crate::plugin::keybindings::BindingContext> = None;
 
     for binding in crate::plugin::keybindings::KEYBINDINGS {
         if last_context != Some(binding.context) {
             if last_context.is_some() {
                 lines.push(String::new());
             }
-            lines.push(format!("{}:", binding.context));
+            lines.push(format!("{}:", binding.context.label()));
             last_context = Some(binding.context);
         }
         lines.push(format!("  {:<10} {}", binding.keys, binding.action));
