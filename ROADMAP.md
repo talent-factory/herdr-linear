@@ -53,7 +53,6 @@ rather than only ever showing "my issues". Tracked as issues in the
 - [ ] Detect the Linear project for the current working directory (git
       repo → Linear project mapping) and show its open issues
 - [ ] Issue search/filter within the panel (fzf-style)
-- [ ] Create issue from the plugin
 
 ### Phase 1.5: Polish & Stability
 

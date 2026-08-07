@@ -34,7 +34,7 @@ expand):
   disabled until those issues land.
 - CWD → Linear-project detection (TF-577) — not needed yet since Project Issues isn't
   selectable.
-- In-list search/filter (TF-580), issue creation (TF-581).
+- In-list search/filter (TF-580).
 - Remembering the last-selected menu entry across app runs, or across an `Esc` back-to-menu
   (menu always resets to entry 0) — not worth the state for a 3-item menu.
 

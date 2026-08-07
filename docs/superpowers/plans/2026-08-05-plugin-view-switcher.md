@@ -15,7 +15,7 @@
 - Must pass the project's quality gate: `cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features -- --nocapture` (`just fmt` / `just lint` / `just test` / `just check`).
 - Commit messages follow this repo's existing plain conventional-commit style (`feat: ...`, `docs: ...`, lower-case, no emoji, no scope required) — see `git log`. Do not use the emoji-conventional-commits style from generic templates.
 - Design spec: `docs/superpowers/specs/2026-08-05-view-switcher-design.md`. Linear: [TF-576](https://linear.app/talent-factory/issue/TF-576).
-- Out of scope, do not implement here: CWD → Linear-project detection (TF-577), actually fetching Project/Team issues (TF-578/TF-579), in-list search (TF-580), issue creation (TF-581). `ProjectIssues`/`TeamIssues` stay visible-but-disabled in the menu.
+- Out of scope, do not implement here: CWD → Linear-project detection (TF-577), actually fetching Project/Team issues (TF-578/TF-579), in-list search (TF-580). `ProjectIssues`/`TeamIssues` stay visible-but-disabled in the menu.
 
 ---
 
