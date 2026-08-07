@@ -1396,6 +1396,57 @@ mod tests {
         assert!(text.contains(env!("CARGO_PKG_VERSION")));
     }
 
+    /// Follow-up review fix (TF-585): the About tab was the only one ever rendered
+    /// end-to-end through `handle_key` + `rendered_text_with_size` — Keybindings and
+    /// Settings (below) were exercised only at the `*_lines()`/`*_lines_from()` function
+    /// level, never through the full `draw_help_overlay` render path. This confirms the
+    /// Keybindings tab actually renders every entry from the canonical registry, not
+    /// just that `keybindings_lines()` in isolation contains them.
+    #[test]
+    fn help_overlay_renders_the_keybindings_tab_with_every_registered_binding() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('2'), KeyModifiers::NONE); // -> Keybindings
+
+        let text = rendered_text_with_size(&app, 100, 40);
+
+        assert!(text.contains("> Keybindings"));
+        for binding in crate::plugin::keybindings::KEYBINDINGS {
+            assert!(
+                text.contains(binding.action),
+                "rendered Keybindings tab is missing action `{}`",
+                binding.action
+            );
+        }
+    }
+
+    /// Companion to the above for the Settings tab — the one tab whose content is
+    /// produced by `settings_lines()`, the impure wrapper that reads
+    /// `HERDR_PLUGIN_CONFIG_DIR`/`LINEAR_API_KEY` from the real environment (previously
+    /// never called by any test; only its pure half `settings_lines_from` was, with
+    /// injected data). Deliberately doesn't set or clear those env vars — mutating them
+    /// would risk interfering with other tests running in parallel in the same process
+    /// (this crate's established convention throughout `config.rs` is to leave impure
+    /// env-reading wrappers untested for exactly that reason) — so this only asserts the
+    /// field labels `settings_lines_from` always emits regardless of what's actually
+    /// resolved, which is enough to confirm `settings_lines()` really is wired through to
+    /// a real render, not just its pure half in isolation.
+    #[test]
+    fn help_overlay_renders_the_settings_tab_via_the_real_config_wiring() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('3'), KeyModifiers::NONE); // -> Settings
+
+        let text = rendered_text_with_size(&app, 100, 40);
+
+        assert!(text.contains("> Settings"));
+        assert!(text.contains("Location:"));
+        assert!(text.contains("api_key"));
+        assert!(text.contains("agent_command"));
+        assert!(text.contains("team_id"));
+        assert!(text.contains("project_overrides"));
+    }
+
     #[test]
     fn help_overlay_closes_and_the_underlying_screen_reappears_unchanged() {
         let mut app = app_in_my_issues_view();

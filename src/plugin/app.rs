@@ -2068,6 +2068,54 @@ mod tests {
         assert_eq!(app.help_overlay().unwrap().scroll, 1);
     }
 
+    /// Follow-up review fix (TF-585): every other scroll test either scrolls on the
+    /// default `WhatsNew` tab (via `handle_key`, so it already routes through the real
+    /// `ui::content_line_count`) or scrolls via `App::help_overlay_scroll_down` directly
+    /// with a hand-picked literal (bypassing `ui::content_line_count` entirely). Neither
+    /// exercises the real `content_line_count(HelpTab::Keybindings)` /
+    /// `content_line_count(HelpTab::Settings)` production wiring the `j`/`k` handler
+    /// actually calls for those tabs. This test does, via `handle_key`, for
+    /// `Keybindings` — a purely static, env-independent tab, so the assertions are exact
+    /// rather than merely "didn't panic".
+    #[test]
+    fn j_and_k_scroll_while_the_overlay_is_open_on_the_keybindings_tab() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('2'), KeyModifiers::NONE); // -> Keybindings
+        assert_eq!(app.help_overlay().unwrap().tab, HelpTab::Keybindings);
+
+        handle_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(app.help_overlay().unwrap().scroll, 2);
+
+        handle_key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+        assert_eq!(app.help_overlay().unwrap().scroll, 1);
+    }
+
+    /// Companion to the above for the `Settings` tab specifically — the one tab whose
+    /// content depends on the real environment (`settings_lines()` reads
+    /// `HERDR_PLUGIN_CONFIG_DIR`/`LINEAR_API_KEY`). Deliberately doesn't mutate those env
+    /// vars (this crate's established convention — see `config.rs`'s untested impure
+    /// wrappers — avoids the flakiness of env-var mutation across parallel test threads),
+    /// so this only asserts scroll moves at all and never goes negative, not exact
+    /// offsets; `settings_lines_from` (tested separately, with injected data) always
+    /// produces at least a handful of lines regardless of what's actually resolved, so
+    /// `content_line_count(HelpTab::Settings)` is always callable here without panicking.
+    #[test]
+    fn j_and_k_scroll_while_the_overlay_is_open_on_the_settings_tab() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('3'), KeyModifiers::NONE); // -> Settings
+        assert_eq!(app.help_overlay().unwrap().tab, HelpTab::Settings);
+
+        handle_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        let after_down = app.help_overlay().unwrap().scroll;
+        assert!(after_down >= 1, "expected `j` to move scroll off zero");
+
+        handle_key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+        assert_eq!(app.help_overlay().unwrap().scroll, after_down - 1);
+    }
+
     #[test]
     fn esc_closes_the_overlay() {
         let mut app = App::new();
