@@ -621,8 +621,8 @@ fn is_buffered_quit_key(
 /// (`Action::Implement` / `Action::ImplementMany`) ran, so a buffered `<Enter>` doesn't replay
 /// as a fresh action once we're back to polling. Every step in that flow has its own bound —
 /// `agent_wait`'s own budget (up to 30s plus retry buffer), `get_workflow_states`/
-/// `update_issue`'s 30s HTTP timeout each, `tab_create`/`agent_send`/`agent_list` at
-/// `DEFAULT_CLI_TIMEOUT` (15s) each, and `agent_start` at up to `DEFAULT_CLI_TIMEOUT` times
+/// `update_issue`'s 30s HTTP timeout each, `tab_create`/`pane_close`/`agent_send`/`agent_list`
+/// at `DEFAULT_CLI_TIMEOUT` (15s) each, and `agent_start` at up to `DEFAULT_CLI_TIMEOUT` times
 /// `1 + AGENT_START_NAME_TAKEN_MAX_RETRIES` (TF-590's `agent_name_taken` retry loop, ~45s
 /// worst case, not a flat 15s) — but they're sequential (and, for `Action::ImplementMany`,
 /// repeated once per marked issue — TF-590), so the flow as a whole can run well past any
