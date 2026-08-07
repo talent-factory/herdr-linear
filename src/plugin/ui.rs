@@ -431,18 +431,93 @@ fn settings_lines_from(summary: &crate::plugin::config::ResolvedConfigSummary) -
     lines
 }
 
-/// The line count of `tab`'s content — the same match `draw_help_overlay` uses to pick
-/// which tab's content function to call, but returning just the length. Lets
-/// `App::help_overlay_scroll_down` (final-review fix, TF-585) clamp the stored scroll
-/// offset against the active tab's actual content, since that length is otherwise only
-/// known here in `ui.rs`.
+/// The *rendered* row count of `tab`'s content — the number of terminal rows it will
+/// actually occupy once `draw_help_overlay` wraps it with `Wrap { trim: false }`, not
+/// just the number of logical `\n`-separated entries. Lets `App::help_overlay_scroll_down`
+/// (final-review fix, TF-585) clamp the stored scroll offset against what will really be
+/// on screen, since that's otherwise only known here in `ui.rs`.
+///
+/// Follow-up review fix (TF-585): this used to return the raw `Vec<String>` length —
+/// correct only if every entry is short enough to never wrap. `ratatui::Paragraph::scroll`
+/// offsets by *rendered* rows, so any tab with a line wider than the popup (plausible for
+/// `whats_new_lines()`, which pulls raw prose from `CHANGELOG.md`) would have more visual
+/// rows than the old count reported — clamping `j`/`↓` short of the real end and making
+/// the tail of that tab's content permanently unreachable. This estimates wrapped rows via
+/// [`word_wrapped_row_count`] against [`CONSERVATIVE_WRAP_WIDTH`] instead of the real,
+/// dynamic terminal width — `App` is deliberately kept unaware of terminal size (it stays
+/// a plain, headlessly-testable key-event state machine), and the assumed width being
+/// narrower than any realistic terminal's popup content area means this can only
+/// *over*-estimate rows relative to the true, wider render (greedy word-wrap needs the
+/// same or more rows at a narrower width, never fewer), which is the safe direction: a
+/// few extra scrollable rows land on the same last screen `Paragraph::scroll` already
+/// clips gracefully, rather than the real bug this guards against — under-counting, which
+/// would make content unreachable.
 pub(crate) fn content_line_count(tab: HelpTab) -> usize {
-    match tab {
-        HelpTab::WhatsNew => whats_new_lines().len(),
-        HelpTab::Keybindings => keybindings_lines().len(),
-        HelpTab::Settings => settings_lines().len(),
-        HelpTab::About => about_lines().len(),
+    let lines = match tab {
+        HelpTab::WhatsNew => whats_new_lines(),
+        HelpTab::Keybindings => keybindings_lines(),
+        HelpTab::Settings => settings_lines(),
+        HelpTab::About => about_lines(),
+    };
+    lines
+        .iter()
+        .map(|line| word_wrapped_row_count(line, CONSERVATIVE_WRAP_WIDTH))
+        .sum()
+}
+
+/// Assumed content width (columns) used only to keep [`content_line_count`]'s
+/// scroll-clamp ceiling from running out ahead of the real, wrapped render — see that
+/// function's doc comment for why a narrower-than-real assumption is the safe direction.
+/// The popup itself is `centered_rect(80, 90, frame.area())`'s width, minus 2 columns for
+/// the bordered `Block`; even an unusually narrow 40-column terminal still leaves
+/// `40 * 0.8 - 2 = 30` columns of real content width, so this stays at or below that for
+/// a comfortable margin without being so small the estimate balloons needlessly.
+const CONSERVATIVE_WRAP_WIDTH: usize = 28;
+
+/// The number of rows a single logical `line` would occupy once greedily word-wrapped to
+/// at most `width` columns — closely mirroring how ratatui's `Wrap` widget breaks text
+/// (pack space-separated words; when the next word wouldn't fit, start a new row; a lone
+/// word wider than `width` on its own is hard-broken across `word_len.div_ceil(width)`
+/// rows). An empty line still occupies exactly one (blank) row, matching how a blank line
+/// renders. Deliberately approximate — see [`content_line_count`] for why an
+/// approximation biased toward *over*-counting rows is the safe choice here, not a bug.
+fn word_wrapped_row_count(line: &str, width: usize) -> usize {
+    let width = width.max(1);
+    if line.is_empty() {
+        return 1;
     }
+
+    let mut rows = 1usize;
+    let mut col = 0usize; // columns used so far on the current row
+
+    for word in line.split(' ') {
+        let word_len = word.chars().count();
+
+        if word_len > width {
+            // A single word wider than the whole row: hard-break it across its own
+            // rows, then carry on with whatever comes after it on a fresh row.
+            if col > 0 {
+                rows += 1;
+            }
+            rows += word_len.div_ceil(width) - 1;
+            col = word_len - (word_len.div_ceil(width) - 1) * width;
+            continue;
+        }
+
+        let needed = if col == 0 {
+            word_len
+        } else {
+            col + 1 + word_len
+        };
+        if needed <= width {
+            col = needed;
+        } else {
+            rows += 1;
+            col = word_len;
+        }
+    }
+
+    rows
 }
 
 /// Renders the help overlay (`?` — TF-585) on top of whatever `draw` already drew for
@@ -978,6 +1053,55 @@ mod tests {
         let heading_count = lines.iter().filter(|line| *line == "Menu:").count();
 
         assert_eq!(heading_count, 1);
+    }
+
+    #[test]
+    fn word_wrapped_row_count_is_one_for_an_empty_line() {
+        assert_eq!(word_wrapped_row_count("", 28), 1);
+    }
+
+    #[test]
+    fn word_wrapped_row_count_is_one_when_the_line_fits_within_width() {
+        assert_eq!(word_wrapped_row_count("a short line", 28), 1);
+    }
+
+    #[test]
+    fn word_wrapped_row_count_wraps_at_a_word_boundary_not_mid_word() {
+        // "one two three" is 13 chars; at width 8, "one two" (7 chars) fits but adding
+        // "three" wouldn't (7 + 1 + 5 = 13 > 8), so it must wrap before "three", not
+        // mid-word.
+        assert_eq!(word_wrapped_row_count("one two three", 8), 2);
+    }
+
+    #[test]
+    fn word_wrapped_row_count_hard_breaks_a_single_word_wider_than_width() {
+        let word = "a".repeat(65);
+        assert_eq!(word_wrapped_row_count(&word, 28), 3); // ceil(65 / 28) == 3
+    }
+
+    #[test]
+    fn word_wrapped_row_count_continues_correctly_after_a_hard_broken_word() {
+        let line = format!("short {}", "a".repeat(65));
+        // "short" (row 1) then the 65-char word can't fit in the remaining space, so it
+        // starts its own fresh row and needs ceil(65/28) = 3 rows of its own: 1 + 3 = 4.
+        assert_eq!(word_wrapped_row_count(&line, 28), 4);
+    }
+
+    /// Follow-up review fix (TF-585): `content_line_count` used to be the raw
+    /// `Vec&lt;String&gt;` entry count, which under-counts whenever a tab has a line wider
+    /// than the popup — the exact scenario that made the scroll clamp stop short of a
+    /// tab's real end. Confirms the fix: a single very long entry now contributes more
+    /// than one row to the estimate, not one.
+    #[test]
+    fn content_line_count_accounts_for_wrapping_of_a_long_line() {
+        let long_line = "word ".repeat(40); // far wider than any realistic popup content
+
+        let wrapped_rows = word_wrapped_row_count(&long_line, CONSERVATIVE_WRAP_WIDTH);
+
+        assert!(
+            wrapped_rows > 1,
+            "expected wrapping to inflate the row count beyond the raw entry count of 1"
+        );
     }
 
     #[test]
