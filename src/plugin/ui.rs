@@ -2,13 +2,14 @@
 //! message with a retry hint, or a two-pane issue list + detail view.
 
 use crate::plugin::app::{
-    matching_issue_indices, App, Screen, Status, ViewKind, ViewState, MENU_OPTIONS,
+    matching_issue_indices, App, HelpOverlayState, HelpTab, Screen, Status, ViewKind, ViewState,
+    MENU_OPTIONS,
 };
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Text},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
 
@@ -16,6 +17,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     match app.screen() {
         Screen::Menu { selected } => draw_menu(frame, *selected),
         Screen::View(kind, view_state) => draw_view(frame, *kind, view_state, app.status()),
+    }
+    if let Some(overlay) = app.help_overlay() {
+        draw_help_overlay(frame, overlay);
     }
 }
 
@@ -425,6 +429,82 @@ fn settings_lines_from(summary: &crate::plugin::config::ResolvedConfigSummary) -
     }
 
     lines
+}
+
+/// Renders the help overlay (`?` — TF-585) on top of whatever `draw` already drew for
+/// the current screen: `Clear` the area first (ratatui doesn't blank a widget's
+/// background on its own — without this, stale content from beneath shows through
+/// wherever this frame's text doesn't happen to overwrite it), then the tab bar +
+/// scrollable body + footer, matching the herdr-file-viewer reference screenshot this
+/// design follows.
+fn draw_help_overlay(frame: &mut Frame, overlay: &HelpOverlayState) {
+    let area = centered_rect(80, 90, frame.area());
+    frame.render_widget(Clear, area);
+
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(area);
+
+    let title = HelpTab::ALL
+        .iter()
+        .map(|&tab| {
+            if tab == overlay.tab {
+                format!("> {}", tab.title())
+            } else {
+                tab.title().to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("   ");
+
+    let content = match overlay.tab {
+        HelpTab::WhatsNew => whats_new_lines(),
+        HelpTab::Keybindings => keybindings_lines(),
+        HelpTab::Settings => settings_lines(),
+        HelpTab::About => about_lines(),
+    }
+    .join("\n");
+
+    let body = Paragraph::new(content)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("Help: {title}")),
+        )
+        .wrap(Wrap { trim: false })
+        .scroll((overlay.scroll, 0));
+    frame.render_widget(body, outer[0]);
+
+    let footer = Paragraph::new("Tab/←→ switch · 1-4 jump · j/k scroll · Esc/q/? close")
+        .style(Style::default().add_modifier(Modifier::DIM));
+    frame.render_widget(footer, outer[1]);
+}
+
+/// A `Rect` centered within `area`, `percent_width`/`percent_height` of its size — the
+/// standard ratatui popup-centering recipe (two nested percentage-based `Layout` splits,
+/// taking the middle cell of each).
+fn centered_rect(
+    percent_width: u16,
+    percent_height: u16,
+    area: ratatui::layout::Rect,
+) -> ratatui::layout::Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_height) / 2),
+            Constraint::Percentage(percent_height),
+            Constraint::Percentage((100 - percent_height) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_width) / 2),
+            Constraint::Percentage(percent_width),
+            Constraint::Percentage((100 - percent_width) / 2),
+        ])
+        .split(vertical[1])[1]
 }
 
 #[cfg(test)]
@@ -1035,5 +1115,64 @@ mod tests {
         assert!(lines.contains("is invalid"));
         assert!(lines.contains("not valid TOML"));
         assert!(lines.contains("✗ Not set"));
+    }
+
+    #[test]
+    fn help_overlay_renders_on_top_of_the_menu_when_open() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        let text = rendered_text_with_size(&app, 100, 30);
+
+        assert!(text.contains("Help:"));
+        assert!(text.contains("What's New"));
+        assert!(text.contains("Keybindings"));
+        assert!(text.contains("Settings"));
+        assert!(text.contains("About"));
+    }
+
+    #[test]
+    fn help_overlay_marks_the_active_tab() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        let text = rendered_text_with_size(&app, 100, 30);
+
+        assert!(text.contains("> What's New"));
+    }
+
+    #[test]
+    fn help_overlay_shows_the_footer_controls() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        let text = rendered_text_with_size(&app, 100, 30);
+
+        assert!(text.contains("close"));
+    }
+
+    #[test]
+    fn help_overlay_switches_tab_content_on_number_jump() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('4'), KeyModifiers::NONE); // -> About
+
+        let text = rendered_text_with_size(&app, 100, 30);
+
+        assert!(text.contains("> About"));
+        assert!(text.contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn help_overlay_closes_and_the_underlying_screen_reappears_unchanged() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+        let text = rendered_text(&app);
+        assert!(!text.contains("Help:"));
+        assert!(text.contains("ENG-1"));
     }
 }
