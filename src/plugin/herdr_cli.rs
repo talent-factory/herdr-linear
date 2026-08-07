@@ -227,6 +227,40 @@ fn is_missing_result_response(error: &Error) -> bool {
 /// call-specific bound in [`agent_wait`] instead of using this constant.
 const DEFAULT_CLI_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Max attempts and per-attempt backoff for [`spawn_with_etxtbsy_retry`]'s retry loop —
+/// `ETXTBSY` always resolves on its own once whatever briefly held the executable open
+/// for writing lets go, so a handful of short retries reliably rides out the window
+/// without meaningfully affecting real (non-`ETXTBSY`) latency.
+const ETXTBSY_MAX_RETRIES: u32 = 5;
+const ETXTBSY_RETRY_DELAY: Duration = Duration::from_millis(20);
+
+/// Spawns `herdr_bin args`, retrying up to [`ETXTBSY_MAX_RETRIES`] times with a short
+/// delay if the OS reports `ErrorKind::ExecutableFileBusy` ("text file busy" / `ETXTBSY`)
+/// — a transient condition (something else has the executable open for writing at the
+/// exact instant of `execve`), not a real, persistent failure. Most reliably hit by this
+/// crate's own tests, which write and `chmod` a fresh fake `herdr` script then exec it
+/// almost immediately (a known kernel/VFS race on some CI filesystems) — but the same
+/// condition could in principle hit a real `herdr` binary that's mid-reinstall/update at
+/// the exact moment this runs, so the retry lives here rather than only in test scaffolding.
+async fn spawn_with_etxtbsy_retry(
+    herdr_bin: &str,
+    args: &[&str],
+) -> std::io::Result<std::process::Output> {
+    let mut attempt = 0;
+    loop {
+        match Command::new(herdr_bin).args(args).output().await {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && attempt < ETXTBSY_MAX_RETRIES =>
+            {
+                attempt += 1;
+                tokio::time::sleep(ETXTBSY_RETRY_DELAY).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Run a `herdr` CLI subcommand, bounded by `call_timeout`, returning the parsed `result` field
 /// on success. See [`interpret_output`] for the success/failure mapping.
 async fn run_with_timeout(
@@ -237,7 +271,7 @@ async fn run_with_timeout(
 ) -> Result<Value> {
     let command_desc = format!("{herdr_bin} {}", args.join(" "));
 
-    let output = tokio::time::timeout(call_timeout, Command::new(herdr_bin).args(args).output())
+    let output = tokio::time::timeout(call_timeout, spawn_with_etxtbsy_retry(herdr_bin, args))
         .await
         .map_err(|_| {
             Error::Internal(format!(
