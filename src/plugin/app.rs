@@ -228,6 +228,18 @@ impl HelpTab {
     }
 }
 
+/// State of the in-app help overlay (`?` — TF-585) while open. `None` on [`App`] means
+/// closed — see [`App::help_overlay`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HelpOverlayState {
+    /// The currently active tab.
+    pub tab: HelpTab,
+    /// Vertical scroll offset into the active tab's content, in lines. Reset to `0` on
+    /// every tab switch — each tab's content is independent, so a scroll position from
+    /// one tab is meaningless on another.
+    pub scroll: u16,
+}
+
 /// The main application state container.
 ///
 /// Manages transitions between the menu and views, and navigation within a loaded
@@ -237,6 +249,9 @@ pub struct App {
     screen: Screen,
     /// The current status banner, if any. See [`Status`].
     status: Option<Status>,
+    /// The help overlay's state, if open (`?` — TF-585). A pure rendering layer over
+    /// `screen`, never `Screen` itself — see [`Self::open_help_overlay`].
+    help_overlay: Option<HelpOverlayState>,
 }
 
 impl App {
@@ -245,6 +260,7 @@ impl App {
         Self {
             screen: Screen::Menu { selected: 0 },
             status: None,
+            help_overlay: None,
         }
     }
 
@@ -550,6 +566,71 @@ impl App {
     /// Clears the status banner.
     pub fn clear_status(&mut self) {
         self.status = None;
+    }
+
+    /// The help overlay's state, if open. `None` means closed — the underlying screen
+    /// renders exactly as it would without this feature.
+    pub fn help_overlay(&self) -> Option<&HelpOverlayState> {
+        self.help_overlay.as_ref()
+    }
+
+    /// Opens the help overlay on its default tab (`WhatsNew`) with scroll reset to the
+    /// top. Reopening after a close always starts fresh — no previous tab/scroll is
+    /// remembered (not requested by TF-585's acceptance criteria).
+    pub fn open_help_overlay(&mut self) {
+        self.help_overlay = Some(HelpOverlayState::default());
+    }
+
+    /// Closes the help overlay, restoring the underlying screen exactly as it was — the
+    /// overlay is a pure rendering layer over `screen`, never `Screen` itself, so
+    /// there's nothing else to restore.
+    pub fn close_help_overlay(&mut self) {
+        self.help_overlay = None;
+    }
+
+    /// Switches to the next tab (`Tab`/`→`), wrapping from `About` back to `WhatsNew`,
+    /// and resets scroll to the top. No-op if the overlay is closed.
+    pub fn help_overlay_switch_tab_forward(&mut self) {
+        if let Some(state) = &mut self.help_overlay {
+            state.tab = state.tab.next();
+            state.scroll = 0;
+        }
+    }
+
+    /// Switches to the previous tab (`←`), wrapping from `WhatsNew` back to `About`, and
+    /// resets scroll to the top. No-op if the overlay is closed.
+    pub fn help_overlay_switch_tab_back(&mut self) {
+        if let Some(state) = &mut self.help_overlay {
+            state.tab = state.tab.prev();
+            state.scroll = 0;
+        }
+    }
+
+    /// Jumps directly to `tab` (bound to `1`-`4`) and resets scroll to the top. No-op if
+    /// the overlay is closed.
+    pub fn help_overlay_jump_tab(&mut self, tab: HelpTab) {
+        if let Some(state) = &mut self.help_overlay {
+            state.tab = tab;
+            state.scroll = 0;
+        }
+    }
+
+    /// Scrolls the current tab's content down one line (`j`/`↓`). No-op if the overlay
+    /// is closed. Unbounded at the bottom end — `ratatui::widgets::Paragraph::scroll`
+    /// clips gracefully past the end of its content, so there's no need to know each
+    /// tab's exact line count here just to clamp against it.
+    pub fn help_overlay_scroll_down(&mut self) {
+        if let Some(state) = &mut self.help_overlay {
+            state.scroll = state.scroll.saturating_add(1);
+        }
+    }
+
+    /// Scrolls the current tab's content up one line (`k`/`↑`), clamped at the top.
+    /// No-op if the overlay is closed.
+    pub fn help_overlay_scroll_up(&mut self) {
+        if let Some(state) = &mut self.help_overlay {
+            state.scroll = state.scroll.saturating_sub(1);
+        }
     }
 }
 
@@ -1713,5 +1794,116 @@ mod tests {
         for tab in HelpTab::ALL {
             assert!(!tab.title().is_empty());
         }
+    }
+
+    #[test]
+    fn app_starts_with_the_help_overlay_closed() {
+        let app = App::new();
+        assert_eq!(app.help_overlay(), None);
+    }
+
+    #[test]
+    fn open_help_overlay_starts_on_whats_new_with_scroll_at_zero() {
+        let mut app = App::new();
+
+        app.open_help_overlay();
+
+        assert_eq!(
+            app.help_overlay(),
+            Some(&HelpOverlayState {
+                tab: HelpTab::WhatsNew,
+                scroll: 0
+            })
+        );
+    }
+
+    #[test]
+    fn close_help_overlay_clears_it() {
+        let mut app = App::new();
+        app.open_help_overlay();
+
+        app.close_help_overlay();
+
+        assert_eq!(app.help_overlay(), None);
+    }
+
+    #[test]
+    fn switch_tab_forward_cycles_and_resets_scroll() {
+        let mut app = App::new();
+        app.open_help_overlay();
+        app.help_overlay_scroll_down();
+
+        app.help_overlay_switch_tab_forward();
+
+        assert_eq!(
+            app.help_overlay(),
+            Some(&HelpOverlayState {
+                tab: HelpTab::Keybindings,
+                scroll: 0
+            })
+        );
+    }
+
+    #[test]
+    fn switch_tab_back_cycles_and_resets_scroll() {
+        let mut app = App::new();
+        app.open_help_overlay();
+
+        app.help_overlay_switch_tab_back();
+
+        assert_eq!(
+            app.help_overlay(),
+            Some(&HelpOverlayState {
+                tab: HelpTab::About,
+                scroll: 0
+            })
+        );
+    }
+
+    #[test]
+    fn jump_tab_sets_the_tab_directly_and_resets_scroll() {
+        let mut app = App::new();
+        app.open_help_overlay();
+        app.help_overlay_scroll_down();
+
+        app.help_overlay_jump_tab(HelpTab::Settings);
+
+        assert_eq!(
+            app.help_overlay(),
+            Some(&HelpOverlayState {
+                tab: HelpTab::Settings,
+                scroll: 0
+            })
+        );
+    }
+
+    #[test]
+    fn scroll_down_then_up_returns_to_zero_and_does_not_go_negative() {
+        let mut app = App::new();
+        app.open_help_overlay();
+
+        app.help_overlay_scroll_up(); // already at 0 — must not underflow/panic
+        assert_eq!(app.help_overlay().unwrap().scroll, 0);
+
+        app.help_overlay_scroll_down();
+        app.help_overlay_scroll_down();
+        assert_eq!(app.help_overlay().unwrap().scroll, 2);
+
+        app.help_overlay_scroll_up();
+        assert_eq!(app.help_overlay().unwrap().scroll, 1);
+    }
+
+    #[test]
+    fn help_overlay_mutators_are_no_ops_when_closed() {
+        let mut app = App::new();
+
+        app.help_overlay_switch_tab_forward();
+        app.help_overlay_switch_tab_back();
+        app.help_overlay_jump_tab(HelpTab::About);
+        app.help_overlay_scroll_down();
+        app.help_overlay_scroll_up();
+        app.close_help_overlay();
+
+        assert_eq!(app.help_overlay(), None);
     }
 }
