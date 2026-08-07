@@ -300,6 +300,76 @@ fn keybindings_lines() -> Vec<String> {
     lines
 }
 
+/// Everything between `heading` (matched verbatim, must be a full `## ...` heading line
+/// present in `text`) and the next `## ` heading (or end of `text`), with leading/
+/// trailing blank lines trimmed off (interior blank lines between entries are kept).
+/// `None` if `heading` isn't found, or if the section is empty after trimming — both
+/// read as "nothing here" to callers (see `whats_new_lines_from`, which falls back to
+/// the next section in either case).
+fn extract_section_after(text: &str, heading: &str) -> Option<Vec<String>> {
+    let start = text.find(heading)?;
+    let after_heading = &text[start + heading.len()..];
+    let end = after_heading.find("\n## ").unwrap_or(after_heading.len());
+    let body: Vec<&str> = after_heading[..end].lines().collect();
+
+    let first_non_blank = body.iter().position(|line| !line.trim().is_empty())?;
+    let last_non_blank = body.iter().rposition(|line| !line.trim().is_empty())?;
+    Some(
+        body[first_non_blank..=last_non_blank]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    )
+}
+
+/// The What's New tab's content (TF-585): the current version as a heading, followed by
+/// `CHANGELOG.md`'s `[Unreleased]` entries — embedded at compile time via `include_str!`
+/// so the plugin binary never depends on `CHANGELOG.md` being present at runtime (it
+/// isn't; nothing ships the source repo alongside the built binary).
+fn whats_new_lines() -> Vec<String> {
+    whats_new_lines_from(include_str!("../../CHANGELOG.md"))
+}
+
+/// Pure half of [`whats_new_lines`], taking the changelog content as a parameter so it's
+/// testable against fixture strings without depending on the real `CHANGELOG.md` —
+/// mirrors `config.rs`'s `resolve_api_key`/`load` split (pure core + thin
+/// compile-time-data wrapper).
+fn whats_new_lines_from(changelog: &str) -> Vec<String> {
+    const UNRELEASED_HEADING: &str = "## [Unreleased]";
+    let mut lines = vec![
+        format!("v{} (unreleased)", env!("CARGO_PKG_VERSION")),
+        String::new(),
+    ];
+
+    let section = extract_section_after(changelog, UNRELEASED_HEADING).or_else(|| {
+        // `[Unreleased]` is missing or empty — fall back to the next `## [` heading
+        // after it (the newest real release). Search from just past `[Unreleased]`'s
+        // own heading line so this can't just re-find the same empty section; if
+        // `[Unreleased]` isn't present at all, search the whole file.
+        let search_from = changelog
+            .find(UNRELEASED_HEADING)
+            .and_then(|i| changelog[i..].find('\n').map(|nl| i + nl + 1))
+            .unwrap_or(0);
+        let rest = &changelog[search_from..];
+        let heading_line_start = rest.find("## [")?;
+        let heading_line_end = rest[heading_line_start..]
+            .find('\n')
+            .map(|nl| heading_line_start + nl)
+            .unwrap_or(rest.len());
+        extract_section_after(
+            &rest[heading_line_start..],
+            &rest[heading_line_start..heading_line_end],
+        )
+    });
+
+    match section {
+        Some(entries) => lines.extend(entries),
+        None => lines.push("Couldn't find recent changes in CHANGELOG.md.".to_string()),
+    }
+
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -757,5 +827,96 @@ mod tests {
         let heading_count = lines.iter().filter(|line| *line == "Menu:").count();
 
         assert_eq!(heading_count, 1);
+    }
+
+    #[test]
+    fn extract_section_after_returns_entries_between_heading_and_next_section() {
+        let changelog = "## [Unreleased]\n### Added\n- Thing one\n- Thing two\n\n\
+                         ## [0.1.0] - 2026-08-04\n### Added\n- Old thing\n";
+
+        let section = extract_section_after(changelog, "## [Unreleased]").unwrap();
+
+        assert_eq!(
+            section,
+            vec![
+                "### Added".to_string(),
+                "- Thing one".to_string(),
+                "- Thing two".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_section_after_stops_at_the_next_level_two_heading() {
+        let changelog = "## [Unreleased]\n### Added\n- Thing\n\
+                         ## [0.1.0] - 2026-08-04\n### Added\n- Old thing\n";
+
+        let section = extract_section_after(changelog, "## [Unreleased]").unwrap();
+
+        assert!(!section.iter().any(|line| line.contains("Old thing")));
+    }
+
+    #[test]
+    fn extract_section_after_returns_none_for_an_empty_section() {
+        let changelog = "## [Unreleased]\n\n## [0.1.0] - 2026-08-04\n### Added\n- Old thing\n";
+
+        assert_eq!(extract_section_after(changelog, "## [Unreleased]"), None);
+    }
+
+    #[test]
+    fn extract_section_after_returns_none_when_heading_is_missing() {
+        let changelog = "## [0.1.0] - 2026-08-04\n### Added\n- Old thing\n";
+
+        assert_eq!(extract_section_after(changelog, "## [Unreleased]"), None);
+    }
+
+    #[test]
+    fn whats_new_lines_from_uses_unreleased_entries_when_present() {
+        let changelog = "## [Unreleased]\n### Added\n- Thing one\n\n\
+                         ## [0.1.0] - 2026-08-04\n### Added\n- Old\n";
+
+        let lines = whats_new_lines_from(changelog);
+
+        assert!(lines[0].contains(env!("CARGO_PKG_VERSION")));
+        assert!(lines.contains(&"### Added".to_string()));
+        assert!(lines.contains(&"- Thing one".to_string()));
+        assert!(!lines.iter().any(|line| line.contains("- Old")));
+    }
+
+    #[test]
+    fn whats_new_lines_from_falls_back_to_the_next_release_when_unreleased_is_empty() {
+        let changelog = "## [Unreleased]\n\n## [0.1.0] - 2026-08-04\n### Added\n- First release\n";
+
+        let lines = whats_new_lines_from(changelog);
+
+        assert!(lines.contains(&"- First release".to_string()));
+    }
+
+    #[test]
+    fn whats_new_lines_from_falls_back_when_unreleased_heading_is_missing_entirely() {
+        let changelog = "## [0.1.0] - 2026-08-04\n### Added\n- First release\n";
+
+        let lines = whats_new_lines_from(changelog);
+
+        assert!(lines.contains(&"- First release".to_string()));
+    }
+
+    #[test]
+    fn whats_new_lines_from_reports_when_nothing_parses_at_all() {
+        let changelog = "Not a changelog at all.";
+
+        let lines = whats_new_lines_from(changelog);
+
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("Couldn't find recent changes")));
+    }
+
+    #[test]
+    fn whats_new_lines_reads_the_real_changelog_and_includes_the_current_version() {
+        let lines = whats_new_lines();
+
+        assert!(lines[0].contains(env!("CARGO_PKG_VERSION")));
+        assert!(lines.len() > 2, "expected real entries, got: {lines:?}");
     }
 }
