@@ -262,6 +262,20 @@ fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState, status: 
     }
 }
 
+/// The About tab's content (TF-585): plugin name, version, description, repo, license —
+/// all resolved at compile time from `Cargo.toml` via `CARGO_PKG_*` env vars, so there's
+/// nothing to keep in sync by hand when either changes.
+fn about_lines() -> Vec<String> {
+    vec![
+        format!("herdr-linear v{}", env!("CARGO_PKG_VERSION")),
+        String::new(),
+        env!("CARGO_PKG_DESCRIPTION").to_string(),
+        String::new(),
+        format!("Repository: {}", env!("CARGO_PKG_REPOSITORY")),
+        format!("License: {}", env!("CARGO_PKG_LICENSE")),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,5 +690,14 @@ mod tests {
         let text = rendered_text(&app);
         assert!(text.contains("No issues match"));
         assert!(!text.contains("Title for ENG-1"));
+    }
+
+    #[test]
+    fn about_lines_include_version_repo_and_license() {
+        let text = about_lines().join("\n");
+
+        assert!(text.contains(env!("CARGO_PKG_VERSION")));
+        assert!(text.contains("github.com/talent-factory/herdr-linear"));
+        assert!(text.contains("MIT"));
     }
 }
