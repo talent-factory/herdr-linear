@@ -441,15 +441,36 @@ fn truncate_with_notice(lines: &mut Vec<String>, max: usize) {
 /// config-reading of its own, only formatting the result.
 fn settings_lines() -> Vec<String> {
     let config_dir = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR").map(std::path::PathBuf::from);
-    let env_api_key = std::env::var("LINEAR_API_KEY").ok();
-    let summary =
-        crate::plugin::config::resolved_summary(config_dir.as_deref(), env_api_key.as_deref());
-    settings_lines_from(&summary)
+
+    // `var_os` (not `var().ok()`) so a `LINEAR_API_KEY` that's set but not valid UTF-8
+    // can be told apart from one that's simply unset (follow-up review fix, TF-585): the
+    // config-resolution path genuinely can't use a non-Unicode value either way (see
+    // `config::resolve_api_key`, which hits the identical `var().ok()` collapse), so
+    // `resolved_summary` still correctly reports `api_key_set: false` for it — but a
+    // diagnostic tab whose entire purpose is explaining *why* a key isn't resolving
+    // should say so, not silently show the same "✗ Not set" as a key that was never
+    // exported at all.
+    let env_api_key_os = std::env::var_os("LINEAR_API_KEY");
+    let env_key_present_but_not_utf8 = env_api_key_os
+        .as_deref()
+        .is_some_and(|v| !v.is_empty() && v.to_str().is_none());
+    let env_api_key = env_api_key_os.as_deref().and_then(|v| v.to_str());
+
+    let summary = crate::plugin::config::resolved_summary(config_dir.as_deref(), env_api_key);
+    settings_lines_from(&summary, env_key_present_but_not_utf8)
 }
 
 /// Pure half of [`settings_lines`], taking an already-resolved summary so it's testable
-/// without touching the real environment.
-fn settings_lines_from(summary: &crate::plugin::config::ResolvedConfigSummary) -> Vec<String> {
+/// without touching the real environment. `env_key_present_but_not_utf8` is the one piece
+/// of diagnostic state `ResolvedConfigSummary` can't carry on its own (it only knows
+/// `api_key_set: bool`, which is correctly `false` in this case too, since a non-Unicode
+/// env var is just as unusable for authentication as a missing one) — see
+/// [`settings_lines`]'s doc comment for why the Settings tab still needs to tell the two
+/// "not set" cases apart in its own display text.
+fn settings_lines_from(
+    summary: &crate::plugin::config::ResolvedConfigSummary,
+    env_key_present_but_not_utf8: bool,
+) -> Vec<String> {
     use crate::plugin::config::ConfigFileStatus;
 
     let mut lines = Vec::new();
@@ -468,6 +489,8 @@ fn settings_lines_from(summary: &crate::plugin::config::ResolvedConfigSummary) -
 
     let api_key_display = if summary.api_key_set {
         "✓ Set"
+    } else if env_key_present_but_not_utf8 {
+        "✗ Not set (LINEAR_API_KEY is set but isn't valid UTF-8)"
     } else {
         "✗ Not set"
     };
@@ -1331,11 +1354,36 @@ mod tests {
             project_overrides: std::collections::BTreeMap::new(),
         };
 
-        let lines = settings_lines_from(&summary).join("\n");
+        let lines = settings_lines_from(&summary, false).join("\n");
 
         assert!(lines.contains("no file found, using defaults"));
         assert!(lines.contains("✗ Not set"));
         assert!(lines.contains("(default)"));
+    }
+
+    /// Follow-up review fix (TF-585): `settings_lines()` used to collapse "LINEAR_API_KEY
+    /// unset" and "LINEAR_API_KEY set but not valid UTF-8" into the same "✗ Not set" —
+    /// misleading specifically on the one tab whose job is explaining *why* a key isn't
+    /// resolving. Confirms the two cases now render distinct messages given the same
+    /// otherwise-empty `ResolvedConfigSummary`.
+    #[test]
+    fn settings_lines_from_distinguishes_unset_from_non_utf8_env_key() {
+        let summary = crate::plugin::config::ResolvedConfigSummary {
+            path: "/fake/config.toml".to_string(),
+            status: crate::plugin::config::ConfigFileStatus::NotFound,
+            api_key_set: false,
+            agent_command: None,
+            team_id: None,
+            project_overrides: std::collections::BTreeMap::new(),
+        };
+
+        let unset = settings_lines_from(&summary, false).join("\n");
+        let non_utf8 = settings_lines_from(&summary, true).join("\n");
+
+        assert!(unset.contains("✗ Not set"));
+        assert!(!unset.contains("UTF-8"));
+        assert!(non_utf8.contains("✗ Not set"));
+        assert!(non_utf8.contains("LINEAR_API_KEY is set but isn't valid UTF-8"));
     }
 
     #[test]
@@ -1351,7 +1399,7 @@ mod tests {
             project_overrides,
         };
 
-        let lines = settings_lines_from(&summary).join("\n");
+        let lines = settings_lines_from(&summary, false).join("\n");
 
         assert!(lines.contains("Config: found"));
         assert!(lines.contains("✓ Set"));
@@ -1373,7 +1421,7 @@ mod tests {
             project_overrides: std::collections::BTreeMap::new(),
         };
 
-        let lines = settings_lines_from(&summary).join("\n");
+        let lines = settings_lines_from(&summary, false).join("\n");
 
         assert!(lines.contains("is invalid"));
         assert!(lines.contains("not valid TOML"));
