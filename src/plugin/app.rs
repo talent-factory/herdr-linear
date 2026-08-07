@@ -165,6 +165,69 @@ impl Status {
     }
 }
 
+/// The four tabs of the in-app help overlay (`?` — TF-585): What's New, Keybindings,
+/// Settings, About, in the order they're shown left to right and jumped to via `1`-`4`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HelpTab {
+    /// Recent changes, pulled from `CHANGELOG.md`'s `[Unreleased]` section.
+    #[default]
+    WhatsNew,
+    /// Every currently-implemented keybinding, from the canonical registry in
+    /// `crate::plugin::keybindings`.
+    Keybindings,
+    /// The plugin's currently-resolved `config.toml` values.
+    Settings,
+    /// Plugin name, version, repo, license.
+    About,
+}
+
+impl HelpTab {
+    /// All four tabs, in display/jump order.
+    pub const ALL: [HelpTab; 4] = [
+        HelpTab::WhatsNew,
+        HelpTab::Keybindings,
+        HelpTab::Settings,
+        HelpTab::About,
+    ];
+
+    /// The tab's position in [`Self::ALL`] (`0`-based) — one less than the `1`-`4` jump
+    /// key that selects it (see `handle_help_overlay_key`).
+    pub fn index(self) -> usize {
+        match self {
+            HelpTab::WhatsNew => 0,
+            HelpTab::Keybindings => 1,
+            HelpTab::Settings => 2,
+            HelpTab::About => 3,
+        }
+    }
+
+    /// The tab at `index` within [`Self::ALL`], or `None` if out of range.
+    pub fn from_index(index: usize) -> Option<Self> {
+        Self::ALL.get(index).copied()
+    }
+
+    /// The label shown in the overlay's tab bar.
+    pub fn title(self) -> &'static str {
+        match self {
+            HelpTab::WhatsNew => "What's New",
+            HelpTab::Keybindings => "Keybindings",
+            HelpTab::Settings => "Settings",
+            HelpTab::About => "About",
+        }
+    }
+
+    /// The next tab in display order (`Tab`/`→`), wrapping from `About` back to `WhatsNew`.
+    pub fn next(self) -> Self {
+        Self::from_index((self.index() + 1) % Self::ALL.len()).expect("index is always in range")
+    }
+
+    /// The previous tab in display order (`←`), wrapping from `WhatsNew` back to `About`.
+    pub fn prev(self) -> Self {
+        Self::from_index((self.index() + Self::ALL.len() - 1) % Self::ALL.len())
+            .expect("index is always in range")
+    }
+}
+
 /// The main application state container.
 ///
 /// Manages transitions between the menu and views, and navigation within a loaded
@@ -1612,5 +1675,43 @@ mod tests {
 
         assert!(!app.is_filtering());
         assert_eq!(app.selected_issue().unwrap().identifier, "ENG-1");
+    }
+
+    #[test]
+    fn help_tab_default_is_whats_new() {
+        assert_eq!(HelpTab::default(), HelpTab::WhatsNew);
+    }
+
+    #[test]
+    fn help_tab_index_and_from_index_round_trip_for_every_tab() {
+        for tab in HelpTab::ALL {
+            assert_eq!(HelpTab::from_index(tab.index()), Some(tab));
+        }
+    }
+
+    #[test]
+    fn help_tab_from_index_out_of_range_returns_none() {
+        assert_eq!(HelpTab::from_index(4), None);
+    }
+
+    #[test]
+    fn help_tab_next_cycles_forward_and_wraps_from_the_last_tab() {
+        assert_eq!(HelpTab::WhatsNew.next(), HelpTab::Keybindings);
+        assert_eq!(HelpTab::Keybindings.next(), HelpTab::Settings);
+        assert_eq!(HelpTab::Settings.next(), HelpTab::About);
+        assert_eq!(HelpTab::About.next(), HelpTab::WhatsNew);
+    }
+
+    #[test]
+    fn help_tab_prev_cycles_backward_and_wraps_from_the_first_tab() {
+        assert_eq!(HelpTab::WhatsNew.prev(), HelpTab::About);
+        assert_eq!(HelpTab::About.prev(), HelpTab::Settings);
+    }
+
+    #[test]
+    fn help_tab_title_is_non_empty_for_every_tab() {
+        for tab in HelpTab::ALL {
+            assert!(!tab.title().is_empty());
+        }
     }
 }
