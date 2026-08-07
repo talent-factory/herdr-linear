@@ -69,19 +69,25 @@ What follows changes:
 3. Workflow-state transition (`get_workflow_states` → `pick_in_progress_state` →
    `update_issue`), `agent_wait`, `send_prompt_until_visible` — unchanged, same warning-not-abort
    shape as today.
-4. The old post-`agent_start` `tab_rename` call is removed; nothing replaces it.
+4. The old post-`agent_start` `tab_rename` call is removed; **see the addendum below** — it is
+   replaced by a `pane_close` call in that same position, not left with nothing.
 
 ## Data flow
 
 ```
 start_implementation
   ├─ resolve_preferred_agent / resolve_agent_command / build_shell_argv / resolve_cwd  (unchanged)
-  ├─ tab_create(cwd, issue.identifier)      -> TabId          [NEW - can abort cheaply]
+  ├─ tab_create(cwd, issue.identifier)       -> TabCreated     [NEW - can abort cheaply]
   ├─ agent_start(command, cwd, tab_id, argv) -> AgentStarted   [tab_id now required input]
+  ├─ pane_close(root_pane_id)                                 [NEW - non-fatal, see addendum]
   ├─ get_workflow_states -> pick_in_progress_state -> update_issue   (unchanged, warning-only)
   ├─ agent_wait(pane_id, "idle", 30_000)                              (unchanged)
   └─ send_prompt_until_visible(pane_id, prompt)                       (unchanged)
 ```
+
+See the addendum below: `tab_create`'s return type became `TabCreated { tab_id, root_pane_id }`
+(not the plain `TabId` this section originally specified), to carry the root pane id `pane_close`
+needs.
 
 ## Error handling
 
@@ -117,3 +123,24 @@ Same "no rollback, always a clear message" philosophy as the implement-on-enter 
   here; the manual-close message is the whole mitigation for now.
 - No change to tab label format (bare `issue.identifier`, e.g. `"TF-579"`) — the workspace already
   disambiguates by repo, so a repo-prefixed label wasn't judged worth the extra decision.
+
+## Addendum — correction after live verification (2026-08-07)
+
+The "Confirmed live against herdr 0.7.3" claim above (that `agent_start --tab <id>` replaces the
+tab's root pane, keeping `pane_count: 1`) was wrong. It was verified using a short-lived probe
+process (`/bin/echo`), which exits almost instantly — by the time `pane_count` was checked, herdr
+had already reaped the split pane for the already-exited process, making a real split look like a
+replacement. Repeating the same test with a long-running process (`/bin/sleep 30`) showed
+`pane_count: 2` persisting for the process's entire lifetime: `agent_start --tab <id>` (with no
+`--split` given) always adds the agent as an additional split pane — it never replaces or consumes
+the tab's existing sole pane.
+
+The actual fix: `herdr tab create`'s JSON response already includes `root_pane.pane_id` alongside
+`tab.tab_id`. `tab_create`'s return type became `TabCreated { tab_id: TabId, root_pane_id: PaneId }`
+(was `TabId`), and after `agent_start` succeeds, `implement_one` calls a new
+`herdr_cli::pane_close(herdr_bin, &created_tab.root_pane_id)` to close the now-redundant root pane
+— non-fatally: a failure to close it is collected as a warning (matching this flow's existing "no
+rollback, collect warnings" pattern), not a hard abort. Verified live, repeatedly, with a
+long-running probe process: `pane_count` goes 1 (after `tab_create`) → 2 (after `agent_start`) → 1
+(after `pane_close`), and confirmed end-to-end by the human partner against two real Linear issues
+in their live herdr instance, each landing as exactly one tab with exactly one pane.

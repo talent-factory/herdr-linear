@@ -68,6 +68,13 @@ pub struct AgentStarted {
     pub tab_id: TabId,
 }
 
+/// Result of a successful `herdr tab create` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabCreated {
+    pub tab_id: TabId,
+    pub root_pane_id: PaneId,
+}
+
 /// Resolve the `herdr` binary path: `$HERDR_BIN_PATH`, falling back to `"herdr"` on `$PATH` —
 /// the same convention `scripts/open-tab.sh` uses.
 pub fn herdr_bin() -> String {
@@ -87,7 +94,7 @@ pub fn herdr_bin() -> String {
 /// [`parse_agent_name_taken_error`]) — only [`agent_start`] (via [`run_for_agent_start`]) passes
 /// `true`. Scoped this way rather than checked unconditionally for every `herdr` subcommand
 /// because `agent_name_taken` is meaningful only in the context of a `agent start` call; if any
-/// other subcommand (`tab_rename`, `agent_wait`, ...) ever received a response reusing that same
+/// other subcommand (`tab_create`, `agent_wait`, ...) ever received a response reusing that same
 /// code, treating it as the same structured error would surface the wrong candidates/remedy
 /// out of context, with no retry logic actually applying.
 fn interpret_output(
@@ -214,10 +221,10 @@ fn is_missing_result_response(error: &Error) -> bool {
 }
 
 /// Wall-clock ceiling for `herdr` subprocess calls that don't carry their own `--timeout`
-/// argument (everything routed through [`run`]: `agent_list`, `agent_start`, `tab_rename`,
-/// `agent_send`). Without this, a hung `herdr` daemon blocks the single-threaded TUI's event
-/// loop indefinitely — `agent_wait` is the exception, since it computes its own call-specific
-/// bound in [`agent_wait`] instead of using this constant.
+/// argument (everything routed through [`run`]: `agent_list`, `tab_create`, `agent_start`,
+/// `agent_send`, `pane_close`). Without this, a hung `herdr` daemon blocks the single-threaded
+/// TUI's event loop indefinitely — `agent_wait` is the exception, since it computes its own
+/// call-specific bound in [`agent_wait`] instead of using this constant.
 const DEFAULT_CLI_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Run a `herdr` CLI subcommand, bounded by `call_timeout`, returning the parsed `result` field
@@ -294,6 +301,53 @@ fn parse_agent_started(result: &Value) -> Result<AgentStarted> {
     })
 }
 
+/// Extract [`TabCreated`] from a `herdr tab create` call's already-unwrapped `result` value.
+/// Split out from [`tab_create`] for the same testability reason as [`parse_agent_started`].
+fn parse_tab_created(result: &Value) -> Result<TabCreated> {
+    let tab_id = result
+        .get("tab")
+        .and_then(|t| t.get("tab_id"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::Internal("tab.create response missing tab.tab_id".to_string()))?
+        .to_string();
+    let root_pane_id = result
+        .get("root_pane")
+        .and_then(|p| p.get("pane_id"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            Error::Internal("tab.create response missing root_pane.pane_id".to_string())
+        })?
+        .to_string();
+
+    Ok(TabCreated {
+        tab_id: TabId(tab_id),
+        root_pane_id: PaneId(root_pane_id),
+    })
+}
+
+/// `herdr tab create --cwd <cwd> --label <label> --focus` — creates a fresh, focused tab that is
+/// already labeled `label`, and returns its [`TabCreated`] (the new tab's id, plus the id of the
+/// single root pane herdr creates inside it by default). Labeling at creation time (rather than
+/// via a follow-up `tab rename`) means the label is correct from the very first frame, with no
+/// window in which the tab could be confused with — or have its label stolen by — a different,
+/// already-running tab. `root_pane_id` exists to be closed once [`agent_start`] has placed the
+/// real agent pane into this tab — `agent_start` never replaces or consumes a tab's existing
+/// panes, it only adds a split alongside them, so without closing it every tab would carry a
+/// permanent extra empty shell pane. See
+/// docs/superpowers/specs/2026-08-06-guaranteed-tab-per-issue-design.md for why this replaced a
+/// rename-after-`agent_start` sequence.
+pub async fn tab_create(herdr_bin: &str, cwd: &Path, label: &str) -> Result<TabCreated> {
+    let cwd_str = cwd.to_string_lossy().to_string();
+    let result = run(
+        herdr_bin,
+        &[
+            "tab", "create", "--cwd", &cwd_str, "--label", label, "--focus",
+        ],
+    )
+    .await?;
+    parse_tab_created(&result)
+}
+
 /// Max retries [`agent_start`] makes after its initial call when herdr reports
 /// `agent_name_taken` (TF-590, see [`Error::AgentNameTaken`]) before giving up and reporting
 /// the collision to the caller. Bounds how many round-trips to herdr the retry loop makes,
@@ -326,8 +380,12 @@ fn next_name_taken_retry<'a>(
         .find(|candidate| !tried.contains(*candidate))
 }
 
-/// `herdr agent start <name> --cwd <cwd> --focus -- <argv...>` — starts `name` (used by herdr
-/// for its own agent-status tracking) running `argv` in a fresh, focused tab at `cwd`.
+/// `herdr agent start <name> --cwd <cwd> --tab <tab> --focus -- <argv...>` — starts `name` (used
+/// by herdr for its own agent-status tracking) running `argv` at `cwd`, explicitly placed inside
+/// `tab` (created via [`tab_create`]) rather than trusting herdr's own default placement — see
+/// docs/superpowers/specs/2026-08-06-guaranteed-tab-per-issue-design.md for why an implicit
+/// placement previously let one issue's agent land as a split inside a different, already-running
+/// issue's tab. There is deliberately no variant of this function that omits `tab`.
 ///
 /// If herdr rejects `name` with `agent_name_taken` (TF-590 — e.g. because a previous issue's
 /// agent tab is still running under a name that collides with this one), retries automatically
@@ -341,6 +399,7 @@ pub async fn agent_start(
     herdr_bin: &str,
     name: &str,
     cwd: &Path,
+    tab: &TabId,
     argv: &[String],
 ) -> Result<AgentStarted> {
     let cwd_str = cwd.to_string_lossy().to_string();
@@ -356,6 +415,8 @@ pub async fn agent_start(
             &attempt_name,
             "--cwd",
             &cwd_str,
+            "--tab",
+            tab.as_str(),
             "--focus",
             "--",
         ];
@@ -419,9 +480,11 @@ pub async fn agent_start(
     }
 }
 
-/// `herdr tab rename <tab_id> <label>`.
-pub async fn tab_rename(herdr_bin: &str, tab_id: &TabId, label: &str) -> Result<()> {
-    run(herdr_bin, &["tab", "rename", tab_id.as_str(), label])
+/// `herdr pane close <pane_id>`. Used to close the now-redundant root pane [`tab_create`] leaves
+/// behind once [`agent_start`] has placed the real agent pane into the same tab (`agent_start`
+/// never replaces a tab's existing panes, only splits alongside them).
+pub async fn pane_close(herdr_bin: &str, pane_id: &PaneId) -> Result<()> {
+    run(herdr_bin, &["pane", "close", pane_id.as_str()])
         .await
         .map(|_| ())
 }
@@ -757,7 +820,7 @@ mod tests {
         // subcommand must fall through to the generic error path even if herdr ever reused
         // this code for a response unrelated to `agent start`.
         let result = interpret_output(
-            "herdr tab rename wY:tW ENG-1",
+            "herdr tab create --label ENG-1",
             false,
             r#"{"error":{"code":"agent_name_taken","message":"agent name hr is already used","candidates":["hr-2"]}}"#,
             "",
@@ -931,6 +994,7 @@ fi
             script.to_str().unwrap(),
             "hr",
             Path::new("/tmp"),
+            &TabId("t0".to_string()),
             &["zsh".to_string()],
         )
         .await
@@ -958,6 +1022,7 @@ exit 1
             script.to_str().unwrap(),
             "hr",
             Path::new("/tmp"),
+            &TabId("t0".to_string()),
             &["zsh".to_string()],
         )
         .await
@@ -992,6 +1057,7 @@ exit 1
             script.to_str().unwrap(),
             "hr",
             Path::new("/tmp"),
+            &TabId("t0".to_string()),
             &["zsh".to_string()],
         )
         .await
@@ -1029,6 +1095,7 @@ exit 1
             script.to_str().unwrap(),
             "hr",
             Path::new("/tmp"),
+            &TabId("t0".to_string()),
             &["zsh".to_string()],
         )
         .await
@@ -1081,6 +1148,7 @@ fi
             script.to_str().unwrap(),
             "hr",
             Path::new("/tmp"),
+            &TabId("t0".to_string()),
             &["zsh".to_string()],
         )
         .await
@@ -1106,6 +1174,7 @@ exit 0
             script.to_str().unwrap(),
             "hr",
             Path::new("/tmp"),
+            &TabId("t0".to_string()),
             &["zsh".to_string()],
         )
         .await
@@ -1113,6 +1182,42 @@ exit 0
 
         assert_eq!(started.pane_id.as_str(), "p1");
         assert_eq!(started.tab_id.as_str(), "t1");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_start_passes_the_requested_tab_id_via_the_tab_flag() {
+        // TF-579: the whole point of this parameter is that `agent_start` explicitly places the
+        // agent into a pre-created tab rather than trusting herdr's default placement. Assert on
+        // the actual argv, not just the returned `AgentStarted` — a dropped/misplaced/mis-valued
+        // `--tab` flag would reintroduce TF-579's bug while every other test here still passes.
+        let capture_dir = tempfile::tempdir().unwrap();
+        let args_file = capture_dir.path().join("args.txt");
+        let (_dir, script) = write_fake_herdr_script(&format!(
+            r#"
+printf '%s\n' "$@" > "{}"
+echo '{{"result":{{"agent":{{"pane_id":"p1","tab_id":"t1"}}}}}}'
+exit 0
+"#,
+            args_file.display()
+        ));
+
+        agent_start(
+            script.to_str().unwrap(),
+            "hr",
+            Path::new("/tmp"),
+            &TabId("t0".to_string()),
+            &["zsh".to_string()],
+        )
+        .await
+        .expect("agent_start should succeed");
+
+        let captured = std::fs::read_to_string(&args_file).unwrap();
+        let args: Vec<&str> = captured.lines().collect();
+        assert_eq!(
+            args,
+            vec!["agent", "start", "hr", "--cwd", "/tmp", "--tab", "t0", "--focus", "--", "zsh"]
+        );
     }
 
     #[cfg(unix)]
@@ -1132,6 +1237,7 @@ exit 1
             script.to_str().unwrap(),
             "hr",
             Path::new("/tmp"),
+            &TabId("t0".to_string()),
             &["zsh".to_string()],
         )
         .await
@@ -1181,6 +1287,157 @@ exit 1
         let result = serde_json::json!({"id": "cli:agent:start"});
 
         assert!(parse_agent_started(&result).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tab_create_builds_the_expected_cli_invocation_and_parses_its_response() {
+        let capture_dir = tempfile::tempdir().unwrap();
+        let args_file = capture_dir.path().join("args.txt");
+        let (_dir, script) = write_fake_herdr_script(&format!(
+            r#"
+printf '%s\n' "$@" > "{}"
+echo '{{"result":{{"tab":{{"tab_id":"t2","label":"TF-579"}},"root_pane":{{"pane_id":"p9"}}}}}}'
+exit 0
+"#,
+            args_file.display()
+        ));
+
+        let created = tab_create(script.to_str().unwrap(), Path::new("/tmp"), "TF-579")
+            .await
+            .expect("tab_create should succeed");
+
+        assert_eq!(created.tab_id.as_str(), "t2");
+        assert_eq!(created.root_pane_id.as_str(), "p9");
+
+        let captured = std::fs::read_to_string(&args_file).unwrap();
+        let args: Vec<&str> = captured.lines().collect();
+        assert_eq!(
+            args,
+            vec!["tab", "create", "--cwd", "/tmp", "--label", "TF-579", "--focus"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tab_create_propagates_a_herdr_error() {
+        let (_dir, script) = write_fake_herdr_script(
+            r#"
+echo '{"error":{"message":"no such workspace"}}'
+exit 1
+"#,
+        );
+
+        let err = tab_create(script.to_str().unwrap(), Path::new("/tmp"), "TF-579")
+            .await
+            .expect_err("tab_create should propagate the herdr error");
+
+        assert!(
+            err.to_string().contains("no such workspace"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pane_close_invokes_the_expected_cli_command() {
+        let capture_dir = tempfile::tempdir().unwrap();
+        let args_file = capture_dir.path().join("args.txt");
+        let (_dir, script) = write_fake_herdr_script(&format!(
+            r#"
+printf '%s\n' "$@" > "{}"
+echo '{{"result":{{}}}}'
+exit 0
+"#,
+            args_file.display()
+        ));
+
+        pane_close(script.to_str().unwrap(), &PaneId("p9".to_string()))
+            .await
+            .expect("pane_close should succeed");
+
+        let captured = std::fs::read_to_string(&args_file).unwrap();
+        let args: Vec<&str> = captured.lines().collect();
+        assert_eq!(args, vec!["pane", "close", "p9"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pane_close_propagates_a_herdr_error() {
+        let (_dir, script) = write_fake_herdr_script(
+            r#"
+echo '{"error":{"message":"no such pane"}}'
+exit 1
+"#,
+        );
+
+        let err = pane_close(script.to_str().unwrap(), &PaneId("p9".to_string()))
+            .await
+            .expect_err("pane_close should propagate the herdr error");
+
+        assert!(
+            err.to_string().contains("no such pane"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_tab_created_extracts_the_tab_id_and_root_pane_id() {
+        let result = serde_json::json!({
+            "tab": {"tab_id": "wY:t2D", "label": "TF-579"},
+            "root_pane": {"pane_id": "wY:p31"}
+        });
+
+        let created = parse_tab_created(&result).unwrap();
+
+        assert_eq!(created.tab_id.as_str(), "wY:t2D");
+        assert_eq!(created.root_pane_id.as_str(), "wY:p31");
+    }
+
+    #[test]
+    fn parse_tab_created_errors_when_tab_id_is_missing() {
+        let result = serde_json::json!({
+            "tab": {"label": "TF-579"},
+            "root_pane": {"pane_id": "wY:p31"}
+        });
+
+        let err = parse_tab_created(&result).unwrap_err().to_string();
+
+        assert!(err.contains("tab.tab_id"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn parse_tab_created_errors_when_the_tab_object_is_missing_entirely() {
+        let result = serde_json::json!({"root_pane": {"pane_id": "wY:p31"}});
+
+        assert!(parse_tab_created(&result).is_err());
+    }
+
+    #[test]
+    fn parse_tab_created_errors_when_root_pane_id_is_missing() {
+        let result = serde_json::json!({
+            "tab": {"tab_id": "wY:t2D", "label": "TF-579"},
+            "root_pane": {}
+        });
+
+        let err = parse_tab_created(&result).unwrap_err().to_string();
+
+        assert!(
+            err.contains("root_pane.pane_id"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_tab_created_errors_when_the_root_pane_object_is_missing_entirely() {
+        let result = serde_json::json!({"tab": {"tab_id": "wY:t2D", "label": "TF-579"}});
+
+        let err = parse_tab_created(&result).unwrap_err().to_string();
+
+        assert!(
+            err.contains("root_pane.pane_id"),
+            "unexpected message: {err}"
+        );
     }
 
     #[test]

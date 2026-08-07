@@ -252,7 +252,8 @@ async fn send_prompt_until_visible(
 /// success).
 ///
 /// `StartedWithWarnings` is kept distinct from `Started` rather than folded into it because a
-/// non-fatal warning (tab rename, workflow-state lookup/transition) still means the agent is up
+/// non-fatal warning (e.g. closing the tab's redundant pane, an unexpected tab placement,
+/// workflow-state lookup/transition) still means the agent is up
 /// and the prompt landed — [`start_implementation_many`]'s "N/M started" count (and its
 /// all-started determination) treats it as a start — but the single-issue path still surfaces
 /// it as an actionable (red) status, matching pre-TF-590 behavior exactly.
@@ -261,6 +262,7 @@ async fn send_prompt_until_visible(
 /// three-way classification, not a `std::result::Result`, and reusing `Ok`/`Err` invited reading
 /// `Warn` as an intermediate point on a binary success/failure axis when its actual meaning is
 /// caller-defined (folded into "started" by one caller, into "failed" by the other).
+#[derive(Debug)]
 enum ImplementOutcome {
     /// Everything succeeded cleanly. Carries the trailing half of the status message (e.g.
     /// `"tab opened, agent started, set to In Progress."`).
@@ -300,23 +302,25 @@ async fn resolve_validated_agent_command(
     })
 }
 
-/// Runs the full "implement this issue" flow for one issue: open a herdr tab running `command`
-/// under a name unique to this issue (TF-590, see [`plugin::implement::build_agent_name`]), set
-/// the issue to its team's "In Progress" state, wait for the agent to become ready, then inject
-/// the implement prompt. `command` is resolved once per run by
-/// [`resolve_validated_agent_command`] — not here — so every issue processed in the same
-/// `<Enter>` press (single or [`start_implementation_many`]'s marked-multiple case) launches
-/// under the same command; see that function's doc for why re-resolving per issue was a bug.
-/// Never propagates — every failure becomes an [`ImplementOutcome::Failed`] so both callers
+/// Runs the full "implement this issue" flow for one issue: create a fresh tab labeled after the
+/// issue and start `command` running inside it under a name unique to this issue (TF-590, see
+/// [`plugin::implement::build_agent_name`]), set the issue to its team's "In Progress" state,
+/// wait for the agent to become ready, then inject the implement prompt. `command` is resolved
+/// once per run by [`resolve_validated_agent_command`] — not here — so every issue processed in
+/// the same `<Enter>` press (single or [`start_implementation_many`]'s marked-multiple case)
+/// launches under the same command; see that function's doc for why re-resolving per issue was a
+/// bug. Never propagates — every failure becomes an [`ImplementOutcome::Failed`] so both callers
 /// ([`start_implementation`] for the single-issue case, [`start_implementation_many`] for the
 /// marked-multiple case) can turn it into whatever status banner fits their situation,
 /// mirroring `ensure_loaded`'s "inline error instead of crashing" philosophy. Any non-fatal
-/// warnings collected along the way (tab rename, workflow-state lookup, the actual state
-/// transition) are preserved in *every* terminal outcome, not just the final success case — a
-/// failure late in the flow (e.g. `agent_wait` timing out) must not hide an earlier one (e.g.
-/// the issue never actually reaching "In Progress"). See
-/// docs/superpowers/specs/2026-08-05-implement-on-enter-design.md for the full data flow this
-/// extends.
+/// warnings collected along the way (the agent landing in an unexpected tab, closing the tab's
+/// redundant root pane, workflow-state lookup, the actual state transition) are preserved in
+/// *every* terminal outcome, not just the final success case — a failure late in the flow (e.g.
+/// `agent_wait` timing out) must not hide
+/// an earlier one (e.g. the issue never actually reaching "In Progress"). See
+/// docs/superpowers/specs/2026-08-05-implement-on-enter-design.md for the full original data
+/// flow this extends, and docs/superpowers/specs/2026-08-06-guaranteed-tab-per-issue-design.md
+/// for the tab-creation change.
 ///
 /// The agent is spawned in [`plugin::host::resolve_cwd`]'s directory — the herdr-injected
 /// launch context's working directory, not the plugin process's own `std::env::current_dir()`
@@ -327,7 +331,7 @@ async fn resolve_validated_agent_command(
 /// split-only caveat this replaces. `resolve_cwd` itself never fails outright (see its own
 /// doc), so this function separately guards against the one case that matters here: both its
 /// launch-context parse *and* its `current_dir()` fallback failing, which would otherwise pass
-/// an empty `--cwd` straight through to `agent_start`.
+/// an empty `--cwd` straight through to `tab_create` and `agent_start`.
 async fn implement_one(
     herdr_bin: &str,
     client: &herdr_linear::LinearClient,
@@ -353,17 +357,64 @@ async fn implement_one(
     // suggested name each time — this is what makes those retries something other than the
     // exact same losing name).
     let agent_name = plugin::implement::build_agent_name(command.as_str(), &issue.identifier);
-    let started = match plugin::herdr_cli::agent_start(herdr_bin, &agent_name, &cwd, &argv).await {
+
+    let created_tab = match plugin::herdr_cli::tab_create(herdr_bin, &cwd, &issue.identifier).await
+    {
+        Ok(created_tab) => created_tab,
+        Err(err) => return ImplementOutcome::Failed(format!("failed to create a tab: {err}")),
+    };
+
+    let started = match plugin::herdr_cli::agent_start(
+        herdr_bin,
+        &agent_name,
+        &cwd,
+        &created_tab.tab_id,
+        &argv,
+    )
+    .await
+    {
         Ok(started) => started,
-        Err(err) => return ImplementOutcome::Failed(format!("failed to start agent tab: {err}")),
+        Err(err) => {
+            // `agent_start` returning `Err` does not necessarily mean the agent never started —
+            // the most likely cause is `run_with_timeout` giving up on a `herdr` call that's
+            // still running in the background (no `kill_on_drop`), so the agent may well be up
+            // despite the error. Don't assert the tab is empty; tell the user to check first.
+            return ImplementOutcome::Failed(format!(
+                "tab created but the agent-start call failed ({err}) — check the '{}' tab: it \
+                 may be empty (safe to close) or the agent may have started anyway despite the \
+                 error, so verify before closing it",
+                issue.identifier
+            ));
+        }
     };
 
     let mut warnings = Vec::new();
 
-    if let Err(err) =
-        plugin::herdr_cli::tab_rename(herdr_bin, &started.tab_id, &issue.identifier).await
-    {
-        warnings.push(format!("failed to rename tab: {err}"));
+    // TF-579 regression guard: `--tab` should have placed the agent inside `created_tab.tab_id`.
+    // If herdr ever placed it elsewhere, the guarantee this whole flow exists for silently
+    // didn't hold — surface that rather than quietly accepting whatever tab herdr picked.
+    if started.tab_id != created_tab.tab_id {
+        warnings.push(format!(
+            "agent started in tab {} instead of the requested tab {} — herdr may have ignored \
+             --tab",
+            started.tab_id.as_str(),
+            created_tab.tab_id.as_str()
+        ));
+    }
+
+    // `agent_start` is assumed to split alongside a tab's existing panes rather than replace
+    // them (see docs/superpowers/specs/2026-08-06-guaranteed-tab-per-issue-design.md's addendum
+    // — verified live against herdr 0.7.3, but a future herdr version could change this). Guard
+    // against that assumption breaking: if the agent's own pane turned out to *be*
+    // `root_pane_id` (herdr replaced rather than split), there is no redundant pane left to
+    // close — closing it anyway would kill the agent's own pane instead of a leftover one.
+    if started.pane_id != created_tab.root_pane_id {
+        if let Err(err) = plugin::herdr_cli::pane_close(herdr_bin, &created_tab.root_pane_id).await
+        {
+            warnings.push(format!(
+                "failed to close the tab's now-redundant empty pane: {err}"
+            ));
+        }
     }
 
     match client.get_workflow_states(&issue.team.id).await {
@@ -595,8 +646,8 @@ fn is_buffered_quit_key(
 /// (`Action::Implement` / `Action::ImplementMany`) ran, so a buffered `<Enter>` doesn't replay
 /// as a fresh action once we're back to polling. Every step in that flow has its own bound —
 /// `agent_wait`'s own budget (up to 30s plus retry buffer), `get_workflow_states`/
-/// `update_issue`'s 30s HTTP timeout each, `tab_rename`/`agent_send`/`agent_list` at
-/// `DEFAULT_CLI_TIMEOUT` (15s) each, and `agent_start` at up to `DEFAULT_CLI_TIMEOUT` times
+/// `update_issue`'s 30s HTTP timeout each, `tab_create`/`pane_close`/`agent_send`/`agent_list`
+/// at `DEFAULT_CLI_TIMEOUT` (15s) each, and `agent_start` at up to `DEFAULT_CLI_TIMEOUT` times
 /// `1 + AGENT_START_NAME_TAKEN_MAX_RETRIES` (TF-590's `agent_name_taken` retry loop, ~45s
 /// worst case, not a flat 15s) — but they're sequential (and, for `Action::ImplementMany`,
 /// repeated once per marked issue — TF-590), so the flow as a whole can run well past any
@@ -870,13 +921,13 @@ exit 1
     #[test]
     fn status_with_warnings_appends_every_collected_warning() {
         let warnings = vec![
-            "failed to rename tab: boom".to_string(),
+            "failed to close the tab's now-redundant empty pane: boom".to_string(),
             "failed to set state to In Progress: boom".to_string(),
         ];
 
         assert_eq!(
             status_with_warnings("agent didn't become ready".to_string(), &warnings),
-            "agent didn't become ready (also: failed to rename tab: boom; failed to set state to In Progress: boom)"
+            "agent didn't become ready (also: failed to close the tab's now-redundant empty pane: boom; failed to set state to In Progress: boom)"
         );
     }
 
@@ -1085,5 +1136,219 @@ exit 1
         assert!(text.contains("FAIL-2: bang"), "unexpected text: {text}");
         assert!(text.ends_with("(+2 more)"), "unexpected text: {text}");
         assert!(!all_started);
+    }
+
+    /// Minimal but fully-populated fixture for [`implement_one`]'s tests — mirrors
+    /// `plugin::app::tests::sample_issue`, duplicated here because that one is private to its
+    /// own module.
+    fn sample_issue(identifier: &str) -> herdr_linear::Issue {
+        herdr_linear::Issue {
+            id: format!("id-{identifier}"),
+            identifier: identifier.to_string(),
+            title: format!("Issue {identifier}"),
+            description: None,
+            state: herdr_linear::IssueState {
+                id: "state-id".to_string(),
+                name: "In Progress".to_string(),
+                r#type: "started".to_string(),
+            },
+            priority: 0,
+            estimate: None,
+            team: herdr_linear::Team {
+                id: "team-id".to_string(),
+                key: "ENG".to_string(),
+                name: "Engineering".to_string(),
+                description: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+            },
+            assignee: None,
+            creator: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            started_at: None,
+            completed_at: None,
+            cycle: None,
+            project: None,
+            labels: herdr_linear::LabelConnection { nodes: vec![] },
+            url: format!("https://linear.app/team/issue/{identifier}"),
+        }
+    }
+
+    /// A `herdr` fake script that dispatches on `$1 $2` so [`implement_one`]'s whole
+    /// `tab_create` → `agent_start` → `pane_close` → `agent_wait` sequence can be driven from a
+    /// single process, each branch supplying its own canned `echo '{...}'; exit N`.
+    fn write_dispatching_herdr_script(
+        tab_create: &str,
+        agent_start: &str,
+        pane_close: &str,
+        agent_wait: &str,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        write_fake_herdr_script(&format!(
+            r#"
+case "$1 $2" in
+  "tab create") {tab_create} ;;
+  "agent start") {agent_start} ;;
+  "pane close") {pane_close} ;;
+  "agent wait") {agent_wait} ;;
+  *)
+    echo '{{"error":{{"message":"unexpected herdr call: $1 $2"}}}}'
+    exit 1
+    ;;
+esac
+"#
+        ))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn implement_one_fails_immediately_when_tab_create_fails() {
+        let (_dir, script) = write_dispatching_herdr_script(
+            r#"echo '{"error":{"message":"no such workspace"}}'; exit 1"#,
+            r#"echo '{"error":{"message":"agent start should not run"}}'; exit 1"#,
+            r#"echo '{"error":{"message":"pane close should not run"}}'; exit 1"#,
+            r#"echo '{"error":{"message":"agent wait should not run"}}'; exit 1"#,
+        );
+        let client = herdr_linear::LinearClient::new("lin_api_test_key").unwrap();
+        let issue = sample_issue("TF-579");
+        let command = plugin::implement::ValidatedAgentCommand::parse("hr".to_string()).unwrap();
+
+        let outcome = implement_one(script.to_str().unwrap(), &client, &issue, &command).await;
+
+        let ImplementOutcome::Failed(message) = outcome else {
+            panic!("expected Failed, got {outcome:?}");
+        };
+        assert!(
+            message.contains("failed to create a tab") && message.contains("no such workspace"),
+            "unexpected message: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn implement_one_reports_a_possibly_orphaned_tab_when_agent_start_fails() {
+        // tab_create succeeds (so a tab now exists), then agent_start fails — the flow must not
+        // claim the tab is definitely empty (agent_start's own failure could be a client-side
+        // timeout with the agent actually running), and it must not attempt pane_close or
+        // agent_wait afterwards.
+        let (_dir, script) = write_dispatching_herdr_script(
+            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"TF-579"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
+            r#"echo '{"error":{"message":"no such pane"}}'; exit 1"#,
+            r#"echo '{"error":{"message":"pane close should not run"}}'; exit 1"#,
+            r#"echo '{"error":{"message":"agent wait should not run"}}'; exit 1"#,
+        );
+        let client = herdr_linear::LinearClient::new("lin_api_test_key").unwrap();
+        let issue = sample_issue("TF-579");
+        let command = plugin::implement::ValidatedAgentCommand::parse("hr".to_string()).unwrap();
+
+        let outcome = implement_one(script.to_str().unwrap(), &client, &issue, &command).await;
+
+        let ImplementOutcome::Failed(message) = outcome else {
+            panic!("expected Failed, got {outcome:?}");
+        };
+        assert!(
+            message.contains("TF-579") && message.contains("no such pane"),
+            "unexpected message: {message}"
+        );
+        assert!(
+            !message.contains("an empty"),
+            "must not assert the tab is definitely empty: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn implement_one_records_a_pane_close_failure_as_a_warning_but_continues() {
+        // tab_create and agent_start both succeed with distinct pane ids (root_pane_id != the
+        // agent's own pane_id, i.e. herdr split rather than replaced), so pane_close actually
+        // runs and its failure must be recorded as a warning, not abort the flow — the
+        // subsequent workflow-state lookup and agent_wait calls must still happen and their own
+        // failures must still surface alongside the pane_close warning in one terminal outcome.
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({"data": null, "errors": [{"message": "workflow states unavailable"}]})
+                    .to_string(),
+            )
+            .create_async()
+            .await;
+        let client = herdr_linear::LinearClient::with_endpoint(
+            "lin_api_test",
+            format!("{}/graphql", server.url()),
+        )
+        .unwrap();
+        let (_dir, script) = write_dispatching_herdr_script(
+            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"TF-579"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
+            r#"echo '{"result":{"agent":{"pane_id":"p1","tab_id":"t2"}}}'; exit 0"#,
+            r#"echo '{"error":{"message":"no such pane"}}'; exit 1"#,
+            r#"echo '{"error":{"message":"agent never went idle"}}'; exit 1"#,
+        );
+        let issue = sample_issue("TF-579");
+        let command = plugin::implement::ValidatedAgentCommand::parse("hr".to_string()).unwrap();
+
+        let outcome = implement_one(script.to_str().unwrap(), &client, &issue, &command).await;
+
+        let ImplementOutcome::Failed(message) = outcome else {
+            panic!("expected Failed, got {outcome:?}");
+        };
+        assert!(
+            message.contains("failed to close the tab's now-redundant empty pane:")
+                && message.contains("no such pane"),
+            "pane_close failure warning missing: {message}"
+        );
+        assert!(
+            message.contains("failed to load workflow states"),
+            "workflow-state warning missing (proves the flow continued past pane_close): {message}"
+        );
+        assert!(
+            message.contains("agent didn't become ready"),
+            "unexpected message: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn implement_one_adds_no_warning_when_pane_close_succeeds() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({"data": null, "errors": [{"message": "workflow states unavailable"}]})
+                    .to_string(),
+            )
+            .create_async()
+            .await;
+        let client = herdr_linear::LinearClient::with_endpoint(
+            "lin_api_test",
+            format!("{}/graphql", server.url()),
+        )
+        .unwrap();
+        let (_dir, script) = write_dispatching_herdr_script(
+            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"TF-579"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
+            r#"echo '{"result":{"agent":{"pane_id":"p1","tab_id":"t2"}}}'; exit 0"#,
+            r#"echo '{"result":{}}'; exit 0"#,
+            r#"echo '{"error":{"message":"agent never went idle"}}'; exit 1"#,
+        );
+        let issue = sample_issue("TF-579");
+        let command = plugin::implement::ValidatedAgentCommand::parse("hr".to_string()).unwrap();
+
+        let outcome = implement_one(script.to_str().unwrap(), &client, &issue, &command).await;
+
+        let ImplementOutcome::Failed(message) = outcome else {
+            panic!("expected Failed, got {outcome:?}");
+        };
+        assert!(
+            !message.contains("redundant empty pane"),
+            "a successful pane_close must not produce a warning: {message}"
+        );
+        assert!(
+            message.contains("failed to load workflow states"),
+            "unexpected message: {message}"
+        );
     }
 }

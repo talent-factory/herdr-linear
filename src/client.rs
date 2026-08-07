@@ -45,9 +45,13 @@ impl LinearClient {
         })
     }
 
-    /// Create a client pointed at a custom endpoint (used by tests to target a mock server)
-    #[cfg(test)]
-    fn with_endpoint<S: Into<String>>(api_key: S, endpoint: String) -> Result<Self> {
+    /// Create a client pointed at a custom endpoint. Used by this crate's own tests to target a
+    /// mock server; kept `pub` (rather than `#[cfg(test)]`-gated) so the `herdr-linear` binary
+    /// target's tests — a separate crate from this library's perspective — can do the same for
+    /// `main.rs`'s `implement_one` integration tests, since a `#[cfg(test)]` item compiled for
+    /// this crate's own test runs doesn't exist in the copy of this crate linked into another
+    /// target's test binary.
+    pub fn with_endpoint<S: Into<String>>(api_key: S, endpoint: String) -> Result<Self> {
         let mut client = Self::new(api_key)?;
         client.endpoint = endpoint;
         Ok(client)

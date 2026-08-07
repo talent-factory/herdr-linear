@@ -88,10 +88,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   agent is actually idle. Previously this surfaced as an immediate "agent didn't become
   ready" error and the implement prompt was never injected (TF-584)
 - Implement-on-`<Enter>`: a status banner reported after `agent_wait`/`agent_send` fails no
-  longer discards warnings collected earlier in the same flow (e.g. a failed tab rename or a
+  longer discards warnings collected earlier in the same flow (e.g. a failed tab/pane setup step or a
   failed "In Progress" transition) — every terminal status now includes every warning, not
   just the one on the path that happened to finish last (TF-584)
-- `herdr` CLI calls other than `agent_wait` (`agent_list`, `agent_start`, `tab_rename`,
+- `herdr` CLI calls other than `agent_wait` (`agent_list`, `tab_create`, `agent_start`, `pane_close`,
   `agent_send`) are now individually timeout-bounded, so a hung `herdr` daemon can no longer
   freeze the whole panel indefinitely (TF-584)
 - `agent_wait`'s missing-`result`-field retry is now detected via a dedicated error variant
@@ -107,6 +107,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of reusing the bare command string for every issue, and if herdr still reports
   the name as taken, the call retries automatically with one of herdr's suggested
   candidates before giving up (TF-590)
+- Implementing two Linear issues back to back could leave both agents sharing one
+  mislabeled tab: `agent_start` never told herdr where to place the new agent pane, so it
+  inherited herdr's implicit default placement (often a split into whichever tab currently had
+  focus), and a follow-up tab rename would then relabel whatever tab that turned out to be —
+  possibly a different, already-running issue's tab. Every implemented issue now gets a
+  freshly created, explicitly targeted, pre-labeled tab, with its now-redundant extra pane
+  closed on a best-effort basis (a failure to close it is a non-fatal warning, not an abort)
+  (TF-579)
 
 ### Removed
 - Unused `cli` Cargo feature (and its `clap` dependency), superseded by the `plugin` feature
