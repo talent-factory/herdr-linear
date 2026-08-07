@@ -1459,7 +1459,14 @@ mod tests {
 
         let text = rendered_text_with_size(&app, 100, 30);
 
-        assert!(text.contains("close"));
+        // Follow-up review fix (TF-585): the original assertion here only checked for
+        // "close", which would still pass even if the switch/jump/scroll hints were
+        // dropped or garbled. Assert the full footer text verbatim so a change to any
+        // part of it is caught, not just an accidental removal of the whole line.
+        assert!(
+            text.contains("Tab/←→ switch · 1-4 jump · j/k scroll · Esc/q/? close"),
+            "footer controls text missing or changed, got: {text:?}"
+        );
     }
 
     #[test]
