@@ -793,12 +793,27 @@ mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyModifiers};
 
+    /// Writes a fake `herdr` script, `chmod +x`'d and ready to exec. Flushes to durable
+    /// storage (`sync_all`, not just closing the write handle `std::fs::write` alone
+    /// leaves to the OS's discretion) before returning: observed in CI (nightly-toolchain
+    /// runner, exit code 101) as an occasional `ETXTBSY` ("text file busy") when a test
+    /// spawns this script microseconds after writing it — a known kernel/VFS race on some
+    /// filesystems where `execve` can transiently see the file as still-open-for-write
+    /// even though this process's own handle is already closed. `spawn_with_etxtbsy_retry`
+    /// (`herdr_cli.rs`) is the primary fix (retries the transient error, which always
+    /// self-resolves); this `sync_all` is a cheap, complementary reduction in how often
+    /// the race is hit at all.
     fn write_fake_herdr_script(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("herdr");
-        std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let mut file = std::fs::File::create(&script).unwrap();
+        file.write_all(format!("#!/bin/sh\n{body}\n").as_bytes())
+            .unwrap();
+        file.sync_all().unwrap();
+        drop(file);
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         (dir, script)
     }
