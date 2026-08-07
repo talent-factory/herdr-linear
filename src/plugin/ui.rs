@@ -8,7 +8,7 @@ use crate::plugin::app::{
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
-    text::{Line, Text},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
@@ -618,17 +618,25 @@ fn draw_help_overlay(frame: &mut Frame, overlay: &HelpOverlayState) {
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(area);
 
-    let title = HelpTab::ALL
-        .iter()
-        .map(|&tab| {
-            if tab == overlay.tab {
-                format!("> {}", tab.title())
-            } else {
-                tab.title().to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("   ");
+    // The active tab is marked with a reversed-video style (follow-up review fix,
+    // TF-585 — a plain "> " text prefix, as this used before, was too easy to miss at a
+    // glance, per user feedback screenshotting the running app). Matches `draw_menu`'s
+    // own selection highlight (`Modifier::REVERSED`) so "currently selected" reads the
+    // same way everywhere in this UI, not as a one-off convention just for this overlay.
+    let mut title_spans: Vec<Span> = vec![Span::raw("Help: ")];
+    for (i, &tab) in HelpTab::ALL.iter().enumerate() {
+        if i > 0 {
+            title_spans.push(Span::raw("   "));
+        }
+        if tab == overlay.tab {
+            title_spans.push(Span::styled(
+                tab.title(),
+                Style::default().add_modifier(Modifier::REVERSED),
+            ));
+        } else {
+            title_spans.push(Span::raw(tab.title()));
+        }
+    }
 
     let content = match overlay.tab {
         HelpTab::WhatsNew => whats_new_lines(),
@@ -639,11 +647,7 @@ fn draw_help_overlay(frame: &mut Frame, overlay: &HelpOverlayState) {
     .join("\n");
 
     let body = Paragraph::new(content)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!("Help: {title}")),
-        )
+        .block(Block::default().borders(Borders::ALL).title(title_spans))
         .wrap(Wrap { trim: false })
         .scroll((overlay.scroll, 0));
     frame.render_widget(body, outer[0]);
@@ -778,6 +782,36 @@ mod tests {
 
     fn rendered_text(app: &App) -> String {
         rendered_text_with_size(app, 60, 15)
+    }
+
+    /// Like [`rendered_text_with_size`], but keeps each cell's [`Modifier`] alongside its
+    /// symbol instead of discarding it — needed to verify a *visual* highlight (e.g.
+    /// `Modifier::REVERSED`), which `rendered_text_with_size`'s plain-`String` output has
+    /// no way to represent. Cell order matches the buffer's own row-major layout, same as
+    /// `rendered_text_with_size`.
+    fn rendered_cells_with_size(app: &App, width: u16, height: u16) -> Vec<(String, Modifier)> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| (cell.symbol().to_string(), cell.modifier))
+            .collect()
+    }
+
+    /// The start index of the first contiguous run of `symbols` matching `needle`,
+    /// character by character — used to locate a known label (e.g. a tab name) within
+    /// [`rendered_cells_with_size`]'s output so its cells' styling can be inspected.
+    fn find_cell_run(symbols: &[String], needle: &str) -> Option<usize> {
+        let needle_chars: Vec<String> = needle.chars().map(|c| c.to_string()).collect();
+        if needle_chars.is_empty() || symbols.len() < needle_chars.len() {
+            return None;
+        }
+        (0..=symbols.len() - needle_chars.len())
+            .find(|&start| symbols[start..start + needle_chars.len()] == needle_chars[..])
     }
 
     /// An `App` that has already entered the "My Issues" view (still `Loading`).
@@ -1442,14 +1476,46 @@ mod tests {
         assert!(text.contains("About"));
     }
 
+    /// Follow-up review fix (TF-585): the active tab used to be marked with a plain
+    /// "> " text prefix, which user testing on the running app found too easy to miss at
+    /// a glance. It's now a reversed-video highlight instead (matching `draw_menu`'s own
+    /// selection style) — this asserts the *actual visual style*, not just that some text
+    /// marker string is present, since a plain `rendered_text`-based `.contains()` check
+    /// can't tell a styled render from an unstyled one at all (style info doesn't survive
+    /// that helper's flattening to a plain string).
     #[test]
-    fn help_overlay_marks_the_active_tab() {
+    fn help_overlay_marks_the_active_tab_with_a_reversed_highlight() {
         let mut app = App::new();
-        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE); // -> WhatsNew (default)
 
-        let text = rendered_text_with_size(&app, 100, 30);
+        let cells = rendered_cells_with_size(&app, 100, 30);
+        let symbols: Vec<String> = cells.iter().map(|(s, _)| s.clone()).collect();
 
-        assert!(text.contains("> What's New"));
+        let active_start = find_cell_run(&symbols, "What's New")
+            .expect("expected to find the active tab's label in the render");
+        for cell in &cells[active_start..active_start + "What's New".chars().count()] {
+            assert!(
+                cell.1.contains(Modifier::REVERSED),
+                "expected every cell of the active tab's label to be reversed-highlighted, \
+                 got symbol {:?} with modifier {:?}",
+                cell.0,
+                cell.1
+            );
+        }
+
+        // An *inactive* tab's label must NOT carry the same highlight, or every tab
+        // would look "selected" and the highlight would communicate nothing.
+        let inactive_start = find_cell_run(&symbols, "About")
+            .expect("expected to find an inactive tab's label in the render");
+        for cell in &cells[inactive_start..inactive_start + "About".chars().count()] {
+            assert!(
+                !cell.1.contains(Modifier::REVERSED),
+                "expected an inactive tab's label to NOT be reversed-highlighted, \
+                 got symbol {:?} with modifier {:?}",
+                cell.0,
+                cell.1
+            );
+        }
     }
 
     #[test]
@@ -1477,7 +1543,7 @@ mod tests {
 
         let text = rendered_text_with_size(&app, 100, 30);
 
-        assert!(text.contains("> About"));
+        assert!(text.contains("About"));
         assert!(text.contains(env!("CARGO_PKG_VERSION")));
     }
 
@@ -1495,7 +1561,7 @@ mod tests {
 
         let text = rendered_text_with_size(&app, 100, 40);
 
-        assert!(text.contains("> Keybindings"));
+        assert!(text.contains("Keybindings"));
         for binding in crate::plugin::keybindings::KEYBINDINGS {
             assert!(
                 text.contains(binding.action),
@@ -1524,7 +1590,7 @@ mod tests {
 
         let text = rendered_text_with_size(&app, 100, 40);
 
-        assert!(text.contains("> Settings"));
+        assert!(text.contains("Settings"));
         assert!(text.contains("Location:"));
         assert!(text.contains("api_key"));
         assert!(text.contains("agent_command"));
