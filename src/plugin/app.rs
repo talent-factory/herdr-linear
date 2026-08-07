@@ -232,12 +232,18 @@ impl HelpTab {
 /// closed — see [`App::help_overlay`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HelpOverlayState {
-    /// The currently active tab.
-    pub tab: HelpTab,
+    /// The currently active tab. `pub(crate)` (follow-up review fix, TF-585): the field
+    /// was `pub` on a `pub` struct in a `pub mod`, in a crate that's a real `[lib]`
+    /// target (not just this binary's internals) — external code could construct
+    /// `HelpOverlayState { tab, scroll }` directly, bypassing every one of `App`'s
+    /// invariant-preserving mutators (e.g. the scroll-reset-on-tab-switch below). Every
+    /// legitimate reader/mutator of this state lives inside this crate (`app.rs` itself
+    /// and `ui.rs`'s render path), so `pub(crate)` loses nothing real.
+    pub(crate) tab: HelpTab,
     /// Vertical scroll offset into the active tab's content, in lines. Reset to `0` on
     /// every tab switch — each tab's content is independent, so a scroll position from
-    /// one tab is meaningless on another.
-    pub scroll: u16,
+    /// one tab is meaningless on another. `pub(crate)` for the same reason as `tab` above.
+    pub(crate) scroll: u16,
 }
 
 /// The main application state container.
