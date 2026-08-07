@@ -37,3 +37,6 @@ Thumbs.db
 # Agent tooling caches
 .headroom/
 .serena/
+
+# Per-task git worktrees (implement-task workflow)
+/.worktrees/
