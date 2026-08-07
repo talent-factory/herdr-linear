@@ -820,7 +820,7 @@ mod tests {
         // subcommand must fall through to the generic error path even if herdr ever reused
         // this code for a response unrelated to `agent start`.
         let result = interpret_output(
-            "herdr tab rename wY:tW ENG-1",
+            "herdr tab create --label ENG-1",
             false,
             r#"{"error":{"code":"agent_name_taken","message":"agent name hr is already used","candidates":["hr-2"]}}"#,
             "",
@@ -1186,6 +1186,42 @@ exit 0
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn agent_start_passes_the_requested_tab_id_via_the_tab_flag() {
+        // TF-579: the whole point of this parameter is that `agent_start` explicitly places the
+        // agent into a pre-created tab rather than trusting herdr's default placement. Assert on
+        // the actual argv, not just the returned `AgentStarted` — a dropped/misplaced/mis-valued
+        // `--tab` flag would reintroduce TF-579's bug while every other test here still passes.
+        let capture_dir = tempfile::tempdir().unwrap();
+        let args_file = capture_dir.path().join("args.txt");
+        let (_dir, script) = write_fake_herdr_script(&format!(
+            r#"
+printf '%s\n' "$@" > "{}"
+echo '{{"result":{{"agent":{{"pane_id":"p1","tab_id":"t1"}}}}}}'
+exit 0
+"#,
+            args_file.display()
+        ));
+
+        agent_start(
+            script.to_str().unwrap(),
+            "hr",
+            Path::new("/tmp"),
+            &TabId("t0".to_string()),
+            &["zsh".to_string()],
+        )
+        .await
+        .expect("agent_start should succeed");
+
+        let captured = std::fs::read_to_string(&args_file).unwrap();
+        let args: Vec<&str> = captured.lines().collect();
+        assert_eq!(
+            args,
+            vec!["agent", "start", "hr", "--cwd", "/tmp", "--tab", "t0", "--focus", "--", "zsh"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn agent_start_propagates_a_non_agent_name_taken_error_without_retrying() {
         // Guards the `Err(err) => return Err(err)` arm, new code introduced by wrapping the
         // single `herdr agent start` call in a loop: a genuine, non-collision failure (bad
@@ -1253,6 +1289,98 @@ exit 1
         assert!(parse_agent_started(&result).is_err());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tab_create_builds_the_expected_cli_invocation_and_parses_its_response() {
+        let capture_dir = tempfile::tempdir().unwrap();
+        let args_file = capture_dir.path().join("args.txt");
+        let (_dir, script) = write_fake_herdr_script(&format!(
+            r#"
+printf '%s\n' "$@" > "{}"
+echo '{{"result":{{"tab":{{"tab_id":"t2","label":"TF-579"}},"root_pane":{{"pane_id":"p9"}}}}}}'
+exit 0
+"#,
+            args_file.display()
+        ));
+
+        let created = tab_create(script.to_str().unwrap(), Path::new("/tmp"), "TF-579")
+            .await
+            .expect("tab_create should succeed");
+
+        assert_eq!(created.tab_id.as_str(), "t2");
+        assert_eq!(created.root_pane_id.as_str(), "p9");
+
+        let captured = std::fs::read_to_string(&args_file).unwrap();
+        let args: Vec<&str> = captured.lines().collect();
+        assert_eq!(
+            args,
+            vec!["tab", "create", "--cwd", "/tmp", "--label", "TF-579", "--focus"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tab_create_propagates_a_herdr_error() {
+        let (_dir, script) = write_fake_herdr_script(
+            r#"
+echo '{"error":{"message":"no such workspace"}}'
+exit 1
+"#,
+        );
+
+        let err = tab_create(script.to_str().unwrap(), Path::new("/tmp"), "TF-579")
+            .await
+            .expect_err("tab_create should propagate the herdr error");
+
+        assert!(
+            err.to_string().contains("no such workspace"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pane_close_invokes_the_expected_cli_command() {
+        let capture_dir = tempfile::tempdir().unwrap();
+        let args_file = capture_dir.path().join("args.txt");
+        let (_dir, script) = write_fake_herdr_script(&format!(
+            r#"
+printf '%s\n' "$@" > "{}"
+echo '{{"result":{{}}}}'
+exit 0
+"#,
+            args_file.display()
+        ));
+
+        pane_close(script.to_str().unwrap(), &PaneId("p9".to_string()))
+            .await
+            .expect("pane_close should succeed");
+
+        let captured = std::fs::read_to_string(&args_file).unwrap();
+        let args: Vec<&str> = captured.lines().collect();
+        assert_eq!(args, vec!["pane", "close", "p9"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pane_close_propagates_a_herdr_error() {
+        let (_dir, script) = write_fake_herdr_script(
+            r#"
+echo '{"error":{"message":"no such pane"}}'
+exit 1
+"#,
+        );
+
+        let err = pane_close(script.to_str().unwrap(), &PaneId("p9".to_string()))
+            .await
+            .expect_err("pane_close should propagate the herdr error");
+
+        assert!(
+            err.to_string().contains("no such pane"),
+            "unexpected message: {err}"
+        );
+    }
+
     #[test]
     fn parse_tab_created_extracts_the_tab_id_and_root_pane_id() {
         let result = serde_json::json!({
@@ -1291,6 +1419,18 @@ exit 1
             "tab": {"tab_id": "wY:t2D", "label": "TF-579"},
             "root_pane": {}
         });
+
+        let err = parse_tab_created(&result).unwrap_err().to_string();
+
+        assert!(
+            err.contains("root_pane.pane_id"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_tab_created_errors_when_the_root_pane_object_is_missing_entirely() {
+        let result = serde_json::json!({"tab": {"tab_id": "wY:t2D", "label": "TF-579"}});
 
         let err = parse_tab_created(&result).unwrap_err().to_string();
 
