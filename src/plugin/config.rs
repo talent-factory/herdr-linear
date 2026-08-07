@@ -179,6 +179,90 @@ pub fn resolve_team_id_override(config_dir: Option<&Path>) -> Result<Option<Stri
     Ok(team_id)
 }
 
+/// Three-way outcome of resolving `config.toml`'s presence/validity — mirrors
+/// [`read_config_file`]'s own `Result<Option<ConfigFile>>` shape (`Ok(None)` = missing,
+/// `Ok(Some(_))` = parsed, `Err(_)` = present but invalid) rather than collapsing it to a
+/// bool, since the help overlay's Settings tab (TF-585) needs to say which of the three
+/// it is, not just "found" vs "not".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConfigFileStatus {
+    /// No `config.toml` at the resolved path (or `config_dir` itself unknown).
+    NotFound,
+    /// `config.toml` exists and parsed successfully.
+    Found,
+    /// `config.toml` exists but isn't valid TOML (or couldn't be read) — see
+    /// [`read_config_file`]'s own doc comment for exactly which cases this covers. The
+    /// message is the underlying [`Error`]'s `Display` text, already user-facing.
+    Invalid(String),
+}
+
+/// The plugin's currently-effective configuration, for the help overlay's Settings tab
+/// (TF-585).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedConfigSummary {
+    /// The resolved `config.toml` path, or its `<HERDR_PLUGIN_CONFIG_DIR not set>`
+    /// placeholder — see [`config_path_hint`].
+    pub path: String,
+    pub status: ConfigFileStatus,
+    /// True if an API key is currently resolvable from *either* source — mirrors
+    /// [`resolve_api_key`]'s own precedence (config file, then `env_api_key`). Never the
+    /// raw key value itself, which the Settings tab must not display (TF-585).
+    pub api_key_set: bool,
+    pub agent_command: Option<String>,
+    pub team_id: Option<String>,
+    pub project_overrides: BTreeMap<String, String>,
+}
+
+/// Builds a [`ResolvedConfigSummary`] for the help overlay's Settings tab (TF-585).
+/// Reads `config_dir` exactly once via [`read_config_file`] and derives every field from
+/// that single `Result`, rather than composing
+/// `resolve_api_key`/`resolve_agent_command_override`/`resolve_team_id_override` (each
+/// of which independently re-reads the file and propagates its `Err` via `?`) — that
+/// would mean either showing the same "invalid TOML" message three times over, or three
+/// separately-worded failures for what is really one root cause. Pure function — callers
+/// own reading the real environment, same pattern as every other `resolve_*` function in
+/// this module.
+pub(crate) fn resolved_summary(
+    config_dir: Option<&Path>,
+    env_api_key: Option<&str>,
+) -> ResolvedConfigSummary {
+    let path = config_path_hint(config_dir);
+    let has_env_key = env_api_key.is_some_and(|key| !key.is_empty());
+
+    match read_config_file(config_dir) {
+        Ok(None) => ResolvedConfigSummary {
+            path,
+            status: ConfigFileStatus::NotFound,
+            api_key_set: has_env_key,
+            agent_command: None,
+            team_id: None,
+            project_overrides: BTreeMap::new(),
+        },
+        Ok(Some(file)) => {
+            let has_file_key = file.api_key.as_deref().is_some_and(|key| !key.is_empty());
+            ResolvedConfigSummary {
+                path,
+                status: ConfigFileStatus::Found,
+                api_key_set: has_file_key || has_env_key,
+                agent_command: file.agent_command.filter(|cmd| !cmd.trim().is_empty()),
+                team_id: file
+                    .team_id
+                    .map(|id| id.trim().to_string())
+                    .filter(|id| !id.is_empty()),
+                project_overrides: file.project_overrides,
+            }
+        }
+        Err(e) => ResolvedConfigSummary {
+            path,
+            status: ConfigFileStatus::Invalid(e.to_string()),
+            api_key_set: false,
+            agent_command: None,
+            team_id: None,
+            project_overrides: BTreeMap::new(),
+        },
+    }
+}
+
 /// Resolve the Linear API key from the real environment: `$HERDR_PLUGIN_CONFIG_DIR/config.toml`
 /// then `$LINEAR_API_KEY`. Thin wrapper around [`resolve_api_key`] used by the binary.
 pub fn load() -> Result<String> {
@@ -227,7 +311,7 @@ pub fn current_config_path_hint() -> String {
 mod tests {
     use super::{
         config_path_hint, resolve_agent_command_override, resolve_api_key,
-        resolve_project_id_override, resolve_team_id_override,
+        resolve_project_id_override, resolve_team_id_override, resolved_summary, ConfigFileStatus,
     };
     use std::fs;
 
@@ -657,5 +741,94 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("not valid TOML"));
         assert!(message.contains(dir.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn resolved_summary_reports_not_found_when_config_dir_is_unknown() {
+        let summary = resolved_summary(None, None);
+
+        assert_eq!(summary.status, ConfigFileStatus::NotFound);
+        assert!(!summary.api_key_set);
+        assert_eq!(summary.agent_command, None);
+        assert_eq!(summary.team_id, None);
+        assert!(summary.project_overrides.is_empty());
+    }
+
+    #[test]
+    fn resolved_summary_not_found_still_reports_api_key_set_from_env() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let summary = resolved_summary(Some(dir.path()), Some("lin_api_from_env"));
+
+        assert_eq!(summary.status, ConfigFileStatus::NotFound);
+        assert!(summary.api_key_set);
+    }
+
+    #[test]
+    fn resolved_summary_reports_found_with_every_resolved_field() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.toml"),
+            "api_key = \"lin_api_x\"\nagent_command = \"my-agent\"\nteam_id = \"team-123\"\n\
+             [project_overrides]\n\"herdr-linear\" = \"proj-1\"\n",
+        )
+        .unwrap();
+
+        let summary = resolved_summary(Some(dir.path()), None);
+
+        assert_eq!(summary.status, ConfigFileStatus::Found);
+        assert!(summary.api_key_set);
+        assert_eq!(summary.agent_command, Some("my-agent".to_string()));
+        assert_eq!(summary.team_id, Some("team-123".to_string()));
+        assert_eq!(
+            summary.project_overrides.get("herdr-linear"),
+            Some(&"proj-1".to_string())
+        );
+    }
+
+    #[test]
+    fn resolved_summary_found_with_no_file_api_key_still_reports_set_from_env() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.toml"),
+            "agent_command = \"my-agent\"\n",
+        )
+        .unwrap();
+
+        let summary = resolved_summary(Some(dir.path()), Some("lin_api_from_env"));
+
+        assert_eq!(summary.status, ConfigFileStatus::Found);
+        assert!(summary.api_key_set);
+    }
+
+    #[test]
+    fn resolved_summary_found_with_neither_api_key_source_reports_not_set() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.toml"),
+            "agent_command = \"my-agent\"\n",
+        )
+        .unwrap();
+
+        let summary = resolved_summary(Some(dir.path()), None);
+
+        assert!(!summary.api_key_set);
+    }
+
+    #[test]
+    fn resolved_summary_reports_invalid_on_malformed_toml_with_every_other_field_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.toml"), "this is [invalid toml\n").unwrap();
+
+        let summary = resolved_summary(Some(dir.path()), Some("lin_api_from_env"));
+
+        match summary.status {
+            ConfigFileStatus::Invalid(message) => assert!(message.contains("not valid TOML")),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        assert!(!summary.api_key_set);
+        assert_eq!(summary.agent_command, None);
+        assert_eq!(summary.team_id, None);
+        assert!(summary.project_overrides.is_empty());
     }
 }
