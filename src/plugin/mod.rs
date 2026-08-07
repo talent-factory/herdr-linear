@@ -6,7 +6,7 @@
 //! project resolution), `herdr_cli` (herdr CLI subprocess wrapper), `implement` (pure
 //! decision logic for "implement this issue" flow), `host` (resolves the herdr-injected
 //! launch context's working directory, since the plugin process's own cwd is always its
-//! install directory).
+//! install directory), `keybindings` (canonical keybindings registry for the help overlay).
 
 pub mod app;
 pub mod config;
@@ -14,6 +14,7 @@ pub mod data;
 pub mod herdr_cli;
 pub mod host;
 pub mod implement;
+pub mod keybindings;
 pub mod launch;
 pub mod repo;
 pub mod ui;

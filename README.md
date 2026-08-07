@@ -316,8 +316,14 @@ status banner then summarizes how many started, e.g. "3/4 started", plus a per-i
 message for any that failed or finished with a warning) — `r` to retry after an error,
 `c` to open `config.toml` from an error screen (see "Configure" above — creates the file
 if it doesn't exist yet), and `Esc` to return to the menu (or, while filtering, to cancel
-the filter first). Press `q` to quit the panel from anywhere (menu or view). Pressing the
-key again focuses the panel if it's open elsewhere, or closes it if it's already focused.
+the filter first). Press `q` to quit the panel from anywhere (menu or view). Press `?`
+from anywhere to open an in-app help overlay — **What's New** (recent changes),
+**Keybindings** (every binding above, plus this one), **Settings** (your currently
+resolved `config.toml` values — the API key is shown only as set/not-set, never in the
+clear), and **About** (version, repo, license) — without leaving the terminal. Switch
+tabs with `Tab`/`←`/`→` or `1`-`4`, scroll with `j`/`k` or the arrow keys, and close with
+`Esc`, `q`, or `?` again. Pressing the key again focuses the panel if it's open
+elsewhere, or closes it if it's already focused.
 
 > [!NOTE]
 > Each issue's agent tab is started under a name unique to that issue (the resolved

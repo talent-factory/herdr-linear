@@ -165,6 +165,87 @@ impl Status {
     }
 }
 
+/// The four tabs of the in-app help overlay (`?` — TF-585): What's New, Keybindings,
+/// Settings, About, in the order they're shown left to right and jumped to via `1`-`4`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HelpTab {
+    /// Recent changes, pulled from `CHANGELOG.md`'s `[Unreleased]` section.
+    #[default]
+    WhatsNew,
+    /// Every currently-implemented keybinding, from the canonical registry in
+    /// `crate::plugin::keybindings`.
+    Keybindings,
+    /// The plugin's currently-resolved `config.toml` values.
+    Settings,
+    /// Plugin name, version, repo, license.
+    About,
+}
+
+impl HelpTab {
+    /// All four tabs, in display/jump order.
+    pub const ALL: [HelpTab; 4] = [
+        HelpTab::WhatsNew,
+        HelpTab::Keybindings,
+        HelpTab::Settings,
+        HelpTab::About,
+    ];
+
+    /// The tab's position in [`Self::ALL`] (`0`-based) — one less than the `1`-`4` jump
+    /// key that selects it (see `handle_help_overlay_key`).
+    pub fn index(self) -> usize {
+        match self {
+            HelpTab::WhatsNew => 0,
+            HelpTab::Keybindings => 1,
+            HelpTab::Settings => 2,
+            HelpTab::About => 3,
+        }
+    }
+
+    /// The tab at `index` within [`Self::ALL`], or `None` if out of range.
+    pub fn from_index(index: usize) -> Option<Self> {
+        Self::ALL.get(index).copied()
+    }
+
+    /// The label shown in the overlay's tab bar.
+    pub fn title(self) -> &'static str {
+        match self {
+            HelpTab::WhatsNew => "What's New",
+            HelpTab::Keybindings => "Keybindings",
+            HelpTab::Settings => "Settings",
+            HelpTab::About => "About",
+        }
+    }
+
+    /// The next tab in display order (`Tab`/`→`), wrapping from `About` back to `WhatsNew`.
+    pub fn next(self) -> Self {
+        Self::from_index((self.index() + 1) % Self::ALL.len()).expect("index is always in range")
+    }
+
+    /// The previous tab in display order (`←`), wrapping from `WhatsNew` back to `About`.
+    pub fn prev(self) -> Self {
+        Self::from_index((self.index() + Self::ALL.len() - 1) % Self::ALL.len())
+            .expect("index is always in range")
+    }
+}
+
+/// State of the in-app help overlay (`?` — TF-585) while open. `None` on [`App`] means
+/// closed — see [`App::help_overlay`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HelpOverlayState {
+    /// The currently active tab. `pub(crate)` (follow-up review fix, TF-585): the field
+    /// was `pub` on a `pub` struct in a `pub mod`, in a crate that's a real `[lib]`
+    /// target (not just this binary's internals) — external code could construct
+    /// `HelpOverlayState { tab, scroll }` directly, bypassing every one of `App`'s
+    /// invariant-preserving mutators (e.g. the scroll-reset-on-tab-switch below). Every
+    /// legitimate reader/mutator of this state lives inside this crate (`app.rs` itself
+    /// and `ui.rs`'s render path), so `pub(crate)` loses nothing real.
+    pub(crate) tab: HelpTab,
+    /// Vertical scroll offset into the active tab's content, in lines. Reset to `0` on
+    /// every tab switch — each tab's content is independent, so a scroll position from
+    /// one tab is meaningless on another. `pub(crate)` for the same reason as `tab` above.
+    pub(crate) scroll: u16,
+}
+
 /// The main application state container.
 ///
 /// Manages transitions between the menu and views, and navigation within a loaded
@@ -174,6 +255,9 @@ pub struct App {
     screen: Screen,
     /// The current status banner, if any. See [`Status`].
     status: Option<Status>,
+    /// The help overlay's state, if open (`?` — TF-585). A pure rendering layer over
+    /// `screen`, never `Screen` itself — see [`Self::open_help_overlay`].
+    help_overlay: Option<HelpOverlayState>,
 }
 
 impl App {
@@ -182,6 +266,7 @@ impl App {
         Self {
             screen: Screen::Menu { selected: 0 },
             status: None,
+            help_overlay: None,
         }
     }
 
@@ -488,6 +573,77 @@ impl App {
     pub fn clear_status(&mut self) {
         self.status = None;
     }
+
+    /// The help overlay's state, if open. `None` means closed — the underlying screen
+    /// renders exactly as it would without this feature.
+    pub fn help_overlay(&self) -> Option<&HelpOverlayState> {
+        self.help_overlay.as_ref()
+    }
+
+    /// Opens the help overlay on its default tab (`WhatsNew`) with scroll reset to the
+    /// top. Reopening after a close always starts fresh — no previous tab/scroll is
+    /// remembered (not requested by TF-585's acceptance criteria).
+    pub fn open_help_overlay(&mut self) {
+        self.help_overlay = Some(HelpOverlayState::default());
+    }
+
+    /// Closes the help overlay, restoring the underlying screen exactly as it was — the
+    /// overlay is a pure rendering layer over `screen`, never `Screen` itself, so
+    /// there's nothing else to restore.
+    pub fn close_help_overlay(&mut self) {
+        self.help_overlay = None;
+    }
+
+    /// Switches to the next tab (`Tab`/`→`), wrapping from `About` back to `WhatsNew`,
+    /// and resets scroll to the top. No-op if the overlay is closed.
+    pub fn help_overlay_switch_tab_forward(&mut self) {
+        if let Some(state) = &mut self.help_overlay {
+            state.tab = state.tab.next();
+            state.scroll = 0;
+        }
+    }
+
+    /// Switches to the previous tab (`←`), wrapping from `WhatsNew` back to `About`, and
+    /// resets scroll to the top. No-op if the overlay is closed.
+    pub fn help_overlay_switch_tab_back(&mut self) {
+        if let Some(state) = &mut self.help_overlay {
+            state.tab = state.tab.prev();
+            state.scroll = 0;
+        }
+    }
+
+    /// Jumps directly to `tab` (bound to `1`-`4`) and resets scroll to the top. No-op if
+    /// the overlay is closed.
+    pub fn help_overlay_jump_tab(&mut self, tab: HelpTab) {
+        if let Some(state) = &mut self.help_overlay {
+            state.tab = tab;
+            state.scroll = 0;
+        }
+    }
+
+    /// Scrolls the current tab's content down one line (`j`/`↓`), clamped so the stored
+    /// offset can never advance past the last line of `content_line_count` (the active
+    /// tab's rendered line count — see `ui::content_line_count`, which callers must pass
+    /// since only `ui.rs` knows each tab's content). No-op if the overlay is closed.
+    /// Final-review fix (TF-585): previously unbounded, on the assumption that
+    /// `ratatui::widgets::Paragraph::scroll` clips gracefully past the end of its content
+    /// at render time — true, but clamping only there (not here) meant a held-down `j`
+    /// could drive the stored offset far past the content, leaving the panel looking
+    /// blank until an equal number of `k` presses brought it back into range.
+    pub fn help_overlay_scroll_down(&mut self, content_line_count: usize) {
+        if let Some(state) = &mut self.help_overlay {
+            let max_scroll = content_line_count.saturating_sub(1) as u16;
+            state.scroll = state.scroll.saturating_add(1).min(max_scroll);
+        }
+    }
+
+    /// Scrolls the current tab's content up one line (`k`/`↑`), clamped at the top.
+    /// No-op if the overlay is closed.
+    pub fn help_overlay_scroll_up(&mut self) {
+        if let Some(state) = &mut self.help_overlay {
+            state.scroll = state.scroll.saturating_sub(1);
+        }
+    }
 }
 
 impl Default for App {
@@ -551,6 +707,16 @@ pub fn handle_key(
 
     if modifiers.contains(KeyModifiers::CONTROL) && key == KeyCode::Char('c') {
         return Some(Action::Quit);
+    }
+
+    if app.help_overlay().is_some() {
+        handle_help_overlay_key(app, key);
+        return None;
+    }
+
+    if key == KeyCode::Char('?') && !app.is_filtering() {
+        app.open_help_overlay();
+        return None;
     }
 
     let in_menu = matches!(app.screen, Screen::Menu { .. });
@@ -657,6 +823,36 @@ pub fn handle_key(
             open_config_action(std::env::var_os("HERDR_PLUGIN_CONFIG_DIR").as_deref())
         }
         _ => None,
+    }
+}
+
+/// Dispatches a key press while the help overlay (`?`) is open. The overlay owns all
+/// input while active — see `handle_key`'s early check above — so every key reaching
+/// this function is either one of the overlay's own bindings or has no effect; it never
+/// falls through to a menu/view binding.
+fn handle_help_overlay_key(app: &mut App, key: crossterm::event::KeyCode) {
+    use crossterm::event::KeyCode;
+
+    match key {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => app.close_help_overlay(),
+        KeyCode::Tab | KeyCode::Right => app.help_overlay_switch_tab_forward(),
+        KeyCode::Left => app.help_overlay_switch_tab_back(),
+        KeyCode::Char(c @ '1'..='4') => {
+            if let Some(tab) = HelpTab::from_index(c as usize - '1' as usize) {
+                app.help_overlay_jump_tab(tab);
+            }
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            // `help_overlay_scroll_down` needs `&mut self` to clamp against the active
+            // tab's content length, so the tab (`HelpTab` is `Copy`) is read into a local
+            // first rather than holding an immutable borrow of `app` across the call.
+            let tab = app.help_overlay().map(|state| state.tab);
+            if let Some(tab) = tab {
+                app.help_overlay_scroll_down(crate::plugin::ui::content_line_count(tab));
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => app.help_overlay_scroll_up(),
+        _ => {}
     }
 }
 
@@ -1612,5 +1808,371 @@ mod tests {
 
         assert!(!app.is_filtering());
         assert_eq!(app.selected_issue().unwrap().identifier, "ENG-1");
+    }
+
+    #[test]
+    fn help_tab_default_is_whats_new() {
+        assert_eq!(HelpTab::default(), HelpTab::WhatsNew);
+    }
+
+    #[test]
+    fn help_tab_index_and_from_index_round_trip_for_every_tab() {
+        for tab in HelpTab::ALL {
+            assert_eq!(HelpTab::from_index(tab.index()), Some(tab));
+        }
+    }
+
+    #[test]
+    fn help_tab_from_index_out_of_range_returns_none() {
+        assert_eq!(HelpTab::from_index(4), None);
+    }
+
+    #[test]
+    fn help_tab_next_cycles_forward_and_wraps_from_the_last_tab() {
+        assert_eq!(HelpTab::WhatsNew.next(), HelpTab::Keybindings);
+        assert_eq!(HelpTab::Keybindings.next(), HelpTab::Settings);
+        assert_eq!(HelpTab::Settings.next(), HelpTab::About);
+        assert_eq!(HelpTab::About.next(), HelpTab::WhatsNew);
+    }
+
+    #[test]
+    fn help_tab_prev_cycles_backward_and_wraps_from_the_first_tab() {
+        assert_eq!(HelpTab::WhatsNew.prev(), HelpTab::About);
+        assert_eq!(HelpTab::About.prev(), HelpTab::Settings);
+    }
+
+    #[test]
+    fn help_tab_title_is_non_empty_for_every_tab() {
+        for tab in HelpTab::ALL {
+            assert!(!tab.title().is_empty());
+        }
+    }
+
+    #[test]
+    fn app_starts_with_the_help_overlay_closed() {
+        let app = App::new();
+        assert_eq!(app.help_overlay(), None);
+    }
+
+    #[test]
+    fn open_help_overlay_starts_on_whats_new_with_scroll_at_zero() {
+        let mut app = App::new();
+
+        app.open_help_overlay();
+
+        assert_eq!(
+            app.help_overlay(),
+            Some(&HelpOverlayState {
+                tab: HelpTab::WhatsNew,
+                scroll: 0
+            })
+        );
+    }
+
+    #[test]
+    fn close_help_overlay_clears_it() {
+        let mut app = App::new();
+        app.open_help_overlay();
+
+        app.close_help_overlay();
+
+        assert_eq!(app.help_overlay(), None);
+    }
+
+    #[test]
+    fn switch_tab_forward_cycles_and_resets_scroll() {
+        let mut app = App::new();
+        app.open_help_overlay();
+        app.help_overlay_scroll_down(100); // generously large — not testing the clamp here
+
+        app.help_overlay_switch_tab_forward();
+
+        assert_eq!(
+            app.help_overlay(),
+            Some(&HelpOverlayState {
+                tab: HelpTab::Keybindings,
+                scroll: 0
+            })
+        );
+    }
+
+    #[test]
+    fn switch_tab_back_cycles_and_resets_scroll() {
+        let mut app = App::new();
+        app.open_help_overlay();
+
+        app.help_overlay_switch_tab_back();
+
+        assert_eq!(
+            app.help_overlay(),
+            Some(&HelpOverlayState {
+                tab: HelpTab::About,
+                scroll: 0
+            })
+        );
+    }
+
+    #[test]
+    fn jump_tab_sets_the_tab_directly_and_resets_scroll() {
+        let mut app = App::new();
+        app.open_help_overlay();
+        app.help_overlay_scroll_down(100); // generously large — not testing the clamp here
+
+        app.help_overlay_jump_tab(HelpTab::Settings);
+
+        assert_eq!(
+            app.help_overlay(),
+            Some(&HelpOverlayState {
+                tab: HelpTab::Settings,
+                scroll: 0
+            })
+        );
+    }
+
+    #[test]
+    fn scroll_down_then_up_returns_to_zero_and_does_not_go_negative() {
+        let mut app = App::new();
+        app.open_help_overlay();
+
+        app.help_overlay_scroll_up(); // already at 0 — must not underflow/panic
+        assert_eq!(app.help_overlay().unwrap().scroll, 0);
+
+        app.help_overlay_scroll_down(100); // generously large — not testing the clamp here
+        app.help_overlay_scroll_down(100); // generously large — not testing the clamp here
+        assert_eq!(app.help_overlay().unwrap().scroll, 2);
+
+        app.help_overlay_scroll_up();
+        assert_eq!(app.help_overlay().unwrap().scroll, 1);
+    }
+
+    /// Final-review fix (TF-585): scrolling down more times than the tab has content
+    /// must clamp the stored offset at `content_line_count - 1`, not run away past it —
+    /// otherwise the panel looks blank until an equal number of `k` presses recover it.
+    #[test]
+    fn scroll_down_clamps_at_the_last_line_of_the_tabs_content() {
+        let mut app = App::new();
+        app.open_help_overlay();
+
+        for _ in 0..10 {
+            app.help_overlay_scroll_down(3);
+        }
+
+        assert_eq!(app.help_overlay().unwrap().scroll, 2);
+    }
+
+    #[test]
+    fn help_overlay_mutators_are_no_ops_when_closed() {
+        let mut app = App::new();
+
+        app.help_overlay_switch_tab_forward();
+        app.help_overlay_switch_tab_back();
+        app.help_overlay_jump_tab(HelpTab::About);
+        app.help_overlay_scroll_down(100); // generously large — not testing the clamp here
+        app.help_overlay_scroll_up();
+        app.close_help_overlay();
+
+        assert_eq!(app.help_overlay(), None);
+    }
+
+    #[test]
+    fn question_mark_opens_the_overlay_from_the_menu() {
+        let mut app = App::new();
+
+        let action = handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        assert_eq!(action, None);
+        assert_eq!(app.help_overlay().unwrap().tab, HelpTab::WhatsNew);
+    }
+
+    #[test]
+    fn question_mark_opens_the_overlay_from_a_loaded_view() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        assert!(app.help_overlay().is_some());
+    }
+
+    #[test]
+    fn question_mark_while_filtering_types_into_the_query_instead_of_opening_the_overlay() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        assert!(app.help_overlay().is_none());
+        assert!(app.is_filtering());
+    }
+
+    #[test]
+    fn overlay_owns_input_and_menu_navigation_does_not_leak_through_while_open() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        // `Down` is a menu-navigation key outside the overlay — while the overlay is
+        // open it must not move the (invisible) menu selection.
+        handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+
+        assert!(matches!(app.screen, Screen::Menu { selected: 0 }));
+        assert!(app.help_overlay().is_some());
+    }
+
+    #[test]
+    fn tab_key_switches_tabs_forward_while_the_overlay_is_open() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        handle_key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+
+        assert_eq!(app.help_overlay().unwrap().tab, HelpTab::Keybindings);
+    }
+
+    #[test]
+    fn right_arrow_switches_tabs_forward_while_the_overlay_is_open() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        handle_key(&mut app, KeyCode::Right, KeyModifiers::NONE);
+
+        assert_eq!(app.help_overlay().unwrap().tab, HelpTab::Keybindings);
+    }
+
+    #[test]
+    fn left_arrow_switches_tabs_backward_while_the_overlay_is_open() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        handle_key(&mut app, KeyCode::Left, KeyModifiers::NONE);
+
+        assert_eq!(app.help_overlay().unwrap().tab, HelpTab::About);
+    }
+
+    #[test]
+    fn number_keys_jump_directly_to_the_matching_tab() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        handle_key(&mut app, KeyCode::Char('3'), KeyModifiers::NONE);
+        assert_eq!(app.help_overlay().unwrap().tab, HelpTab::Settings);
+
+        handle_key(&mut app, KeyCode::Char('1'), KeyModifiers::NONE);
+        assert_eq!(app.help_overlay().unwrap().tab, HelpTab::WhatsNew);
+    }
+
+    #[test]
+    fn j_and_k_scroll_while_the_overlay_is_open() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        handle_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(app.help_overlay().unwrap().scroll, 2);
+
+        handle_key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+        assert_eq!(app.help_overlay().unwrap().scroll, 1);
+    }
+
+    /// Follow-up review fix (TF-585): every other scroll test either scrolls on the
+    /// default `WhatsNew` tab (via `handle_key`, so it already routes through the real
+    /// `ui::content_line_count`) or scrolls via `App::help_overlay_scroll_down` directly
+    /// with a hand-picked literal (bypassing `ui::content_line_count` entirely). Neither
+    /// exercises the real `content_line_count(HelpTab::Keybindings)` /
+    /// `content_line_count(HelpTab::Settings)` production wiring the `j`/`k` handler
+    /// actually calls for those tabs. This test does, via `handle_key`, for
+    /// `Keybindings` — a purely static, env-independent tab, so the assertions are exact
+    /// rather than merely "didn't panic".
+    #[test]
+    fn j_and_k_scroll_while_the_overlay_is_open_on_the_keybindings_tab() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('2'), KeyModifiers::NONE); // -> Keybindings
+        assert_eq!(app.help_overlay().unwrap().tab, HelpTab::Keybindings);
+
+        handle_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(app.help_overlay().unwrap().scroll, 2);
+
+        handle_key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+        assert_eq!(app.help_overlay().unwrap().scroll, 1);
+    }
+
+    /// Companion to the above for the `Settings` tab specifically — the one tab whose
+    /// content depends on the real environment (`settings_lines()` reads
+    /// `HERDR_PLUGIN_CONFIG_DIR`/`LINEAR_API_KEY`). Deliberately doesn't mutate those env
+    /// vars (this crate's established convention — see `config.rs`'s untested impure
+    /// wrappers — avoids the flakiness of env-var mutation across parallel test threads),
+    /// so this only asserts scroll moves at all and never goes negative, not exact
+    /// offsets; `settings_lines_from` (tested separately, with injected data) always
+    /// produces at least a handful of lines regardless of what's actually resolved, so
+    /// `content_line_count(HelpTab::Settings)` is always callable here without panicking.
+    #[test]
+    fn j_and_k_scroll_while_the_overlay_is_open_on_the_settings_tab() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('3'), KeyModifiers::NONE); // -> Settings
+        assert_eq!(app.help_overlay().unwrap().tab, HelpTab::Settings);
+
+        handle_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        let after_down = app.help_overlay().unwrap().scroll;
+        assert!(after_down >= 1, "expected `j` to move scroll off zero");
+
+        handle_key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+        assert_eq!(app.help_overlay().unwrap().scroll, after_down - 1);
+    }
+
+    #[test]
+    fn esc_closes_the_overlay() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+        assert!(app.help_overlay().is_none());
+    }
+
+    #[test]
+    fn q_closes_the_overlay() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        handle_key(&mut app, KeyCode::Char('q'), KeyModifiers::NONE);
+
+        assert!(app.help_overlay().is_none());
+    }
+
+    #[test]
+    fn question_mark_again_closes_the_overlay() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        assert!(app.help_overlay().is_none());
+    }
+
+    #[test]
+    fn closing_the_overlay_leaves_the_underlying_screen_untouched() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
+        app.move_selection_down(); // select ENG-2
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+        assert_eq!(app.selected_issue().unwrap().identifier, "ENG-2");
+        assert_eq!(app.current_view(), Some(ViewKind::MyIssues));
+    }
+
+    #[test]
+    fn ctrl_c_quits_even_while_the_overlay_is_open() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL),
+            Some(Action::Quit)
+        );
     }
 }

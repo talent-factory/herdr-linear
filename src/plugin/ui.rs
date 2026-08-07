@@ -2,13 +2,14 @@
 //! message with a retry hint, or a two-pane issue list + detail view.
 
 use crate::plugin::app::{
-    matching_issue_indices, App, Screen, Status, ViewKind, ViewState, MENU_OPTIONS,
+    matching_issue_indices, App, HelpOverlayState, HelpTab, Screen, Status, ViewKind, ViewState,
+    MENU_OPTIONS,
 };
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
-    text::{Line, Text},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    text::{Line, Span, Text},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
 
@@ -16,6 +17,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     match app.screen() {
         Screen::Menu { selected } => draw_menu(frame, *selected),
         Screen::View(kind, view_state) => draw_view(frame, *kind, view_state, app.status()),
+    }
+    if let Some(overlay) = app.help_overlay() {
+        draw_help_overlay(frame, overlay);
     }
 }
 
@@ -262,6 +266,423 @@ fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState, status: 
     }
 }
 
+/// The About tab's content (TF-585): plugin name, version, description, repo, license —
+/// all resolved at compile time from `Cargo.toml` via `CARGO_PKG_*` env vars, so there's
+/// nothing to keep in sync by hand when either changes.
+///
+/// Follow-up review fix (TF-585): cached in a `OnceLock` — every call previously
+/// rebuilt this `Vec` from scratch, and `content_line_count` (the scroll-clamp's
+/// production caller, in `app.rs`'s `j`/`↓` handler) calls the active tab's content
+/// function on *every* scroll keypress purely to measure its length, discarding the
+/// content itself. Safe to cache unconditionally: every source here (`env!` macros) is
+/// resolved at compile time, so the result can never change within a running process —
+/// unlike [`settings_lines`], which reads the real, mutable environment on every call and
+/// deliberately stays uncached.
+fn about_lines() -> Vec<String> {
+    static CACHE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            vec![
+                format!("herdr-linear v{}", env!("CARGO_PKG_VERSION")),
+                String::new(),
+                env!("CARGO_PKG_DESCRIPTION").to_string(),
+                String::new(),
+                format!("Repository: {}", env!("CARGO_PKG_REPOSITORY")),
+                format!("License: {}", env!("CARGO_PKG_LICENSE")),
+            ]
+        })
+        .clone()
+}
+
+/// The Keybindings tab's content (TF-585): every entry in `keybindings::KEYBINDINGS`
+/// (the single source of truth — see that module's doc comment), grouped under a
+/// heading each time `context` changes. Relies on `KEYBINDINGS` grouping same-context
+/// entries contiguously (an invariant that table's own tests guard) rather than
+/// re-sorting, so the table's declared order (Menu, View, Filtering, Error screen,
+/// Global) is what's shown, not an alphabetized one.
+///
+/// Cached in a `OnceLock` for the same reason as [`about_lines`]: `KEYBINDINGS` is a
+/// `static` table that never changes within a running process, so recomputing this on
+/// every scroll keypress is pure waste.
+fn keybindings_lines() -> Vec<String> {
+    static CACHE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let mut lines = Vec::new();
+            let mut last_context: Option<crate::plugin::keybindings::BindingContext> = None;
+
+            for binding in crate::plugin::keybindings::KEYBINDINGS {
+                if last_context != Some(binding.context) {
+                    if last_context.is_some() {
+                        lines.push(String::new());
+                    }
+                    lines.push(format!("{}:", binding.context.label()));
+                    last_context = Some(binding.context);
+                }
+                lines.push(format!("  {:<10} {}", binding.keys, binding.action));
+            }
+
+            lines
+        })
+        .clone()
+}
+
+/// Everything between `heading` (matched verbatim, must be a full `## ...` heading line
+/// present in `text`) and the next `## ` heading (or end of `text`), with leading/
+/// trailing blank lines trimmed off (interior blank lines between entries are kept).
+/// `None` if `heading` isn't found, or if the section is empty after trimming — both
+/// read as "nothing here" to callers (see `whats_new_lines_from`, which falls back to
+/// the next section in either case).
+fn extract_section_after(text: &str, heading: &str) -> Option<Vec<String>> {
+    let start = text.find(heading)?;
+    let after_heading = &text[start + heading.len()..];
+    let end = after_heading.find("\n## ").unwrap_or(after_heading.len());
+    let body: Vec<&str> = after_heading[..end].lines().collect();
+
+    let first_non_blank = body.iter().position(|line| !line.trim().is_empty())?;
+    let last_non_blank = body.iter().rposition(|line| !line.trim().is_empty())?;
+    Some(
+        body[first_non_blank..=last_non_blank]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    )
+}
+
+/// The What's New tab's content (TF-585): the current version as a heading, followed by
+/// `CHANGELOG.md`'s `[Unreleased]` entries — embedded at compile time via `include_str!`
+/// so the plugin binary never depends on `CHANGELOG.md` being present at runtime (it
+/// isn't; nothing ships the source repo alongside the built binary).
+fn whats_new_lines() -> Vec<String> {
+    // Cached in a `OnceLock` for the same reason as `about_lines`/`keybindings_lines`:
+    // `include_str!` embeds `CHANGELOG.md` at compile time, so the content can never
+    // change within a running process, and this is otherwise recomputed (including a
+    // full re-parse of the embedded changelog) on every scroll keypress.
+    static CACHE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| whats_new_lines_from(include_str!("../../CHANGELOG.md")))
+        .clone()
+}
+
+/// Pure half of [`whats_new_lines`], taking the changelog content as a parameter so it's
+/// testable against fixture strings without depending on the real `CHANGELOG.md` —
+/// mirrors `config.rs`'s `resolve_api_key`/`load` split (pure core + thin
+/// compile-time-data wrapper).
+fn whats_new_lines_from(changelog: &str) -> Vec<String> {
+    const UNRELEASED_HEADING: &str = "## [Unreleased]";
+    let mut lines = vec![
+        format!("v{} (unreleased)", env!("CARGO_PKG_VERSION")),
+        String::new(),
+    ];
+
+    let section = extract_section_after(changelog, UNRELEASED_HEADING).or_else(|| {
+        // `[Unreleased]` is missing or empty — fall back to the next `## [` heading
+        // after it (the newest real release). Search from just past `[Unreleased]`'s
+        // own heading line so this can't just re-find the same empty section; if
+        // `[Unreleased]` isn't present at all, search the whole file.
+        let search_from = changelog
+            .find(UNRELEASED_HEADING)
+            .and_then(|i| changelog[i..].find('\n').map(|nl| i + nl + 1))
+            .unwrap_or(0);
+        let rest = &changelog[search_from..];
+        let heading_line_start = rest.find("## [")?;
+        let heading_line_end = rest[heading_line_start..]
+            .find('\n')
+            .map(|nl| heading_line_start + nl)
+            .unwrap_or(rest.len());
+        extract_section_after(
+            &rest[heading_line_start..],
+            &rest[heading_line_start..heading_line_end],
+        )
+    });
+
+    match section {
+        Some(entries) => lines.extend(entries),
+        None => lines.push("Couldn't find recent changes in CHANGELOG.md.".to_string()),
+    }
+
+    truncate_with_notice(&mut lines, WHATS_NEW_MAX_LINES);
+    lines
+}
+
+/// Hard cap on how many lines [`whats_new_lines_from`] shows before truncating with a
+/// pointer to the full changelog (follow-up review fix, TF-585 — found during code
+/// review: `CHANGELOG.md`'s real `[Unreleased]` section already runs past 100 lines,
+/// spanning every generic library-scaffolding entry since the project's only release,
+/// not just recent, plugin-facing work, which defeats the point of a "what's new"
+/// summary meant to be read in a small overlay panel). Sized to comfortably fit a normal
+/// terminal without excessive scrolling for a typical release cycle's worth of entries;
+/// deliberately a *display* limit in `ui.rs`; the underlying `CHANGELOG.md` is untouched
+/// and remains the full, authoritative history.
+const WHATS_NEW_MAX_LINES: usize = 30;
+
+/// Truncates `lines` to at most `max` entries, replacing anything past that with a
+/// single "… N more lines" notice pointing at `CHANGELOG.md` — so an oversized section
+/// degrades *visibly* (the reader knows there's more, and where to find it) rather than
+/// silently. No-op if `lines` is already within `max`. `max` must be at least `1`.
+fn truncate_with_notice(lines: &mut Vec<String>, max: usize) {
+    debug_assert!(max >= 1, "truncate_with_notice requires max >= 1");
+    if lines.len() <= max {
+        return;
+    }
+    let kept = max - 1; // one of `max` slots is reserved for the notice itself
+    let hidden = lines.len() - kept;
+    lines.truncate(kept);
+    lines.push(format!(
+        "… {hidden} more line{} — see CHANGELOG.md for the full history.",
+        if hidden == 1 { "" } else { "s" }
+    ));
+}
+
+/// The Settings tab's content (TF-585): the plugin's currently-resolved `config.toml`
+/// values. Reads the real environment once, via the same `HERDR_PLUGIN_CONFIG_DIR`/
+/// `LINEAR_API_KEY` lookup `config::load()` uses, then hands off to
+/// `config::resolved_summary` for the actual resolution logic — this function owns no
+/// config-reading of its own, only formatting the result.
+fn settings_lines() -> Vec<String> {
+    let config_dir = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR").map(std::path::PathBuf::from);
+
+    // `var_os` (not `var().ok()`) so a `LINEAR_API_KEY` that's set but not valid UTF-8
+    // can be told apart from one that's simply unset (follow-up review fix, TF-585): the
+    // config-resolution path genuinely can't use a non-Unicode value either way (see
+    // `config::resolve_api_key`, which hits the identical `var().ok()` collapse), so
+    // `resolved_summary` still correctly reports `api_key_set: false` for it — but a
+    // diagnostic tab whose entire purpose is explaining *why* a key isn't resolving
+    // should say so, not silently show the same "✗ Not set" as a key that was never
+    // exported at all.
+    let env_api_key_os = std::env::var_os("LINEAR_API_KEY");
+    let env_key_present_but_not_utf8 = env_api_key_os
+        .as_deref()
+        .is_some_and(|v| !v.is_empty() && v.to_str().is_none());
+    let env_api_key = env_api_key_os.as_deref().and_then(|v| v.to_str());
+
+    let summary = crate::plugin::config::resolved_summary(config_dir.as_deref(), env_api_key);
+    settings_lines_from(&summary, env_key_present_but_not_utf8)
+}
+
+/// Pure half of [`settings_lines`], taking an already-resolved summary so it's testable
+/// without touching the real environment. `env_key_present_but_not_utf8` is the one piece
+/// of diagnostic state `ResolvedConfigSummary` can't carry on its own (it only knows
+/// `api_key_set: bool`, which is correctly `false` in this case too, since a non-Unicode
+/// env var is just as unusable for authentication as a missing one) — see
+/// [`settings_lines`]'s doc comment for why the Settings tab still needs to tell the two
+/// "not set" cases apart in its own display text.
+fn settings_lines_from(
+    summary: &crate::plugin::config::ResolvedConfigSummary,
+    env_key_present_but_not_utf8: bool,
+) -> Vec<String> {
+    use crate::plugin::config::ConfigFileStatus;
+
+    let mut lines = Vec::new();
+    match &summary.status {
+        ConfigFileStatus::NotFound => {
+            lines.push("Config: no file found, using defaults.".to_string())
+        }
+        ConfigFileStatus::Found => lines.push("Config: found".to_string()),
+        ConfigFileStatus::Invalid(message) => lines.push(format!(
+            "Config: {} exists but is invalid — {message}",
+            summary.path
+        )),
+    }
+    lines.push(format!("Location: {}", summary.path));
+    lines.push(String::new());
+
+    let api_key_display = if summary.api_key_set {
+        "✓ Set"
+    } else if env_key_present_but_not_utf8 {
+        "✗ Not set (LINEAR_API_KEY is set but isn't valid UTF-8)"
+    } else {
+        "✗ Not set"
+    };
+    lines.push(format!("api_key          = {api_key_display}"));
+
+    let agent_command_display = summary.agent_command.as_deref().unwrap_or("(default)");
+    lines.push(format!("agent_command    = {agent_command_display}"));
+
+    let team_id_display = summary.team_id.as_deref().unwrap_or("Not set");
+    lines.push(format!("team_id          = {team_id_display}"));
+
+    if summary.project_overrides.is_empty() {
+        lines.push("project_overrides: (none)".to_string());
+    } else {
+        lines.push("project_overrides:".to_string());
+        for (repo, project_id) in &summary.project_overrides {
+            lines.push(format!("  {repo:<15} = {project_id}"));
+        }
+    }
+
+    lines
+}
+
+/// The *rendered* row count of `tab`'s content — the number of terminal rows it will
+/// actually occupy once `draw_help_overlay` wraps it with `Wrap { trim: false }`, not
+/// just the number of logical `\n`-separated entries. Lets `App::help_overlay_scroll_down`
+/// (final-review fix, TF-585) clamp the stored scroll offset against what will really be
+/// on screen, since that's otherwise only known here in `ui.rs`.
+///
+/// Follow-up review fix (TF-585): this used to return the raw `Vec<String>` length —
+/// correct only if every entry is short enough to never wrap. `ratatui::Paragraph::scroll`
+/// offsets by *rendered* rows, so any tab with a line wider than the popup (plausible for
+/// `whats_new_lines()`, which pulls raw prose from `CHANGELOG.md`) would have more visual
+/// rows than the old count reported — clamping `j`/`↓` short of the real end and making
+/// the tail of that tab's content permanently unreachable. This estimates wrapped rows via
+/// [`word_wrapped_row_count`] against [`CONSERVATIVE_WRAP_WIDTH`] instead of the real,
+/// dynamic terminal width — `App` is deliberately kept unaware of terminal size (it stays
+/// a plain, headlessly-testable key-event state machine), and the assumed width being
+/// narrower than any realistic terminal's popup content area means this can only
+/// *over*-estimate rows relative to the true, wider render (greedy word-wrap needs the
+/// same or more rows at a narrower width, never fewer), which is the safe direction: a
+/// few extra scrollable rows land on the same last screen `Paragraph::scroll` already
+/// clips gracefully, rather than the real bug this guards against — under-counting, which
+/// would make content unreachable.
+pub(crate) fn content_line_count(tab: HelpTab) -> usize {
+    let lines = match tab {
+        HelpTab::WhatsNew => whats_new_lines(),
+        HelpTab::Keybindings => keybindings_lines(),
+        HelpTab::Settings => settings_lines(),
+        HelpTab::About => about_lines(),
+    };
+    lines
+        .iter()
+        .map(|line| word_wrapped_row_count(line, CONSERVATIVE_WRAP_WIDTH))
+        .sum()
+}
+
+/// Assumed content width (columns) used only to keep [`content_line_count`]'s
+/// scroll-clamp ceiling from running out ahead of the real, wrapped render — see that
+/// function's doc comment for why a narrower-than-real assumption is the safe direction.
+/// The popup itself is `centered_rect(80, 90, frame.area())`'s width, minus 2 columns for
+/// the bordered `Block`; even an unusually narrow 40-column terminal still leaves
+/// `40 * 0.8 - 2 = 30` columns of real content width, so this stays at or below that for
+/// a comfortable margin without being so small the estimate balloons needlessly.
+const CONSERVATIVE_WRAP_WIDTH: usize = 28;
+
+/// The number of rows a single logical `line` would occupy once greedily word-wrapped to
+/// at most `width` columns — closely mirroring how ratatui's `Wrap` widget breaks text
+/// (pack space-separated words; when the next word wouldn't fit, start a new row; a lone
+/// word wider than `width` on its own is hard-broken across `word_len.div_ceil(width)`
+/// rows). An empty line still occupies exactly one (blank) row, matching how a blank line
+/// renders. Deliberately approximate — see [`content_line_count`] for why an
+/// approximation biased toward *over*-counting rows is the safe choice here, not a bug.
+fn word_wrapped_row_count(line: &str, width: usize) -> usize {
+    let width = width.max(1);
+    if line.is_empty() {
+        return 1;
+    }
+
+    let mut rows = 1usize;
+    let mut col = 0usize; // columns used so far on the current row
+
+    for word in line.split(' ') {
+        let word_len = word.chars().count();
+
+        if word_len > width {
+            // A single word wider than the whole row: hard-break it across its own
+            // rows, then carry on with whatever comes after it on a fresh row.
+            if col > 0 {
+                rows += 1;
+            }
+            rows += word_len.div_ceil(width) - 1;
+            col = word_len - (word_len.div_ceil(width) - 1) * width;
+            continue;
+        }
+
+        let needed = if col == 0 {
+            word_len
+        } else {
+            col + 1 + word_len
+        };
+        if needed <= width {
+            col = needed;
+        } else {
+            rows += 1;
+            col = word_len;
+        }
+    }
+
+    rows
+}
+
+/// Renders the help overlay (`?` — TF-585) on top of whatever `draw` already drew for
+/// the current screen: `Clear` the area first (ratatui doesn't blank a widget's
+/// background on its own — without this, stale content from beneath shows through
+/// wherever this frame's text doesn't happen to overwrite it), then the tab bar +
+/// scrollable body + footer, matching the herdr-file-viewer reference screenshot this
+/// design follows.
+fn draw_help_overlay(frame: &mut Frame, overlay: &HelpOverlayState) {
+    let area = centered_rect(80, 90, frame.area());
+    frame.render_widget(Clear, area);
+
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(area);
+
+    // The active tab is marked with a reversed-video style (follow-up review fix,
+    // TF-585 — a plain "> " text prefix, as this used before, was too easy to miss at a
+    // glance, per user feedback screenshotting the running app). Matches `draw_menu`'s
+    // own selection highlight (`Modifier::REVERSED`) so "currently selected" reads the
+    // same way everywhere in this UI, not as a one-off convention just for this overlay.
+    let mut title_spans: Vec<Span> = vec![Span::raw("Help: ")];
+    for (i, &tab) in HelpTab::ALL.iter().enumerate() {
+        if i > 0 {
+            title_spans.push(Span::raw("   "));
+        }
+        if tab == overlay.tab {
+            title_spans.push(Span::styled(
+                tab.title(),
+                Style::default().add_modifier(Modifier::REVERSED),
+            ));
+        } else {
+            title_spans.push(Span::raw(tab.title()));
+        }
+    }
+
+    let content = match overlay.tab {
+        HelpTab::WhatsNew => whats_new_lines(),
+        HelpTab::Keybindings => keybindings_lines(),
+        HelpTab::Settings => settings_lines(),
+        HelpTab::About => about_lines(),
+    }
+    .join("\n");
+
+    let body = Paragraph::new(content)
+        .block(Block::default().borders(Borders::ALL).title(title_spans))
+        .wrap(Wrap { trim: false })
+        .scroll((overlay.scroll, 0));
+    frame.render_widget(body, outer[0]);
+
+    let footer = Paragraph::new("Tab/←→ switch · 1-4 jump · j/k scroll · Esc/q/? close")
+        .style(Style::default().add_modifier(Modifier::DIM));
+    frame.render_widget(footer, outer[1]);
+}
+
+/// A `Rect` centered within `area`, `percent_width`/`percent_height` of its size — the
+/// standard ratatui popup-centering recipe (two nested percentage-based `Layout` splits,
+/// taking the middle cell of each).
+fn centered_rect(
+    percent_width: u16,
+    percent_height: u16,
+    area: ratatui::layout::Rect,
+) -> ratatui::layout::Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_height) / 2),
+            Constraint::Percentage(percent_height),
+            Constraint::Percentage((100 - percent_height) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_width) / 2),
+            Constraint::Percentage(percent_width),
+            Constraint::Percentage((100 - percent_width) / 2),
+        ])
+        .split(vertical[1])[1]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,6 +782,36 @@ mod tests {
 
     fn rendered_text(app: &App) -> String {
         rendered_text_with_size(app, 60, 15)
+    }
+
+    /// Like [`rendered_text_with_size`], but keeps each cell's [`Modifier`] alongside its
+    /// symbol instead of discarding it — needed to verify a *visual* highlight (e.g.
+    /// `Modifier::REVERSED`), which `rendered_text_with_size`'s plain-`String` output has
+    /// no way to represent. Cell order matches the buffer's own row-major layout, same as
+    /// `rendered_text_with_size`.
+    fn rendered_cells_with_size(app: &App, width: u16, height: u16) -> Vec<(String, Modifier)> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| (cell.symbol().to_string(), cell.modifier))
+            .collect()
+    }
+
+    /// The start index of the first contiguous run of `symbols` matching `needle`,
+    /// character by character — used to locate a known label (e.g. a tab name) within
+    /// [`rendered_cells_with_size`]'s output so its cells' styling can be inspected.
+    fn find_cell_run(symbols: &[String], needle: &str) -> Option<usize> {
+        let needle_chars: Vec<String> = needle.chars().map(|c| c.to_string()).collect();
+        if needle_chars.is_empty() || symbols.len() < needle_chars.len() {
+            return None;
+        }
+        (0..=symbols.len() - needle_chars.len())
+            .find(|&start| symbols[start..start + needle_chars.len()] == needle_chars[..])
     }
 
     /// An `App` that has already entered the "My Issues" view (still `Loading`).
@@ -676,5 +1127,487 @@ mod tests {
         let text = rendered_text(&app);
         assert!(text.contains("No issues match"));
         assert!(!text.contains("Title for ENG-1"));
+    }
+
+    #[test]
+    fn about_lines_include_version_repo_and_license() {
+        let text = about_lines().join("\n");
+
+        assert!(text.contains(env!("CARGO_PKG_VERSION")));
+        assert!(text.contains("github.com/talent-factory/herdr-linear"));
+        assert!(text.contains("MIT"));
+    }
+
+    #[test]
+    fn keybindings_lines_include_every_binding_from_the_registry() {
+        let text = keybindings_lines().join("\n");
+
+        for binding in crate::plugin::keybindings::KEYBINDINGS {
+            assert!(
+                text.contains(binding.keys),
+                "missing key `{}` in keybindings tab",
+                binding.keys
+            );
+            assert!(
+                text.contains(binding.action),
+                "missing action `{}` in keybindings tab",
+                binding.action
+            );
+        }
+    }
+
+    #[test]
+    fn keybindings_lines_group_by_context_with_headings() {
+        let lines = keybindings_lines();
+
+        assert!(lines.contains(&"Menu:".to_string()));
+        assert!(lines.contains(&"Global:".to_string()));
+    }
+
+    #[test]
+    fn keybindings_lines_does_not_repeat_a_context_heading() {
+        let lines = keybindings_lines();
+        let heading_count = lines.iter().filter(|line| *line == "Menu:").count();
+
+        assert_eq!(heading_count, 1);
+    }
+
+    #[test]
+    fn word_wrapped_row_count_is_one_for_an_empty_line() {
+        assert_eq!(word_wrapped_row_count("", 28), 1);
+    }
+
+    #[test]
+    fn word_wrapped_row_count_is_one_when_the_line_fits_within_width() {
+        assert_eq!(word_wrapped_row_count("a short line", 28), 1);
+    }
+
+    #[test]
+    fn word_wrapped_row_count_wraps_at_a_word_boundary_not_mid_word() {
+        // "one two three" is 13 chars; at width 8, "one two" (7 chars) fits but adding
+        // "three" wouldn't (7 + 1 + 5 = 13 > 8), so it must wrap before "three", not
+        // mid-word.
+        assert_eq!(word_wrapped_row_count("one two three", 8), 2);
+    }
+
+    #[test]
+    fn word_wrapped_row_count_hard_breaks_a_single_word_wider_than_width() {
+        let word = "a".repeat(65);
+        assert_eq!(word_wrapped_row_count(&word, 28), 3); // ceil(65 / 28) == 3
+    }
+
+    #[test]
+    fn word_wrapped_row_count_continues_correctly_after_a_hard_broken_word() {
+        let line = format!("short {}", "a".repeat(65));
+        // "short" (row 1) then the 65-char word can't fit in the remaining space, so it
+        // starts its own fresh row and needs ceil(65/28) = 3 rows of its own: 1 + 3 = 4.
+        assert_eq!(word_wrapped_row_count(&line, 28), 4);
+    }
+
+    /// Follow-up review fix (TF-585): `content_line_count` used to be the raw
+    /// `Vec&lt;String&gt;` entry count, which under-counts whenever a tab has a line wider
+    /// than the popup — the exact scenario that made the scroll clamp stop short of a
+    /// tab's real end. Confirms the fix: a single very long entry now contributes more
+    /// than one row to the estimate, not one.
+    #[test]
+    fn content_line_count_accounts_for_wrapping_of_a_long_line() {
+        let long_line = "word ".repeat(40); // far wider than any realistic popup content
+
+        let wrapped_rows = word_wrapped_row_count(&long_line, CONSERVATIVE_WRAP_WIDTH);
+
+        assert!(
+            wrapped_rows > 1,
+            "expected wrapping to inflate the row count beyond the raw entry count of 1"
+        );
+    }
+
+    #[test]
+    fn extract_section_after_returns_entries_between_heading_and_next_section() {
+        let changelog = "## [Unreleased]\n### Added\n- Thing one\n- Thing two\n\n\
+                         ## [0.1.0] - 2026-08-04\n### Added\n- Old thing\n";
+
+        let section = extract_section_after(changelog, "## [Unreleased]").unwrap();
+
+        assert_eq!(
+            section,
+            vec![
+                "### Added".to_string(),
+                "- Thing one".to_string(),
+                "- Thing two".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_section_after_stops_at_the_next_level_two_heading() {
+        let changelog = "## [Unreleased]\n### Added\n- Thing\n\
+                         ## [0.1.0] - 2026-08-04\n### Added\n- Old thing\n";
+
+        let section = extract_section_after(changelog, "## [Unreleased]").unwrap();
+
+        assert!(!section.iter().any(|line| line.contains("Old thing")));
+    }
+
+    #[test]
+    fn extract_section_after_returns_none_for_an_empty_section() {
+        let changelog = "## [Unreleased]\n\n## [0.1.0] - 2026-08-04\n### Added\n- Old thing\n";
+
+        assert_eq!(extract_section_after(changelog, "## [Unreleased]"), None);
+    }
+
+    #[test]
+    fn extract_section_after_returns_none_when_heading_is_missing() {
+        let changelog = "## [0.1.0] - 2026-08-04\n### Added\n- Old thing\n";
+
+        assert_eq!(extract_section_after(changelog, "## [Unreleased]"), None);
+    }
+
+    #[test]
+    fn whats_new_lines_from_uses_unreleased_entries_when_present() {
+        let changelog = "## [Unreleased]\n### Added\n- Thing one\n\n\
+                         ## [0.1.0] - 2026-08-04\n### Added\n- Old\n";
+
+        let lines = whats_new_lines_from(changelog);
+
+        assert!(lines[0].contains(env!("CARGO_PKG_VERSION")));
+        assert!(lines.contains(&"### Added".to_string()));
+        assert!(lines.contains(&"- Thing one".to_string()));
+        assert!(!lines.iter().any(|line| line.contains("- Old")));
+    }
+
+    #[test]
+    fn whats_new_lines_from_falls_back_to_the_next_release_when_unreleased_is_empty() {
+        let changelog = "## [Unreleased]\n\n## [0.1.0] - 2026-08-04\n### Added\n- First release\n";
+
+        let lines = whats_new_lines_from(changelog);
+
+        assert!(lines.contains(&"- First release".to_string()));
+    }
+
+    #[test]
+    fn whats_new_lines_from_falls_back_when_unreleased_heading_is_missing_entirely() {
+        let changelog = "## [0.1.0] - 2026-08-04\n### Added\n- First release\n";
+
+        let lines = whats_new_lines_from(changelog);
+
+        assert!(lines.contains(&"- First release".to_string()));
+    }
+
+    #[test]
+    fn whats_new_lines_from_reports_when_nothing_parses_at_all() {
+        let changelog = "Not a changelog at all.";
+
+        let lines = whats_new_lines_from(changelog);
+
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("Couldn't find recent changes")));
+    }
+
+    /// Follow-up review fix (TF-585): `whats_new_lines_from` used to show the entire
+    /// `[Unreleased]` section verbatim, however large — confirms an oversized section
+    /// now gets truncated to `WHATS_NEW_MAX_LINES` with a visible "…N more" notice
+    /// instead of dumping everything into the overlay.
+    #[test]
+    fn whats_new_lines_from_truncates_a_very_long_unreleased_section_with_a_notice() {
+        let entries = (0..50)
+            .map(|i| format!("- entry {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let changelog = format!("## [Unreleased]\n### Added\n{entries}\n");
+
+        let lines = whats_new_lines_from(&changelog);
+
+        assert_eq!(lines.len(), WHATS_NEW_MAX_LINES);
+        let last = lines.last().unwrap();
+        assert!(
+            last.contains("more line") && last.contains("CHANGELOG.md"),
+            "expected a truncation notice, got: {last:?}"
+        );
+        // The entries that *did* make the cut must be the first ones, not an arbitrary
+        // subset — a reader scanning from the top should see the earliest (per
+        // Keep-a-Changelog convention, most-recently-added) entries first.
+        assert!(lines.contains(&"- entry 0".to_string()));
+        assert!(!lines.contains(&"- entry 49".to_string()));
+    }
+
+    #[test]
+    fn whats_new_lines_from_does_not_truncate_when_within_the_limit() {
+        let changelog = "## [Unreleased]\n### Added\n- one\n- two\n\
+                         ## [0.1.0] - 2026-08-04\n### Added\n- old\n";
+
+        let lines = whats_new_lines_from(changelog);
+
+        assert!(!lines.iter().any(|line| line.contains("more line")));
+    }
+
+    #[test]
+    fn truncate_with_notice_is_a_no_op_when_already_within_the_limit() {
+        let mut lines = vec!["a".to_string(), "b".to_string()];
+
+        truncate_with_notice(&mut lines, 5);
+
+        assert_eq!(lines, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn truncate_with_notice_reports_the_correct_hidden_count() {
+        let mut lines: Vec<String> = (0..10).map(|i| i.to_string()).collect();
+
+        truncate_with_notice(&mut lines, 4);
+
+        assert_eq!(lines.len(), 4);
+        assert!(lines[3].contains("7 more lines"), "got: {:?}", lines[3]);
+    }
+
+    #[test]
+    fn whats_new_lines_reads_the_real_changelog_and_includes_the_current_version() {
+        let lines = whats_new_lines();
+
+        assert!(lines[0].contains(env!("CARGO_PKG_VERSION")));
+        assert!(lines.len() > 2, "expected real entries, got: {lines:?}");
+        // Follow-up review fix (TF-585): the real `[Unreleased]` section runs well past
+        // 100 lines (everything since the project's only release, not just recent
+        // work) — this is the ceiling the old version of this test was missing, which
+        // is exactly why the lack of a size cap went unnoticed.
+        assert!(
+            lines.len() <= WHATS_NEW_MAX_LINES,
+            "expected the What's New tab to stay within its display cap, got {} lines: {lines:?}",
+            lines.len()
+        );
+    }
+
+    #[test]
+    fn settings_lines_from_not_found_shows_defaults_message() {
+        let summary = crate::plugin::config::ResolvedConfigSummary {
+            path: "/fake/config.toml".to_string(),
+            status: crate::plugin::config::ConfigFileStatus::NotFound,
+            api_key_set: false,
+            agent_command: None,
+            team_id: None,
+            project_overrides: std::collections::BTreeMap::new(),
+        };
+
+        let lines = settings_lines_from(&summary, false).join("\n");
+
+        assert!(lines.contains("no file found, using defaults"));
+        assert!(lines.contains("✗ Not set"));
+        assert!(lines.contains("(default)"));
+    }
+
+    /// Follow-up review fix (TF-585): `settings_lines()` used to collapse "LINEAR_API_KEY
+    /// unset" and "LINEAR_API_KEY set but not valid UTF-8" into the same "✗ Not set" —
+    /// misleading specifically on the one tab whose job is explaining *why* a key isn't
+    /// resolving. Confirms the two cases now render distinct messages given the same
+    /// otherwise-empty `ResolvedConfigSummary`.
+    #[test]
+    fn settings_lines_from_distinguishes_unset_from_non_utf8_env_key() {
+        let summary = crate::plugin::config::ResolvedConfigSummary {
+            path: "/fake/config.toml".to_string(),
+            status: crate::plugin::config::ConfigFileStatus::NotFound,
+            api_key_set: false,
+            agent_command: None,
+            team_id: None,
+            project_overrides: std::collections::BTreeMap::new(),
+        };
+
+        let unset = settings_lines_from(&summary, false).join("\n");
+        let non_utf8 = settings_lines_from(&summary, true).join("\n");
+
+        assert!(unset.contains("✗ Not set"));
+        assert!(!unset.contains("UTF-8"));
+        assert!(non_utf8.contains("✗ Not set"));
+        assert!(non_utf8.contains("LINEAR_API_KEY is set but isn't valid UTF-8"));
+    }
+
+    #[test]
+    fn settings_lines_from_found_shows_masked_api_key_and_resolved_values() {
+        let mut project_overrides = std::collections::BTreeMap::new();
+        project_overrides.insert("herdr-linear".to_string(), "proj-1".to_string());
+        let summary = crate::plugin::config::ResolvedConfigSummary {
+            path: "/fake/config.toml".to_string(),
+            status: crate::plugin::config::ConfigFileStatus::Found,
+            api_key_set: true,
+            agent_command: Some("my-agent".to_string()),
+            team_id: Some("team-123".to_string()),
+            project_overrides,
+        };
+
+        let lines = settings_lines_from(&summary, false).join("\n");
+
+        assert!(lines.contains("Config: found"));
+        assert!(lines.contains("✓ Set"));
+        assert!(!lines.contains("lin_api_"));
+        assert!(lines.contains("my-agent"));
+        assert!(lines.contains("team-123"));
+        assert!(lines.contains("herdr-linear"));
+        assert!(lines.contains("proj-1"));
+    }
+
+    #[test]
+    fn settings_lines_from_invalid_shows_the_error_message_and_no_stale_values() {
+        let summary = crate::plugin::config::ResolvedConfigSummary {
+            path: "/fake/config.toml".to_string(),
+            status: crate::plugin::config::ConfigFileStatus::Invalid("not valid TOML".to_string()),
+            api_key_set: false,
+            agent_command: None,
+            team_id: None,
+            project_overrides: std::collections::BTreeMap::new(),
+        };
+
+        let lines = settings_lines_from(&summary, false).join("\n");
+
+        assert!(lines.contains("is invalid"));
+        assert!(lines.contains("not valid TOML"));
+        assert!(lines.contains("✗ Not set"));
+    }
+
+    #[test]
+    fn help_overlay_renders_on_top_of_the_menu_when_open() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        let text = rendered_text_with_size(&app, 100, 30);
+
+        assert!(text.contains("Help:"));
+        assert!(text.contains("What's New"));
+        assert!(text.contains("Keybindings"));
+        assert!(text.contains("Settings"));
+        assert!(text.contains("About"));
+    }
+
+    /// Follow-up review fix (TF-585): the active tab used to be marked with a plain
+    /// "> " text prefix, which user testing on the running app found too easy to miss at
+    /// a glance. It's now a reversed-video highlight instead (matching `draw_menu`'s own
+    /// selection style) — this asserts the *actual visual style*, not just that some text
+    /// marker string is present, since a plain `rendered_text`-based `.contains()` check
+    /// can't tell a styled render from an unstyled one at all (style info doesn't survive
+    /// that helper's flattening to a plain string).
+    #[test]
+    fn help_overlay_marks_the_active_tab_with_a_reversed_highlight() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE); // -> WhatsNew (default)
+
+        let cells = rendered_cells_with_size(&app, 100, 30);
+        let symbols: Vec<String> = cells.iter().map(|(s, _)| s.clone()).collect();
+
+        let active_start = find_cell_run(&symbols, "What's New")
+            .expect("expected to find the active tab's label in the render");
+        for cell in &cells[active_start..active_start + "What's New".chars().count()] {
+            assert!(
+                cell.1.contains(Modifier::REVERSED),
+                "expected every cell of the active tab's label to be reversed-highlighted, \
+                 got symbol {:?} with modifier {:?}",
+                cell.0,
+                cell.1
+            );
+        }
+
+        // An *inactive* tab's label must NOT carry the same highlight, or every tab
+        // would look "selected" and the highlight would communicate nothing.
+        let inactive_start = find_cell_run(&symbols, "About")
+            .expect("expected to find an inactive tab's label in the render");
+        for cell in &cells[inactive_start..inactive_start + "About".chars().count()] {
+            assert!(
+                !cell.1.contains(Modifier::REVERSED),
+                "expected an inactive tab's label to NOT be reversed-highlighted, \
+                 got symbol {:?} with modifier {:?}",
+                cell.0,
+                cell.1
+            );
+        }
+    }
+
+    #[test]
+    fn help_overlay_shows_the_footer_controls() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        let text = rendered_text_with_size(&app, 100, 30);
+
+        // Follow-up review fix (TF-585): the original assertion here only checked for
+        // "close", which would still pass even if the switch/jump/scroll hints were
+        // dropped or garbled. Assert the full footer text verbatim so a change to any
+        // part of it is caught, not just an accidental removal of the whole line.
+        assert!(
+            text.contains("Tab/←→ switch · 1-4 jump · j/k scroll · Esc/q/? close"),
+            "footer controls text missing or changed, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn help_overlay_switches_tab_content_on_number_jump() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('4'), KeyModifiers::NONE); // -> About
+
+        let text = rendered_text_with_size(&app, 100, 30);
+
+        assert!(text.contains("About"));
+        assert!(text.contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    /// Follow-up review fix (TF-585): the About tab was the only one ever rendered
+    /// end-to-end through `handle_key` + `rendered_text_with_size` — Keybindings and
+    /// Settings (below) were exercised only at the `*_lines()`/`*_lines_from()` function
+    /// level, never through the full `draw_help_overlay` render path. This confirms the
+    /// Keybindings tab actually renders every entry from the canonical registry, not
+    /// just that `keybindings_lines()` in isolation contains them.
+    #[test]
+    fn help_overlay_renders_the_keybindings_tab_with_every_registered_binding() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('2'), KeyModifiers::NONE); // -> Keybindings
+
+        let text = rendered_text_with_size(&app, 100, 40);
+
+        assert!(text.contains("Keybindings"));
+        for binding in crate::plugin::keybindings::KEYBINDINGS {
+            assert!(
+                text.contains(binding.action),
+                "rendered Keybindings tab is missing action `{}`",
+                binding.action
+            );
+        }
+    }
+
+    /// Companion to the above for the Settings tab — the one tab whose content is
+    /// produced by `settings_lines()`, the impure wrapper that reads
+    /// `HERDR_PLUGIN_CONFIG_DIR`/`LINEAR_API_KEY` from the real environment (previously
+    /// never called by any test; only its pure half `settings_lines_from` was, with
+    /// injected data). Deliberately doesn't set or clear those env vars — mutating them
+    /// would risk interfering with other tests running in parallel in the same process
+    /// (this crate's established convention throughout `config.rs` is to leave impure
+    /// env-reading wrappers untested for exactly that reason) — so this only asserts the
+    /// field labels `settings_lines_from` always emits regardless of what's actually
+    /// resolved, which is enough to confirm `settings_lines()` really is wired through to
+    /// a real render, not just its pure half in isolation.
+    #[test]
+    fn help_overlay_renders_the_settings_tab_via_the_real_config_wiring() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('3'), KeyModifiers::NONE); // -> Settings
+
+        let text = rendered_text_with_size(&app, 100, 40);
+
+        assert!(text.contains("Settings"));
+        assert!(text.contains("Location:"));
+        assert!(text.contains("api_key"));
+        assert!(text.contains("agent_command"));
+        assert!(text.contains("team_id"));
+        assert!(text.contains("project_overrides"));
+    }
+
+    #[test]
+    fn help_overlay_closes_and_the_underlying_screen_reappears_unchanged() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+        let text = rendered_text(&app);
+        assert!(!text.contains("Help:"));
+        assert!(text.contains("ENG-1"));
     }
 }

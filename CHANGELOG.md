@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+
+- In-app Help overlay (`?` key): What's New / Keybindings / Settings / About (TF-585)
+- Type-to-filter the loaded issue list by title/identifier (TF-580)
+- Guaranteed tab-per-issue on the Linear implement flow (TF-579)
+- Unique per-issue herdr agent names + multi-select issues (TF-590)
+
 - Initial project setup
 - Core `LinearClient` implementation
 - GraphQL query/mutation execution
