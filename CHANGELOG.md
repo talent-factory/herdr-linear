@@ -112,7 +112,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inherited herdr's implicit default placement (often a split into whichever tab currently had
   focus), and a follow-up tab rename would then relabel whatever tab that turned out to be —
   possibly a different, already-running issue's tab. Every implemented issue now gets a
-  freshly created, explicitly targeted, pre-labeled tab with exactly one pane (TF-579)
+  freshly created, explicitly targeted, pre-labeled tab, with its now-redundant extra pane
+  closed on a best-effort basis (a failure to close it is a non-fatal warning, not an abort)
+  (TF-579)
 
 ### Removed
 - Unused `cli` Cargo feature (and its `clap` dependency), superseded by the `plugin` feature

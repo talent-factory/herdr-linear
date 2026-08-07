@@ -69,19 +69,25 @@ What follows changes:
 3. Workflow-state transition (`get_workflow_states` → `pick_in_progress_state` →
    `update_issue`), `agent_wait`, `send_prompt_until_visible` — unchanged, same warning-not-abort
    shape as today.
-4. The old post-`agent_start` `tab_rename` call is removed; nothing replaces it.
+4. The old post-`agent_start` `tab_rename` call is removed; **see the addendum below** — it is
+   replaced by a `pane_close` call in that same position, not left with nothing.
 
 ## Data flow
 
 ```
 start_implementation
   ├─ resolve_preferred_agent / resolve_agent_command / build_shell_argv / resolve_cwd  (unchanged)
-  ├─ tab_create(cwd, issue.identifier)      -> TabId          [NEW - can abort cheaply]
+  ├─ tab_create(cwd, issue.identifier)       -> TabCreated     [NEW - can abort cheaply]
   ├─ agent_start(command, cwd, tab_id, argv) -> AgentStarted   [tab_id now required input]
+  ├─ pane_close(root_pane_id)                                 [NEW - non-fatal, see addendum]
   ├─ get_workflow_states -> pick_in_progress_state -> update_issue   (unchanged, warning-only)
   ├─ agent_wait(pane_id, "idle", 30_000)                              (unchanged)
   └─ send_prompt_until_visible(pane_id, prompt)                       (unchanged)
 ```
+
+See the addendum below: `tab_create`'s return type became `TabCreated { tab_id, root_pane_id }`
+(not the plain `TabId` this section originally specified), to carry the root pane id `pane_close`
+needs.
 
 ## Error handling
 
