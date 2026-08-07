@@ -370,6 +370,63 @@ fn whats_new_lines_from(changelog: &str) -> Vec<String> {
     lines
 }
 
+/// The Settings tab's content (TF-585): the plugin's currently-resolved `config.toml`
+/// values. Reads the real environment once, via the same `HERDR_PLUGIN_CONFIG_DIR`/
+/// `LINEAR_API_KEY` lookup `config::load()` uses, then hands off to
+/// `config::resolved_summary` for the actual resolution logic — this function owns no
+/// config-reading of its own, only formatting the result.
+fn settings_lines() -> Vec<String> {
+    let config_dir = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR").map(std::path::PathBuf::from);
+    let env_api_key = std::env::var("LINEAR_API_KEY").ok();
+    let summary =
+        crate::plugin::config::resolved_summary(config_dir.as_deref(), env_api_key.as_deref());
+    settings_lines_from(&summary)
+}
+
+/// Pure half of [`settings_lines`], taking an already-resolved summary so it's testable
+/// without touching the real environment.
+fn settings_lines_from(summary: &crate::plugin::config::ResolvedConfigSummary) -> Vec<String> {
+    use crate::plugin::config::ConfigFileStatus;
+
+    let mut lines = Vec::new();
+    match &summary.status {
+        ConfigFileStatus::NotFound => {
+            lines.push("Config: no file found, using defaults.".to_string())
+        }
+        ConfigFileStatus::Found => lines.push("Config: found".to_string()),
+        ConfigFileStatus::Invalid(message) => lines.push(format!(
+            "Config: {} exists but is invalid — {message}",
+            summary.path
+        )),
+    }
+    lines.push(format!("Location: {}", summary.path));
+    lines.push(String::new());
+
+    let api_key_display = if summary.api_key_set {
+        "✓ Set"
+    } else {
+        "✗ Not set"
+    };
+    lines.push(format!("api_key          = {api_key_display}"));
+
+    let agent_command_display = summary.agent_command.as_deref().unwrap_or("(default)");
+    lines.push(format!("agent_command    = {agent_command_display}"));
+
+    let team_id_display = summary.team_id.as_deref().unwrap_or("Not set");
+    lines.push(format!("team_id          = {team_id_display}"));
+
+    if summary.project_overrides.is_empty() {
+        lines.push("project_overrides: (none)".to_string());
+    } else {
+        lines.push("project_overrides:".to_string());
+        for (repo, project_id) in &summary.project_overrides {
+            lines.push(format!("  {repo:<15} = {project_id}"));
+        }
+    }
+
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -918,5 +975,65 @@ mod tests {
 
         assert!(lines[0].contains(env!("CARGO_PKG_VERSION")));
         assert!(lines.len() > 2, "expected real entries, got: {lines:?}");
+    }
+
+    #[test]
+    fn settings_lines_from_not_found_shows_defaults_message() {
+        let summary = crate::plugin::config::ResolvedConfigSummary {
+            path: "/fake/config.toml".to_string(),
+            status: crate::plugin::config::ConfigFileStatus::NotFound,
+            api_key_set: false,
+            agent_command: None,
+            team_id: None,
+            project_overrides: std::collections::BTreeMap::new(),
+        };
+
+        let lines = settings_lines_from(&summary).join("\n");
+
+        assert!(lines.contains("no file found, using defaults"));
+        assert!(lines.contains("✗ Not set"));
+        assert!(lines.contains("(default)"));
+    }
+
+    #[test]
+    fn settings_lines_from_found_shows_masked_api_key_and_resolved_values() {
+        let mut project_overrides = std::collections::BTreeMap::new();
+        project_overrides.insert("herdr-linear".to_string(), "proj-1".to_string());
+        let summary = crate::plugin::config::ResolvedConfigSummary {
+            path: "/fake/config.toml".to_string(),
+            status: crate::plugin::config::ConfigFileStatus::Found,
+            api_key_set: true,
+            agent_command: Some("my-agent".to_string()),
+            team_id: Some("team-123".to_string()),
+            project_overrides,
+        };
+
+        let lines = settings_lines_from(&summary).join("\n");
+
+        assert!(lines.contains("Config: found"));
+        assert!(lines.contains("✓ Set"));
+        assert!(!lines.contains("lin_api_"));
+        assert!(lines.contains("my-agent"));
+        assert!(lines.contains("team-123"));
+        assert!(lines.contains("herdr-linear"));
+        assert!(lines.contains("proj-1"));
+    }
+
+    #[test]
+    fn settings_lines_from_invalid_shows_the_error_message_and_no_stale_values() {
+        let summary = crate::plugin::config::ResolvedConfigSummary {
+            path: "/fake/config.toml".to_string(),
+            status: crate::plugin::config::ConfigFileStatus::Invalid("not valid TOML".to_string()),
+            api_key_set: false,
+            agent_command: None,
+            team_id: None,
+            project_overrides: std::collections::BTreeMap::new(),
+        };
+
+        let lines = settings_lines_from(&summary).join("\n");
+
+        assert!(lines.contains("is invalid"));
+        assert!(lines.contains("not valid TOML"));
+        assert!(lines.contains("✗ Not set"));
     }
 }
