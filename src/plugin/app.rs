@@ -697,6 +697,16 @@ pub fn handle_key(
         return Some(Action::Quit);
     }
 
+    if app.help_overlay().is_some() {
+        handle_help_overlay_key(app, key);
+        return None;
+    }
+
+    if key == KeyCode::Char('?') && !app.is_filtering() {
+        app.open_help_overlay();
+        return None;
+    }
+
     let in_menu = matches!(app.screen, Screen::Menu { .. });
 
     if in_menu {
@@ -801,6 +811,28 @@ pub fn handle_key(
             open_config_action(std::env::var_os("HERDR_PLUGIN_CONFIG_DIR").as_deref())
         }
         _ => None,
+    }
+}
+
+/// Dispatches a key press while the help overlay (`?`) is open. The overlay owns all
+/// input while active — see `handle_key`'s early check above — so every key reaching
+/// this function is either one of the overlay's own bindings or has no effect; it never
+/// falls through to a menu/view binding.
+fn handle_help_overlay_key(app: &mut App, key: crossterm::event::KeyCode) {
+    use crossterm::event::KeyCode;
+
+    match key {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => app.close_help_overlay(),
+        KeyCode::Tab | KeyCode::Right => app.help_overlay_switch_tab_forward(),
+        KeyCode::Left => app.help_overlay_switch_tab_back(),
+        KeyCode::Char(c @ '1'..='4') => {
+            if let Some(tab) = HelpTab::from_index(c as usize - '1' as usize) {
+                app.help_overlay_jump_tab(tab);
+            }
+        }
+        KeyCode::Char('j') | KeyCode::Down => app.help_overlay_scroll_down(),
+        KeyCode::Char('k') | KeyCode::Up => app.help_overlay_scroll_up(),
+        _ => {}
     }
 }
 
@@ -1905,5 +1937,159 @@ mod tests {
         app.close_help_overlay();
 
         assert_eq!(app.help_overlay(), None);
+    }
+
+    #[test]
+    fn question_mark_opens_the_overlay_from_the_menu() {
+        let mut app = App::new();
+
+        let action = handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        assert_eq!(action, None);
+        assert_eq!(app.help_overlay().unwrap().tab, HelpTab::WhatsNew);
+    }
+
+    #[test]
+    fn question_mark_opens_the_overlay_from_a_loaded_view() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        assert!(app.help_overlay().is_some());
+    }
+
+    #[test]
+    fn question_mark_while_filtering_types_into_the_query_instead_of_opening_the_overlay() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        assert!(app.help_overlay().is_none());
+        assert!(app.is_filtering());
+    }
+
+    #[test]
+    fn overlay_owns_input_and_menu_navigation_does_not_leak_through_while_open() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        // `Down` is a menu-navigation key outside the overlay — while the overlay is
+        // open it must not move the (invisible) menu selection.
+        handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+
+        assert!(matches!(app.screen, Screen::Menu { selected: 0 }));
+        assert!(app.help_overlay().is_some());
+    }
+
+    #[test]
+    fn tab_key_switches_tabs_forward_while_the_overlay_is_open() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        handle_key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+
+        assert_eq!(app.help_overlay().unwrap().tab, HelpTab::Keybindings);
+    }
+
+    #[test]
+    fn right_arrow_switches_tabs_forward_while_the_overlay_is_open() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        handle_key(&mut app, KeyCode::Right, KeyModifiers::NONE);
+
+        assert_eq!(app.help_overlay().unwrap().tab, HelpTab::Keybindings);
+    }
+
+    #[test]
+    fn left_arrow_switches_tabs_backward_while_the_overlay_is_open() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        handle_key(&mut app, KeyCode::Left, KeyModifiers::NONE);
+
+        assert_eq!(app.help_overlay().unwrap().tab, HelpTab::About);
+    }
+
+    #[test]
+    fn number_keys_jump_directly_to_the_matching_tab() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        handle_key(&mut app, KeyCode::Char('3'), KeyModifiers::NONE);
+        assert_eq!(app.help_overlay().unwrap().tab, HelpTab::Settings);
+
+        handle_key(&mut app, KeyCode::Char('1'), KeyModifiers::NONE);
+        assert_eq!(app.help_overlay().unwrap().tab, HelpTab::WhatsNew);
+    }
+
+    #[test]
+    fn j_and_k_scroll_while_the_overlay_is_open() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        handle_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(app.help_overlay().unwrap().scroll, 2);
+
+        handle_key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+        assert_eq!(app.help_overlay().unwrap().scroll, 1);
+    }
+
+    #[test]
+    fn esc_closes_the_overlay() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+        assert!(app.help_overlay().is_none());
+    }
+
+    #[test]
+    fn q_closes_the_overlay() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        handle_key(&mut app, KeyCode::Char('q'), KeyModifiers::NONE);
+
+        assert!(app.help_overlay().is_none());
+    }
+
+    #[test]
+    fn question_mark_again_closes_the_overlay() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        assert!(app.help_overlay().is_none());
+    }
+
+    #[test]
+    fn closing_the_overlay_leaves_the_underlying_screen_untouched() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
+        app.move_selection_down(); // select ENG-2
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+        assert_eq!(app.selected_issue().unwrap().identifier, "ENG-2");
+        assert_eq!(app.current_view(), Some(ViewKind::MyIssues));
+    }
+
+    #[test]
+    fn ctrl_c_quits_even_while_the_overlay_is_open() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL),
+            Some(Action::Quit)
+        );
     }
 }
