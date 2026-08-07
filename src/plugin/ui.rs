@@ -276,6 +276,30 @@ fn about_lines() -> Vec<String> {
     ]
 }
 
+/// The Keybindings tab's content (TF-585): every entry in `keybindings::KEYBINDINGS`
+/// (the single source of truth — see that module's doc comment), grouped under a
+/// heading each time `context` changes. Relies on `KEYBINDINGS` grouping same-context
+/// entries contiguously (an invariant that table's own tests guard) rather than
+/// re-sorting, so the table's declared order (Menu, View, Filtering, Error screen,
+/// Global) is what's shown, not an alphabetized one.
+fn keybindings_lines() -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut last_context: Option<&str> = None;
+
+    for binding in crate::plugin::keybindings::KEYBINDINGS {
+        if last_context != Some(binding.context) {
+            if last_context.is_some() {
+                lines.push(String::new());
+            }
+            lines.push(format!("{}:", binding.context));
+            last_context = Some(binding.context);
+        }
+        lines.push(format!("  {:<10} {}", binding.keys, binding.action));
+    }
+
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -699,5 +723,39 @@ mod tests {
         assert!(text.contains(env!("CARGO_PKG_VERSION")));
         assert!(text.contains("github.com/talent-factory/herdr-linear"));
         assert!(text.contains("MIT"));
+    }
+
+    #[test]
+    fn keybindings_lines_include_every_binding_from_the_registry() {
+        let text = keybindings_lines().join("\n");
+
+        for binding in crate::plugin::keybindings::KEYBINDINGS {
+            assert!(
+                text.contains(binding.keys),
+                "missing key `{}` in keybindings tab",
+                binding.keys
+            );
+            assert!(
+                text.contains(binding.action),
+                "missing action `{}` in keybindings tab",
+                binding.action
+            );
+        }
+    }
+
+    #[test]
+    fn keybindings_lines_group_by_context_with_headings() {
+        let lines = keybindings_lines();
+
+        assert!(lines.contains(&"Menu:".to_string()));
+        assert!(lines.contains(&"Global:".to_string()));
+    }
+
+    #[test]
+    fn keybindings_lines_does_not_repeat_a_context_heading() {
+        let lines = keybindings_lines();
+        let heading_count = lines.iter().filter(|line| *line == "Menu:").count();
+
+        assert_eq!(heading_count, 1);
     }
 }
