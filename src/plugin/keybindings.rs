@@ -26,23 +26,91 @@ pub struct KeyBinding {
 /// the order `handle_key` itself checks them (menu, view, filtering, error-screen-only,
 /// then global).
 pub static KEYBINDINGS: &[KeyBinding] = &[
-    KeyBinding { keys: "↑ / ↓", action: "Move selection", context: "Menu" },
-    KeyBinding { keys: "<Enter>", action: "Open highlighted view", context: "Menu" },
-    KeyBinding { keys: "q / Esc", action: "Quit", context: "Menu" },
-    KeyBinding { keys: "↑ / ↓", action: "Move selection", context: "View" },
-    KeyBinding { keys: "/", action: "Filter issues by title/identifier", context: "View" },
-    KeyBinding { keys: "o", action: "Open selected issue in browser", context: "View" },
-    KeyBinding { keys: "<Space>", action: "Mark/unmark issue for multi-select", context: "View" },
-    KeyBinding { keys: "<Enter>", action: "Implement selected (or every marked) issue", context: "View" },
-    KeyBinding { keys: "Esc", action: "Back to menu", context: "View" },
-    KeyBinding { keys: "q", action: "Quit", context: "View" },
-    KeyBinding { keys: "<Enter>", action: "Confirm filter", context: "Filtering" },
-    KeyBinding { keys: "Esc", action: "Cancel filter, restore full list", context: "Filtering" },
-    KeyBinding { keys: "Backspace", action: "Remove last filter character", context: "Filtering" },
-    KeyBinding { keys: "r", action: "Retry", context: "Error screen" },
-    KeyBinding { keys: "c", action: "Open config.toml", context: "Error screen" },
-    KeyBinding { keys: "?", action: "Toggle this help overlay", context: "Global" },
-    KeyBinding { keys: "Ctrl+C", action: "Quit", context: "Global" },
+    KeyBinding {
+        keys: "↑ / ↓",
+        action: "Move selection",
+        context: "Menu",
+    },
+    KeyBinding {
+        keys: "<Enter>",
+        action: "Open highlighted view",
+        context: "Menu",
+    },
+    KeyBinding {
+        keys: "q / Esc",
+        action: "Quit",
+        context: "Menu",
+    },
+    KeyBinding {
+        keys: "↑ / ↓",
+        action: "Move selection",
+        context: "View",
+    },
+    KeyBinding {
+        keys: "/",
+        action: "Filter issues by title/identifier",
+        context: "View",
+    },
+    KeyBinding {
+        keys: "o",
+        action: "Open selected issue in browser",
+        context: "View",
+    },
+    KeyBinding {
+        keys: "<Space>",
+        action: "Mark/unmark issue for multi-select",
+        context: "View",
+    },
+    KeyBinding {
+        keys: "<Enter>",
+        action: "Implement selected (or every marked) issue",
+        context: "View",
+    },
+    KeyBinding {
+        keys: "Esc",
+        action: "Back to menu",
+        context: "View",
+    },
+    KeyBinding {
+        keys: "q",
+        action: "Quit",
+        context: "View",
+    },
+    KeyBinding {
+        keys: "<Enter>",
+        action: "Confirm filter",
+        context: "Filtering",
+    },
+    KeyBinding {
+        keys: "Esc",
+        action: "Cancel filter, restore full list",
+        context: "Filtering",
+    },
+    KeyBinding {
+        keys: "Backspace",
+        action: "Remove last filter character",
+        context: "Filtering",
+    },
+    KeyBinding {
+        keys: "r",
+        action: "Retry",
+        context: "Error screen",
+    },
+    KeyBinding {
+        keys: "c",
+        action: "Open config.toml",
+        context: "Error screen",
+    },
+    KeyBinding {
+        keys: "?",
+        action: "Toggle this help overlay",
+        context: "Global",
+    },
+    KeyBinding {
+        keys: "Ctrl+C",
+        action: "Quit",
+        context: "Global",
+    },
 ];
 
 #[cfg(test)]
@@ -55,7 +123,10 @@ mod tests {
         for binding in KEYBINDINGS {
             assert!(!binding.keys.is_empty(), "empty `keys` in {binding:?}");
             assert!(!binding.action.is_empty(), "empty `action` in {binding:?}");
-            assert!(!binding.context.is_empty(), "empty `context` in {binding:?}");
+            assert!(
+                !binding.context.is_empty(),
+                "empty `context` in {binding:?}"
+            );
         }
     }
 
