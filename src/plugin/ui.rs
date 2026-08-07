@@ -371,7 +371,37 @@ fn whats_new_lines_from(changelog: &str) -> Vec<String> {
         None => lines.push("Couldn't find recent changes in CHANGELOG.md.".to_string()),
     }
 
+    truncate_with_notice(&mut lines, WHATS_NEW_MAX_LINES);
     lines
+}
+
+/// Hard cap on how many lines [`whats_new_lines_from`] shows before truncating with a
+/// pointer to the full changelog (follow-up review fix, TF-585 — found during code
+/// review: `CHANGELOG.md`'s real `[Unreleased]` section already runs past 100 lines,
+/// spanning every generic library-scaffolding entry since the project's only release,
+/// not just recent, plugin-facing work, which defeats the point of a "what's new"
+/// summary meant to be read in a small overlay panel). Sized to comfortably fit a normal
+/// terminal without excessive scrolling for a typical release cycle's worth of entries;
+/// deliberately a *display* limit in `ui.rs`; the underlying `CHANGELOG.md` is untouched
+/// and remains the full, authoritative history.
+const WHATS_NEW_MAX_LINES: usize = 30;
+
+/// Truncates `lines` to at most `max` entries, replacing anything past that with a
+/// single "… N more lines" notice pointing at `CHANGELOG.md` — so an oversized section
+/// degrades *visibly* (the reader knows there's more, and where to find it) rather than
+/// silently. No-op if `lines` is already within `max`. `max` must be at least `1`.
+fn truncate_with_notice(lines: &mut Vec<String>, max: usize) {
+    debug_assert!(max >= 1, "truncate_with_notice requires max >= 1");
+    if lines.len() <= max {
+        return;
+    }
+    let kept = max - 1; // one of `max` slots is reserved for the notice itself
+    let hidden = lines.len() - kept;
+    lines.truncate(kept);
+    lines.push(format!(
+        "… {hidden} more line{} — see CHANGELOG.md for the full history.",
+        if hidden == 1 { "" } else { "s" }
+    ));
 }
 
 /// The Settings tab's content (TF-585): the plugin's currently-resolved `config.toml`
@@ -1187,12 +1217,77 @@ mod tests {
             .any(|line| line.contains("Couldn't find recent changes")));
     }
 
+    /// Follow-up review fix (TF-585): `whats_new_lines_from` used to show the entire
+    /// `[Unreleased]` section verbatim, however large — confirms an oversized section
+    /// now gets truncated to `WHATS_NEW_MAX_LINES` with a visible "…N more" notice
+    /// instead of dumping everything into the overlay.
+    #[test]
+    fn whats_new_lines_from_truncates_a_very_long_unreleased_section_with_a_notice() {
+        let entries = (0..50)
+            .map(|i| format!("- entry {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let changelog = format!("## [Unreleased]\n### Added\n{entries}\n");
+
+        let lines = whats_new_lines_from(&changelog);
+
+        assert_eq!(lines.len(), WHATS_NEW_MAX_LINES);
+        let last = lines.last().unwrap();
+        assert!(
+            last.contains("more line") && last.contains("CHANGELOG.md"),
+            "expected a truncation notice, got: {last:?}"
+        );
+        // The entries that *did* make the cut must be the first ones, not an arbitrary
+        // subset — a reader scanning from the top should see the earliest (per
+        // Keep-a-Changelog convention, most-recently-added) entries first.
+        assert!(lines.contains(&"- entry 0".to_string()));
+        assert!(!lines.contains(&"- entry 49".to_string()));
+    }
+
+    #[test]
+    fn whats_new_lines_from_does_not_truncate_when_within_the_limit() {
+        let changelog = "## [Unreleased]\n### Added\n- one\n- two\n\
+                         ## [0.1.0] - 2026-08-04\n### Added\n- old\n";
+
+        let lines = whats_new_lines_from(changelog);
+
+        assert!(!lines.iter().any(|line| line.contains("more line")));
+    }
+
+    #[test]
+    fn truncate_with_notice_is_a_no_op_when_already_within_the_limit() {
+        let mut lines = vec!["a".to_string(), "b".to_string()];
+
+        truncate_with_notice(&mut lines, 5);
+
+        assert_eq!(lines, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn truncate_with_notice_reports_the_correct_hidden_count() {
+        let mut lines: Vec<String> = (0..10).map(|i| i.to_string()).collect();
+
+        truncate_with_notice(&mut lines, 4);
+
+        assert_eq!(lines.len(), 4);
+        assert!(lines[3].contains("7 more lines"), "got: {:?}", lines[3]);
+    }
+
     #[test]
     fn whats_new_lines_reads_the_real_changelog_and_includes_the_current_version() {
         let lines = whats_new_lines();
 
         assert!(lines[0].contains(env!("CARGO_PKG_VERSION")));
         assert!(lines.len() > 2, "expected real entries, got: {lines:?}");
+        // Follow-up review fix (TF-585): the real `[Unreleased]` section runs well past
+        // 100 lines (everything since the project's only release, not just recent
+        // work) — this is the ceiling the old version of this test was missing, which
+        // is exactly why the lack of a size cap went unnoticed.
+        assert!(
+            lines.len() <= WHATS_NEW_MAX_LINES,
+            "expected the What's New tab to stay within its display cap, got {} lines: {lines:?}",
+            lines.len()
+        );
     }
 
     #[test]
