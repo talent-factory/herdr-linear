@@ -61,11 +61,8 @@ fn read_config_file(config_dir: Option<&Path>) -> Result<Option<ConfigFile>> {
     toml::from_str::<ConfigFile>(&contents)
         .map(Some)
         .map_err(|e| {
-            Error::ConfigError(format!(
-                "{} is not valid TOML: {}",
-                config_path.display(),
-                e
-            ))
+            let raw = format!("{} is not valid TOML: {}", config_path.display(), e);
+            Error::ConfigError(redact_api_key_value_lines(&raw, &contents))
         })
 }
 
@@ -192,7 +189,10 @@ pub(crate) enum ConfigFileStatus {
     Found,
     /// `config.toml` exists but isn't valid TOML (or couldn't be read) — see
     /// [`read_config_file`]'s own doc comment for exactly which cases this covers. The
-    /// message is the underlying [`Error`]'s `Display` text, already user-facing.
+    /// message is the underlying [`Error`]'s `Display` text, already user-facing — and,
+    /// for the invalid-TOML case specifically, already redacted of any `api_key` value by
+    /// [`read_config_file`] itself via [`redact_api_key_value_lines`], so this variant
+    /// never needs its own redaction pass before display.
     Invalid(String),
 }
 
@@ -213,21 +213,89 @@ pub(crate) struct ResolvedConfigSummary {
     pub project_overrides: BTreeMap<String, String>,
 }
 
-/// Scrubs any line of `message` whose lowercased content contains the substring
-/// `"api_key"` before it can reach [`ConfigFileStatus::Invalid`] (final-review fix,
-/// TF-585). The `toml` crate's parse-error `Display` embeds a snippet of the offending
-/// source line — if the syntax error lands on the `api_key = "..."` line itself (e.g. an
-/// unterminated string), that snippet is the raw key value, and it would otherwise reach
-/// the Settings tab (see `ui::settings_lines_from`'s `ConfigFileStatus::Invalid` arm) in
-/// the clear, contradicting README.md's claim that the API key is "shown only as
-/// set/not-set, never in the clear". Deliberately scoped to this one demonstrated leak
-/// vector (a source-snippet line containing the literal `api_key` field name), not a
-/// general secret scanner.
-fn redact_api_key_lines(message: &str) -> String {
+/// The `[start, end)` 0-based, end-exclusive line-index range that `contents`'s
+/// top-level `api_key` assignment occupies: the line declaring the key itself, through
+/// the line just before the next top-level key/table declaration (or end of file) —
+/// covering any multi-line (triple-quoted) continuation of its value. `None` if no line
+/// declares `api_key` at the top level.
+fn api_key_value_line_range(contents: &str) -> Option<(usize, usize)> {
+    let lines: Vec<&str> = contents.lines().collect();
+    let start = lines.iter().position(|line| is_api_key_assignment(line))?;
+    let end = lines[start + 1..]
+        .iter()
+        .position(|line| starts_new_top_level_entry(line))
+        .map(|offset| start + 1 + offset)
+        .unwrap_or(lines.len());
+    Some((start, end))
+}
+
+/// True if `line` (leading whitespace aside) declares the `api_key` key — matched as the
+/// exact, case-sensitive TOML key name [`ConfigFile::api_key`] deserializes from, not a
+/// substring match, so a key like `my_api_key_backup` doesn't false-positive.
+fn is_api_key_assignment(line: &str) -> bool {
+    line.trim_start()
+        .strip_prefix("api_key")
+        .is_some_and(|rest| rest.trim_start().starts_with('='))
+}
+
+/// True if `line` looks like the start of a *different* top-level key or table
+/// declaration (`some_key = ...` / `[table]`) rather than a continuation of a preceding
+/// multi-line value. Blank and comment lines never count as a new entry — either can
+/// legitimately appear inside a multi-line string's content, so treating them as a
+/// boundary would end the sensitive range early and under-redact.
+fn starts_new_top_level_entry(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return false;
+    }
+    if trimmed.starts_with('[') {
+        return true;
+    }
+    let Some((key_part, _)) = trimmed.split_once('=') else {
+        return false;
+    };
+    let key_part = key_part.trim();
+    !key_part.is_empty()
+        && key_part
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Scrubs any line of `message` that echoes a line from `contents`'s `api_key`
+/// assignment before the message can reach [`ConfigFileStatus::Invalid`] (final-review
+/// fix, TF-585; broadened in a follow-up review after the original single-line-only
+/// version — which redacted a message line only if *that line's own text* contained the
+/// substring `"api_key"` — was found to still leak a multi-line/triple-quoted `api_key`
+/// value: the `toml` crate's parse-error `Display` shows only the *one* source line
+/// nearest the error, and for a multi-line string that's typically a continuation line
+/// which never contains the literal text `api_key` at all, so a redaction that only
+/// inspects the message's own text can never reliably tell that line belongs to the
+/// `api_key` field).
+///
+/// Cross-references against the raw source (`contents`, via
+/// [`api_key_value_line_range`]) instead: whichever source lines fall within the
+/// `api_key` field's own assignment are treated as sensitive, and any message line that
+/// echoes one of them (as a substring, since the `toml` crate's `Display` prefixes each
+/// shown line with `"N | "`) is redacted — regardless of whether that message line
+/// itself happens to mention `api_key`. Deliberately scoped to this one field (the only
+/// secret this file holds), not a general secret scanner.
+fn redact_api_key_value_lines(message: &str, contents: &str) -> String {
+    let Some((start, end)) = api_key_value_line_range(contents) else {
+        // No `api_key` line in the source at all — nothing to redact against.
+        return message.to_string();
+    };
+
+    let source_lines: Vec<&str> = contents.lines().collect();
+    let sensitive: Vec<&str> = source_lines[start..end.min(source_lines.len())]
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect();
+
     message
         .lines()
         .map(|line| {
-            if line.to_lowercase().contains("api_key") {
+            if sensitive.iter().any(|snippet| line.contains(snippet)) {
                 "[line redacted — contained api_key]"
             } else {
                 line
@@ -245,7 +313,9 @@ fn redact_api_key_lines(message: &str) -> String {
 /// would mean either showing the same "invalid TOML" message three times over, or three
 /// separately-worded failures for what is really one root cause. Pure function — callers
 /// own reading the real environment, same pattern as every other `resolve_*` function in
-/// this module.
+/// this module. The `Err` arm's message needs no redaction of its own —
+/// [`read_config_file`] already redacts any `api_key` value out of it via
+/// [`redact_api_key_value_lines`] before the `Err` is even constructed.
 pub(crate) fn resolved_summary(
     config_dir: Option<&Path>,
     env_api_key: Option<&str>,
@@ -278,7 +348,7 @@ pub(crate) fn resolved_summary(
         }
         Err(e) => ResolvedConfigSummary {
             path,
-            status: ConfigFileStatus::Invalid(redact_api_key_lines(&e.to_string())),
+            status: ConfigFileStatus::Invalid(e.to_string()),
             api_key_set: false,
             agent_command: None,
             team_id: None,
@@ -334,8 +404,9 @@ pub fn current_config_path_hint() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        config_path_hint, resolve_agent_command_override, resolve_api_key,
-        resolve_project_id_override, resolve_team_id_override, resolved_summary, ConfigFileStatus,
+        api_key_value_line_range, config_path_hint, redact_api_key_value_lines,
+        resolve_agent_command_override, resolve_api_key, resolve_project_id_override,
+        resolve_team_id_override, resolved_summary, ConfigFileStatus,
     };
     use std::fs;
 
@@ -866,6 +937,170 @@ mod tests {
             }
             other => panic!("expected Invalid, got {other:?}"),
         }
+    }
+
+    /// Follow-up review fix (TF-585): the single-line redaction above only catches the
+    /// case where the `toml` crate's error snippet lands *on* the `api_key = ` line
+    /// itself. An unterminated multi-line (triple-quoted) `api_key` value makes the
+    /// error snippet show a *continuation* line instead — one that never contains the
+    /// literal text `api_key` — so the original line-text-matching redaction let the raw
+    /// secret straight through. Confirms `resolved_summary` now catches this via
+    /// `api_key_value_line_range`'s source-derived range instead of the message text
+    /// alone.
+    #[test]
+    fn resolved_summary_redacts_multiline_api_key_value_from_invalid_toml_error() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.toml"),
+            "api_key = \"\"\"\nlin_api_SUPERSECRET_MULTILINE_LEAK\n",
+        )
+        .unwrap();
+
+        let summary = resolved_summary(Some(dir.path()), None);
+
+        match summary.status {
+            ConfigFileStatus::Invalid(message) => {
+                assert!(
+                    !message.contains("SUPERSECRET_MULTILINE_LEAK"),
+                    "raw api_key value leaked into error message: {message}"
+                );
+                assert!(message.contains("not valid TOML"));
+                assert!(message.contains("[line redacted"));
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    /// Same leak vector as above, but via TOML's other multi-line string form (a literal
+    /// triple-single-quoted string) — confirms the fix isn't accidentally scoped to only
+    /// the basic-string case.
+    #[test]
+    fn resolved_summary_redacts_multiline_literal_api_key_value_from_invalid_toml_error() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.toml"),
+            "api_key = '''\nlin_api_SUPERSECRET_LITERAL_LEAK\n",
+        )
+        .unwrap();
+
+        let summary = resolved_summary(Some(dir.path()), None);
+
+        match summary.status {
+            ConfigFileStatus::Invalid(message) => {
+                assert!(
+                    !message.contains("SUPERSECRET_LITERAL_LEAK"),
+                    "raw api_key value leaked into error message: {message}"
+                );
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    /// Confirms the broadened redaction doesn't over-reach: a syntax error on a
+    /// *different, unrelated* field (with a perfectly valid `api_key` earlier in the
+    /// file) must still show its real error text — the `toml` crate's snippet here
+    /// doesn't even echo the `api_key` line (the error is entirely about
+    /// `agent_command`), so nothing should be redacted at all.
+    #[test]
+    fn resolved_summary_does_not_redact_an_unrelated_field_error_when_api_key_is_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.toml"),
+            "api_key = \"lin_api_totally_fine\"\nagent_command = [this is not valid\n",
+        )
+        .unwrap();
+
+        let summary = resolved_summary(Some(dir.path()), None);
+
+        match summary.status {
+            ConfigFileStatus::Invalid(message) => {
+                assert!(
+                    message.contains("agent_command"),
+                    "unrelated field's real error text is missing: {message}"
+                );
+                assert!(
+                    !message.contains("[line redacted"),
+                    "an error unrelated to `api_key` was redacted anyway: {message}"
+                );
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    /// Companion to the above: this time the error snippet *does* land on a line that
+    /// echoes the (valid) `api_key` value — e.g. a duplicate-key redeclaration — so this
+    /// confirms redaction still fires when it should, even though `api_key` itself
+    /// parses fine on its own.
+    #[test]
+    fn resolved_summary_redacts_api_key_value_line_even_when_the_error_is_a_duplicate_key() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.toml"),
+            "api_key = \"lin_api_DUPLICATE_SECRET\"\napi_key = \"lin_api_DUPLICATE_SECRET\"\n",
+        )
+        .unwrap();
+
+        let summary = resolved_summary(Some(dir.path()), None);
+
+        match summary.status {
+            ConfigFileStatus::Invalid(message) => {
+                assert!(!message.contains("DUPLICATE_SECRET"));
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn api_key_value_line_range_covers_only_the_single_line_when_unterminated() {
+        let range = api_key_value_line_range("api_key = \"unterminated\n");
+        assert_eq!(range, Some((0, 1)));
+    }
+
+    #[test]
+    fn api_key_value_line_range_extends_to_end_of_file_for_an_unclosed_multiline_value() {
+        let contents = "api_key = \"\"\"\nsecret line one\nsecret line two\n";
+        let range = api_key_value_line_range(contents);
+        assert_eq!(range, Some((0, 3)));
+    }
+
+    #[test]
+    fn api_key_value_line_range_stops_at_the_next_top_level_key() {
+        let contents = "api_key = \"\"\"\nsecret\n\"\"\"\nagent_command = \"x\"\n";
+        let range = api_key_value_line_range(contents);
+        assert_eq!(range, Some((0, 3)));
+    }
+
+    #[test]
+    fn api_key_value_line_range_stops_at_a_table_header() {
+        let contents = "api_key = \"\"\"\nsecret\n\"\"\"\n[project_overrides]\n";
+        let range = api_key_value_line_range(contents);
+        assert_eq!(range, Some((0, 3)));
+    }
+
+    #[test]
+    fn api_key_value_line_range_is_none_when_api_key_is_absent() {
+        assert_eq!(
+            api_key_value_line_range("agent_command = \"x\"\nteam_id = \"y\"\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn api_key_value_line_range_does_not_match_a_similarly_named_key() {
+        // `my_api_key_backup` starts with a different identifier, not the literal
+        // `api_key` key — must not be mistaken for it.
+        assert_eq!(
+            api_key_value_line_range("my_api_key_backup = \"not the real one\"\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn redact_api_key_value_lines_passes_message_through_unchanged_when_no_api_key_present() {
+        let message = "1 | agent_command = [oops\nnot valid TOML";
+        let contents = "agent_command = [oops\n";
+
+        assert_eq!(redact_api_key_value_lines(message, contents), message);
     }
 
     #[test]
