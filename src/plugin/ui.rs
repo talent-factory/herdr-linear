@@ -269,15 +269,29 @@ fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState, status: 
 /// The About tab's content (TF-585): plugin name, version, description, repo, license —
 /// all resolved at compile time from `Cargo.toml` via `CARGO_PKG_*` env vars, so there's
 /// nothing to keep in sync by hand when either changes.
+///
+/// Follow-up review fix (TF-585): cached in a `OnceLock` — every call previously
+/// rebuilt this `Vec` from scratch, and `content_line_count` (the scroll-clamp's
+/// production caller, in `app.rs`'s `j`/`↓` handler) calls the active tab's content
+/// function on *every* scroll keypress purely to measure its length, discarding the
+/// content itself. Safe to cache unconditionally: every source here (`env!` macros) is
+/// resolved at compile time, so the result can never change within a running process —
+/// unlike [`settings_lines`], which reads the real, mutable environment on every call and
+/// deliberately stays uncached.
 fn about_lines() -> Vec<String> {
-    vec![
-        format!("herdr-linear v{}", env!("CARGO_PKG_VERSION")),
-        String::new(),
-        env!("CARGO_PKG_DESCRIPTION").to_string(),
-        String::new(),
-        format!("Repository: {}", env!("CARGO_PKG_REPOSITORY")),
-        format!("License: {}", env!("CARGO_PKG_LICENSE")),
-    ]
+    static CACHE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            vec![
+                format!("herdr-linear v{}", env!("CARGO_PKG_VERSION")),
+                String::new(),
+                env!("CARGO_PKG_DESCRIPTION").to_string(),
+                String::new(),
+                format!("Repository: {}", env!("CARGO_PKG_REPOSITORY")),
+                format!("License: {}", env!("CARGO_PKG_LICENSE")),
+            ]
+        })
+        .clone()
 }
 
 /// The Keybindings tab's content (TF-585): every entry in `keybindings::KEYBINDINGS`
@@ -286,22 +300,31 @@ fn about_lines() -> Vec<String> {
 /// entries contiguously (an invariant that table's own tests guard) rather than
 /// re-sorting, so the table's declared order (Menu, View, Filtering, Error screen,
 /// Global) is what's shown, not an alphabetized one.
+///
+/// Cached in a `OnceLock` for the same reason as [`about_lines`]: `KEYBINDINGS` is a
+/// `static` table that never changes within a running process, so recomputing this on
+/// every scroll keypress is pure waste.
 fn keybindings_lines() -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut last_context: Option<crate::plugin::keybindings::BindingContext> = None;
+    static CACHE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let mut lines = Vec::new();
+            let mut last_context: Option<crate::plugin::keybindings::BindingContext> = None;
 
-    for binding in crate::plugin::keybindings::KEYBINDINGS {
-        if last_context != Some(binding.context) {
-            if last_context.is_some() {
-                lines.push(String::new());
+            for binding in crate::plugin::keybindings::KEYBINDINGS {
+                if last_context != Some(binding.context) {
+                    if last_context.is_some() {
+                        lines.push(String::new());
+                    }
+                    lines.push(format!("{}:", binding.context.label()));
+                    last_context = Some(binding.context);
+                }
+                lines.push(format!("  {:<10} {}", binding.keys, binding.action));
             }
-            lines.push(format!("{}:", binding.context.label()));
-            last_context = Some(binding.context);
-        }
-        lines.push(format!("  {:<10} {}", binding.keys, binding.action));
-    }
 
-    lines
+            lines
+        })
+        .clone()
 }
 
 /// Everything between `heading` (matched verbatim, must be a full `## ...` heading line
@@ -331,7 +354,14 @@ fn extract_section_after(text: &str, heading: &str) -> Option<Vec<String>> {
 /// so the plugin binary never depends on `CHANGELOG.md` being present at runtime (it
 /// isn't; nothing ships the source repo alongside the built binary).
 fn whats_new_lines() -> Vec<String> {
-    whats_new_lines_from(include_str!("../../CHANGELOG.md"))
+    // Cached in a `OnceLock` for the same reason as `about_lines`/`keybindings_lines`:
+    // `include_str!` embeds `CHANGELOG.md` at compile time, so the content can never
+    // change within a running process, and this is otherwise recomputed (including a
+    // full re-parse of the embedded changelog) on every scroll keypress.
+    static CACHE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| whats_new_lines_from(include_str!("../../CHANGELOG.md")))
+        .clone()
 }
 
 /// Pure half of [`whats_new_lines`], taking the changelog content as a parameter so it's
