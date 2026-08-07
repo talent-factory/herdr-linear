@@ -311,10 +311,10 @@ async fn resolve_validated_agent_command(
 /// ([`start_implementation`] for the single-issue case, [`start_implementation_many`] for the
 /// marked-multiple case) can turn it into whatever status banner fits their situation,
 /// mirroring `ensure_loaded`'s "inline error instead of crashing" philosophy. Any non-fatal
-/// warnings collected along the way (workflow-state lookup, the actual state transition) are
-/// preserved in *every* terminal outcome, not just the final success case — a failure late in
-/// the flow (e.g. `agent_wait` timing out) must not hide an earlier one (e.g. the issue never
-/// actually reaching "In Progress"). See
+/// warnings collected along the way (closing the tab's redundant root pane, workflow-state
+/// lookup, the actual state transition) are preserved in *every* terminal outcome, not just the
+/// final success case — a failure late in the flow (e.g. `agent_wait` timing out) must not hide
+/// an earlier one (e.g. the issue never actually reaching "In Progress"). See
 /// docs/superpowers/specs/2026-08-05-implement-on-enter-design.md for the full original data
 /// flow this extends, and docs/superpowers/specs/2026-08-06-guaranteed-tab-per-issue-design.md
 /// for the tab-creation change.
@@ -355,24 +355,42 @@ async fn implement_one(
     // exact same losing name).
     let agent_name = plugin::implement::build_agent_name(command.as_str(), &issue.identifier);
 
-    let tab_id = match plugin::herdr_cli::tab_create(herdr_bin, &cwd, &issue.identifier).await {
-        Ok(tab_id) => tab_id,
+    let created_tab = match plugin::herdr_cli::tab_create(herdr_bin, &cwd, &issue.identifier).await
+    {
+        Ok(created_tab) => created_tab,
         Err(err) => return ImplementOutcome::Failed(format!("failed to create a tab: {err}")),
     };
 
-    let started =
-        match plugin::herdr_cli::agent_start(herdr_bin, &agent_name, &cwd, &tab_id, &argv).await {
-            Ok(started) => started,
-            Err(err) => {
-                return ImplementOutcome::Failed(format!(
-                    "tab created but agent failed to start ({err}) — an empty '{}' tab was left \
-                     open, close it manually",
-                    issue.identifier
-                ));
-            }
-        };
+    let started = match plugin::herdr_cli::agent_start(
+        herdr_bin,
+        &agent_name,
+        &cwd,
+        &created_tab.tab_id,
+        &argv,
+    )
+    .await
+    {
+        Ok(started) => started,
+        Err(err) => {
+            return ImplementOutcome::Failed(format!(
+                "tab created but agent failed to start ({err}) — an empty '{}' tab was left \
+                 open, close it manually",
+                issue.identifier
+            ));
+        }
+    };
 
     let mut warnings = Vec::new();
+
+    // `agent_start` never replaces a tab's existing panes — it only splits alongside them — so
+    // the tab now carries both the real agent pane and `tab_create`'s original empty root pane.
+    // Closing the latter is non-fatal: an extra pane is a cosmetic annoyance, not a reason to
+    // abort a flow that already has a running agent.
+    if let Err(err) = plugin::herdr_cli::pane_close(herdr_bin, &created_tab.root_pane_id).await {
+        warnings.push(format!(
+            "failed to close the tab's now-redundant empty pane: {err}"
+        ));
+    }
 
     match client.get_workflow_states(&issue.team.id).await {
         Ok(states) => match plugin::implement::pick_in_progress_state(&states) {

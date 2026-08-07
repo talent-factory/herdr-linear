@@ -68,6 +68,13 @@ pub struct AgentStarted {
     pub tab_id: TabId,
 }
 
+/// Result of a successful `herdr tab create` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabCreated {
+    pub tab_id: TabId,
+    pub root_pane_id: PaneId,
+}
+
 /// Resolve the `herdr` binary path: `$HERDR_BIN_PATH`, falling back to `"herdr"` on `$PATH` —
 /// the same convention `scripts/open-tab.sh` uses.
 pub fn herdr_bin() -> String {
@@ -215,9 +222,9 @@ fn is_missing_result_response(error: &Error) -> bool {
 
 /// Wall-clock ceiling for `herdr` subprocess calls that don't carry their own `--timeout`
 /// argument (everything routed through [`run`]: `agent_list`, `tab_create`, `agent_start`,
-/// `agent_send`). Without this, a hung `herdr` daemon blocks the single-threaded TUI's event
-/// loop indefinitely — `agent_wait` is the exception, since it computes its own call-specific
-/// bound in [`agent_wait`] instead of using this constant.
+/// `agent_send`, `pane_close`). Without this, a hung `herdr` daemon blocks the single-threaded
+/// TUI's event loop indefinitely — `agent_wait` is the exception, since it computes its own
+/// call-specific bound in [`agent_wait`] instead of using this constant.
 const DEFAULT_CLI_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Run a `herdr` CLI subcommand, bounded by `call_timeout`, returning the parsed `result` field
@@ -294,26 +301,42 @@ fn parse_agent_started(result: &Value) -> Result<AgentStarted> {
     })
 }
 
-/// Extract the created [`TabId`] from a `herdr tab create` call's already-unwrapped `result`
-/// value. Split out from [`tab_create`] for the same testability reason as
-/// [`parse_agent_started`].
-fn parse_tab_created(result: &Value) -> Result<TabId> {
-    result
+/// Extract [`TabCreated`] from a `herdr tab create` call's already-unwrapped `result` value.
+/// Split out from [`tab_create`] for the same testability reason as [`parse_agent_started`].
+fn parse_tab_created(result: &Value) -> Result<TabCreated> {
+    let tab_id = result
         .get("tab")
         .and_then(|t| t.get("tab_id"))
         .and_then(|v| v.as_str())
-        .map(|s| TabId(s.to_string()))
-        .ok_or_else(|| Error::Internal("tab.create response missing tab.tab_id".to_string()))
+        .ok_or_else(|| Error::Internal("tab.create response missing tab.tab_id".to_string()))?
+        .to_string();
+    let root_pane_id = result
+        .get("root_pane")
+        .and_then(|p| p.get("pane_id"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            Error::Internal("tab.create response missing root_pane.pane_id".to_string())
+        })?
+        .to_string();
+
+    Ok(TabCreated {
+        tab_id: TabId(tab_id),
+        root_pane_id: PaneId(root_pane_id),
+    })
 }
 
 /// `herdr tab create --cwd <cwd> --label <label> --focus` — creates a fresh, focused tab that is
-/// already labeled `label`, and returns its [`TabId`]. Labeling at creation time (rather than via
-/// a follow-up `tab rename`) means the label is correct from the very first frame, with no window
-/// in which the tab could be confused with — or have its label stolen by — a different,
-/// already-running tab. See
+/// already labeled `label`, and returns its [`TabCreated`] (the new tab's id, plus the id of the
+/// single root pane herdr creates inside it by default). Labeling at creation time (rather than
+/// via a follow-up `tab rename`) means the label is correct from the very first frame, with no
+/// window in which the tab could be confused with — or have its label stolen by — a different,
+/// already-running tab. `root_pane_id` exists to be closed once [`agent_start`] has placed the
+/// real agent pane into this tab — `agent_start` never replaces or consumes a tab's existing
+/// panes, it only adds a split alongside them, so without closing it every tab would carry a
+/// permanent extra empty shell pane. See
 /// docs/superpowers/specs/2026-08-06-guaranteed-tab-per-issue-design.md for why this replaced a
 /// rename-after-`agent_start` sequence.
-pub async fn tab_create(herdr_bin: &str, cwd: &Path, label: &str) -> Result<TabId> {
+pub async fn tab_create(herdr_bin: &str, cwd: &Path, label: &str) -> Result<TabCreated> {
     let cwd_str = cwd.to_string_lossy().to_string();
     let result = run(
         herdr_bin,
@@ -455,6 +478,15 @@ pub async fn agent_start(
             Err(err) => return Err(err),
         }
     }
+}
+
+/// `herdr pane close <pane_id>`. Used to close the now-redundant root pane [`tab_create`] leaves
+/// behind once [`agent_start`] has placed the real agent pane into the same tab (`agent_start`
+/// never replaces a tab's existing panes, only splits alongside them).
+pub async fn pane_close(herdr_bin: &str, pane_id: &PaneId) -> Result<()> {
+    run(herdr_bin, &["pane", "close", pane_id.as_str()])
+        .await
+        .map(|_| ())
 }
 
 /// Extra attempts `agent_wait` makes when herdr responds with the missing-`result` bug (see the
@@ -1222,20 +1254,24 @@ exit 1
     }
 
     #[test]
-    fn parse_tab_created_extracts_the_tab_id() {
+    fn parse_tab_created_extracts_the_tab_id_and_root_pane_id() {
         let result = serde_json::json!({
             "tab": {"tab_id": "wY:t2D", "label": "TF-579"},
             "root_pane": {"pane_id": "wY:p31"}
         });
 
-        let tab_id = parse_tab_created(&result).unwrap();
+        let created = parse_tab_created(&result).unwrap();
 
-        assert_eq!(tab_id.as_str(), "wY:t2D");
+        assert_eq!(created.tab_id.as_str(), "wY:t2D");
+        assert_eq!(created.root_pane_id.as_str(), "wY:p31");
     }
 
     #[test]
     fn parse_tab_created_errors_when_tab_id_is_missing() {
-        let result = serde_json::json!({"tab": {"label": "TF-579"}});
+        let result = serde_json::json!({
+            "tab": {"label": "TF-579"},
+            "root_pane": {"pane_id": "wY:p31"}
+        });
 
         let err = parse_tab_created(&result).unwrap_err().to_string();
 
@@ -1247,6 +1283,21 @@ exit 1
         let result = serde_json::json!({"root_pane": {"pane_id": "wY:p31"}});
 
         assert!(parse_tab_created(&result).is_err());
+    }
+
+    #[test]
+    fn parse_tab_created_errors_when_root_pane_id_is_missing() {
+        let result = serde_json::json!({
+            "tab": {"tab_id": "wY:t2D", "label": "TF-579"},
+            "root_pane": {}
+        });
+
+        let err = parse_tab_created(&result).unwrap_err().to_string();
+
+        assert!(
+            err.contains("root_pane.pane_id"),
+            "unexpected message: {err}"
+        );
     }
 
     #[test]
