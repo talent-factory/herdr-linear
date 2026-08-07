@@ -92,6 +92,16 @@ pub static KEYBINDINGS: &[KeyBinding] = &[
         context: "Filtering",
     },
     KeyBinding {
+        keys: "↑ / ↓",
+        action: "Move selection while typing",
+        context: "Filtering",
+    },
+    KeyBinding {
+        keys: "(any character)",
+        action: "Add to filter query",
+        context: "Filtering",
+    },
+    KeyBinding {
         keys: "r",
         action: "Retry",
         context: "Error screen",

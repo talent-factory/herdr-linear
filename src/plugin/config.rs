@@ -213,6 +213,30 @@ pub(crate) struct ResolvedConfigSummary {
     pub project_overrides: BTreeMap<String, String>,
 }
 
+/// Scrubs any line of `message` whose lowercased content contains the substring
+/// `"api_key"` before it can reach [`ConfigFileStatus::Invalid`] (final-review fix,
+/// TF-585). The `toml` crate's parse-error `Display` embeds a snippet of the offending
+/// source line — if the syntax error lands on the `api_key = "..."` line itself (e.g. an
+/// unterminated string), that snippet is the raw key value, and it would otherwise reach
+/// the Settings tab (see `ui::settings_lines_from`'s `ConfigFileStatus::Invalid` arm) in
+/// the clear, contradicting README.md's claim that the API key is "shown only as
+/// set/not-set, never in the clear". Deliberately scoped to this one demonstrated leak
+/// vector (a source-snippet line containing the literal `api_key` field name), not a
+/// general secret scanner.
+fn redact_api_key_lines(message: &str) -> String {
+    message
+        .lines()
+        .map(|line| {
+            if line.to_lowercase().contains("api_key") {
+                "[line redacted — contained api_key]"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Builds a [`ResolvedConfigSummary`] for the help overlay's Settings tab (TF-585).
 /// Reads `config_dir` exactly once via [`read_config_file`] and derives every field from
 /// that single `Result`, rather than composing
@@ -254,7 +278,7 @@ pub(crate) fn resolved_summary(
         }
         Err(e) => ResolvedConfigSummary {
             path,
-            status: ConfigFileStatus::Invalid(e.to_string()),
+            status: ConfigFileStatus::Invalid(redact_api_key_lines(&e.to_string())),
             api_key_set: false,
             agent_command: None,
             team_id: None,
@@ -813,6 +837,35 @@ mod tests {
         let summary = resolved_summary(Some(dir.path()), None);
 
         assert!(!summary.api_key_set);
+    }
+
+    /// Final-review fix (TF-585): an unterminated string on the `api_key` line makes the
+    /// `toml` crate's parse-error `Display` embed a snippet of that very line — which
+    /// would otherwise put the raw key value on the Settings tab. Confirms
+    /// `resolved_summary` redacts it while still surfacing enough of the original error
+    /// (e.g. still says the file isn't valid TOML) to be useful.
+    #[test]
+    fn resolved_summary_redacts_api_key_line_from_invalid_toml_error() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.toml"),
+            "api_key = \"lin_api_SUPERSECRET_XYZ\n",
+        )
+        .unwrap();
+
+        let summary = resolved_summary(Some(dir.path()), None);
+
+        match summary.status {
+            ConfigFileStatus::Invalid(message) => {
+                assert!(
+                    !message.contains("SUPERSECRET"),
+                    "raw api_key value leaked into error message: {message}"
+                );
+                assert!(message.contains("not valid TOML"));
+                assert!(message.contains("[line redacted"));
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
     }
 
     #[test]

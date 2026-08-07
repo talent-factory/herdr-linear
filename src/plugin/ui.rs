@@ -431,6 +431,20 @@ fn settings_lines_from(summary: &crate::plugin::config::ResolvedConfigSummary) -
     lines
 }
 
+/// The line count of `tab`'s content — the same match `draw_help_overlay` uses to pick
+/// which tab's content function to call, but returning just the length. Lets
+/// `App::help_overlay_scroll_down` (final-review fix, TF-585) clamp the stored scroll
+/// offset against the active tab's actual content, since that length is otherwise only
+/// known here in `ui.rs`.
+pub(crate) fn content_line_count(tab: HelpTab) -> usize {
+    match tab {
+        HelpTab::WhatsNew => whats_new_lines().len(),
+        HelpTab::Keybindings => keybindings_lines().len(),
+        HelpTab::Settings => settings_lines().len(),
+        HelpTab::About => about_lines().len(),
+    }
+}
+
 /// Renders the help overlay (`?` — TF-585) on top of whatever `draw` already drew for
 /// the current screen: `Clear` the area first (ratatui doesn't blank a widget's
 /// background on its own — without this, stale content from beneath shows through

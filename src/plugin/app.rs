@@ -615,13 +615,19 @@ impl App {
         }
     }
 
-    /// Scrolls the current tab's content down one line (`j`/`↓`). No-op if the overlay
-    /// is closed. Unbounded at the bottom end — `ratatui::widgets::Paragraph::scroll`
-    /// clips gracefully past the end of its content, so there's no need to know each
-    /// tab's exact line count here just to clamp against it.
-    pub fn help_overlay_scroll_down(&mut self) {
+    /// Scrolls the current tab's content down one line (`j`/`↓`), clamped so the stored
+    /// offset can never advance past the last line of `content_line_count` (the active
+    /// tab's rendered line count — see `ui::content_line_count`, which callers must pass
+    /// since only `ui.rs` knows each tab's content). No-op if the overlay is closed.
+    /// Final-review fix (TF-585): previously unbounded, on the assumption that
+    /// `ratatui::widgets::Paragraph::scroll` clips gracefully past the end of its content
+    /// at render time — true, but clamping only there (not here) meant a held-down `j`
+    /// could drive the stored offset far past the content, leaving the panel looking
+    /// blank until an equal number of `k` presses brought it back into range.
+    pub fn help_overlay_scroll_down(&mut self, content_line_count: usize) {
         if let Some(state) = &mut self.help_overlay {
-            state.scroll = state.scroll.saturating_add(1);
+            let max_scroll = content_line_count.saturating_sub(1) as u16;
+            state.scroll = state.scroll.saturating_add(1).min(max_scroll);
         }
     }
 
@@ -830,7 +836,15 @@ fn handle_help_overlay_key(app: &mut App, key: crossterm::event::KeyCode) {
                 app.help_overlay_jump_tab(tab);
             }
         }
-        KeyCode::Char('j') | KeyCode::Down => app.help_overlay_scroll_down(),
+        KeyCode::Char('j') | KeyCode::Down => {
+            // `help_overlay_scroll_down` needs `&mut self` to clamp against the active
+            // tab's content length, so the tab (`HelpTab` is `Copy`) is read into a local
+            // first rather than holding an immutable borrow of `app` across the call.
+            let tab = app.help_overlay().map(|state| state.tab);
+            if let Some(tab) = tab {
+                app.help_overlay_scroll_down(crate::plugin::ui::content_line_count(tab));
+            }
+        }
         KeyCode::Char('k') | KeyCode::Up => app.help_overlay_scroll_up(),
         _ => {}
     }
@@ -1863,7 +1877,7 @@ mod tests {
     fn switch_tab_forward_cycles_and_resets_scroll() {
         let mut app = App::new();
         app.open_help_overlay();
-        app.help_overlay_scroll_down();
+        app.help_overlay_scroll_down(100); // generously large — not testing the clamp here
 
         app.help_overlay_switch_tab_forward();
 
@@ -1896,7 +1910,7 @@ mod tests {
     fn jump_tab_sets_the_tab_directly_and_resets_scroll() {
         let mut app = App::new();
         app.open_help_overlay();
-        app.help_overlay_scroll_down();
+        app.help_overlay_scroll_down(100); // generously large — not testing the clamp here
 
         app.help_overlay_jump_tab(HelpTab::Settings);
 
@@ -1917,12 +1931,27 @@ mod tests {
         app.help_overlay_scroll_up(); // already at 0 — must not underflow/panic
         assert_eq!(app.help_overlay().unwrap().scroll, 0);
 
-        app.help_overlay_scroll_down();
-        app.help_overlay_scroll_down();
+        app.help_overlay_scroll_down(100); // generously large — not testing the clamp here
+        app.help_overlay_scroll_down(100); // generously large — not testing the clamp here
         assert_eq!(app.help_overlay().unwrap().scroll, 2);
 
         app.help_overlay_scroll_up();
         assert_eq!(app.help_overlay().unwrap().scroll, 1);
+    }
+
+    /// Final-review fix (TF-585): scrolling down more times than the tab has content
+    /// must clamp the stored offset at `content_line_count - 1`, not run away past it —
+    /// otherwise the panel looks blank until an equal number of `k` presses recover it.
+    #[test]
+    fn scroll_down_clamps_at_the_last_line_of_the_tabs_content() {
+        let mut app = App::new();
+        app.open_help_overlay();
+
+        for _ in 0..10 {
+            app.help_overlay_scroll_down(3);
+        }
+
+        assert_eq!(app.help_overlay().unwrap().scroll, 2);
     }
 
     #[test]
@@ -1932,7 +1961,7 @@ mod tests {
         app.help_overlay_switch_tab_forward();
         app.help_overlay_switch_tab_back();
         app.help_overlay_jump_tab(HelpTab::About);
-        app.help_overlay_scroll_down();
+        app.help_overlay_scroll_down(100); // generously large — not testing the clamp here
         app.help_overlay_scroll_up();
         app.close_help_overlay();
 
