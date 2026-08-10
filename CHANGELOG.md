@@ -11,6 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Auto-paginating `LinearClient` helpers — `get_all_issues`, `get_all_teams`, `get_all_team_issues`, `get_all_projects` — that loop through every page of a query and return the full result set, with a configurable page size and safety caps on total pages/items (TF-609)
 
+### Fixed
+
+- Detail pane: unordered Markdown list items now render with a `•` bullet and a hanging
+  indent for wrapped continuation lines, so a wrapped line starting with `--` (e.g. inline
+  code like `` `cargo test --features plugin -- --ignored live_api` `` wrapping right
+  before `--ignored`) can no longer be mistaken for a new bullet. Ordered (`1. `) list
+  items keep their numbering but get the same hanging indent on wrap (TF-613)
+
 ## [0.1.1] - 2026-08-10
 
 ### Added
