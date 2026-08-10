@@ -18,6 +18,7 @@ jobs:
   live-api:
     name: Live API (Linear sandbox)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v3
 
@@ -25,7 +26,22 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Verify LINEAR_API_KEY secret is configured
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+        run: |
+          # tests/live_api.rs skips (rather than fails) when LINEAR_API_KEY is
+          # unset, so it stays safe to run without credentials locally. But an
+          # unconfigured secret expands to an empty string here, not an error —
+          # without this guard a missing/rotated-out secret would make every
+          # test skip silently and the job would report green having made zero
+          # real requests, defeating the point of a canary.
+          if [ -z "$LINEAR_API_KEY" ]; then
+            echo "::error::LINEAR_API_KEY secret is not configured — the live API suite would skip every test silently."
+            exit 1
+          fi
+
       - name: Run live API tests
         env:
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
-        run: cargo test --features plugin -- --ignored live_api
+        run: cargo test --test live_api -- --ignored --nocapture

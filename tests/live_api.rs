@@ -1,25 +1,26 @@
 //! Live integration tests against the real Linear GraphQL API.
 //!
-//! Every other test in this crate runs against `mockito::Server::new_async()`
-//! (see `src/client.rs`), so none of them can catch schema drift, auth
-//! changes, or unexpected real-world response shapes — only a real request
-//! to `https://api.linear.app/graphql` can. This suite fills that gap.
+//! Every other test that exercises `LinearClient`'s HTTP layer runs against
+//! `mockito::Server::new_async()` (see `src/client.rs`), so none of them can
+//! catch schema drift, auth changes, or unexpected real-world response
+//! shapes — only a real request to `https://api.linear.app/graphql` can.
+//! This suite fills that gap.
 //!
 //! These tests are `#[ignore]`-gated, so they never run as part of the
-//! normal `cargo test` / CI path. They read `LINEAR_API_KEY` from the
-//! environment and skip (rather than fail) when it's unset, so the crate's
-//! default test suite stays safe to run without credentials.
+//! normal `cargo test` / CI path. Most of them read `LINEAR_API_KEY` from
+//! the environment and skip (rather than fail) when it's unset, so the
+//! crate's default test suite stays safe to run without credentials.
 //!
 //! Run locally against your own Linear workspace with:
 //!
 //! ```bash
 //! export LINEAR_API_KEY=lin_api_your_key_here
-//! cargo test --features plugin -- --ignored live_api
+//! cargo test --test live_api -- --ignored
 //! ```
 //!
 //! See CONTRIBUTING.md for details.
 
-use herdr_linear::LinearClient;
+use herdr_linear::{Error, LinearClient};
 
 /// Env var these tests read the API key from. Kept as a constant so the
 /// skip message and the lookup can't drift apart.
@@ -88,8 +89,10 @@ async fn live_api_get_teams_returns_a_connection() {
 
 #[tokio::test]
 #[ignore = "hits the real Linear API; requires LINEAR_API_KEY (see CONTRIBUTING.md)"]
-async fn live_api_get_issues_paginates_a_small_page() {
-    let Some(client) = client_from_env("live_api_get_issues_paginates_a_small_page") else {
+async fn live_api_get_issues_returns_a_small_page_with_consistent_page_info() {
+    let Some(client) =
+        client_from_env("live_api_get_issues_returns_a_small_page_with_consistent_page_info")
+    else {
         return;
     };
 
@@ -114,4 +117,41 @@ async fn live_api_get_issues_paginates_a_small_page() {
             "issue.team.id should not be empty"
         );
     }
+
+    // The pagination invariant `get_all_issues`/`get_all_teams` rely on:
+    // whenever the API says there's a next page, it must also hand back a
+    // cursor to fetch it with. A mock can only assume Linear honors this
+    // contract (see `get_all_issues_errors_when_has_next_page_is_true_but_end_cursor_is_missing`
+    // in `src/client.rs`) — only a real response can confirm it still does.
+    if issues.page_info.has_next_page {
+        assert!(
+            issues.page_info.end_cursor.is_some(),
+            "has_next_page is true but end_cursor is missing"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "hits the real Linear API; requires LINEAR_API_KEY (see CONTRIBUTING.md)"]
+async fn live_api_invalid_key_maps_to_authentication_failed() {
+    // Unlike the other tests here, this one doesn't need a real
+    // LINEAR_API_KEY — a syntactically-valid-but-wrong key is the whole
+    // point, and it always runs (never silently skips) as part of the
+    // `--ignored` suite. It exists because the mocked equivalent in
+    // `src/client.rs` (`unauthorized_response_maps_to_authentication_failed`)
+    // only proves the client parses *a* 401 correctly; it can't prove
+    // Linear's real API still rejects bad credentials with 401 rather than,
+    // say, 403 or a 200 carrying a GraphQL-level auth error.
+    let client = LinearClient::new("lin_api_invalid_00000000000000000000000000000000")
+        .expect("a non-empty API key builds a valid client even if Linear will reject it");
+
+    let err = client
+        .get_viewer()
+        .await
+        .expect_err("an invalid API key should be rejected by the real API");
+
+    assert!(
+        matches!(err, Error::AuthenticationFailed(_)),
+        "expected Error::AuthenticationFailed, got {err:?}"
+    );
 }
