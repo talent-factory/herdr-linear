@@ -39,20 +39,19 @@ Delivered ahead of the original schedule as part of what Phase 3 called
 teams/projects — no way to scope to the project you're actually working in,
 or to switch views. See Phase 1.6 below.
 
-### Phase 1.6: Smart Issue Selection (Plugin v2)
+### Phase 1.6: Smart Issue Selection (Plugin v2) ✅ Complete
 
-**Estimated**: August-September 2026
-
-Closes the gap between this Rust reimplementation and the original
+Closed the gap between this Rust reimplementation and the original
 [JacquesvanWyk/herdr-linear](https://github.com/JacquesvanWyk/herdr-linear)
 plugin it's modeled after, which lets you drill into projects and search
 rather than only ever showing "my issues". Tracked as issues in the
-[herdr-linear Linear project](https://linear.app/talent-factory/project/herdr-linear-10dca51ea35b/overview).
+[herdr-linear Linear project](https://linear.app/talent-factory/project/herdr-linear-10dca51ea35b/overview)
+(MVP milestone, 100% — TF-576 through TF-590).
 
-- [ ] View switcher: My Issues / Project Issues / Team Issues
-- [ ] Detect the Linear project for the current working directory (git
-      repo → Linear project mapping) and show its open issues
-- [ ] Issue search/filter within the panel (fzf-style)
+- [x] View switcher: My Issues / Project Issues / Team Issues (TF-576)
+- [x] Detect the Linear project for the current working directory (git
+      repo → Linear project mapping) and show its open issues (TF-577, TF-578)
+- [x] Issue search/filter within the panel (fzf-style) (TF-580)
 
 ### Phase 1.5: Polish & Stability
 
@@ -191,7 +190,7 @@ Have ideas? Please:
 |-----------|----------------------------------|-----------|
 | Aug 2026  | Phase 1 Complete                | Done      |
 | Aug 2026  | Plugin v1 ("My Issues") Complete | Done      |
-| Sep 2026  | Phase 1.6 (Smart Issue Selection)| Current   |
+| Aug 2026  | Phase 1.6 (Smart Issue Selection)| Done      |
 | Sep 2026  | Phase 1.5 (Stability)            | Planned   |
 | Oct 2026  | Phase 2 (Advanced Features)     | Planned   |
 | Nov 2026  | Phase 3 (Herdr Integration)     | Planned   |
@@ -205,4 +204,4 @@ Have ideas? Please:
 
 ---
 
-Last updated: 2026-08-05
+Last updated: 2026-08-08
