@@ -1,20 +1,29 @@
 use std::fs;
 
 fn workflow() -> String {
-    fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/.github/workflows/auto-tag-on-main.yml"))
-        .expect(".github/workflows/auto-tag-on-main.yml should exist")
+    fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/.github/workflows/auto-tag-on-main.yml"
+    ))
+    .expect(".github/workflows/auto-tag-on-main.yml should exist")
 }
 
 #[test]
 fn triggers_on_push_to_main() {
     let w = workflow();
-    assert!(w.contains("branches: [main]"), "must trigger on push to main");
+    assert!(
+        w.contains("branches: [main]"),
+        "must trigger on push to main"
+    );
 }
 
 #[test]
 fn has_contents_write_permission() {
     let w = workflow();
-    assert!(w.contains("contents: write"), "needs write permission to push a tag");
+    assert!(
+        w.contains("contents: write"),
+        "needs write permission to push a tag"
+    );
 }
 
 #[test]
@@ -36,16 +45,28 @@ fn refuses_to_tag_on_version_mismatch() {
 #[test]
 fn skips_cleanly_when_release_already_exists() {
     let w = workflow();
-    assert!(w.contains("gh release view"), "must check for an existing release before tagging");
-    assert!(w.contains("nothing to do"), "must no-op cleanly, not fail, when already released");
+    assert!(
+        w.contains("gh release view"),
+        "must check for an existing release before tagging"
+    );
+    assert!(
+        w.contains("nothing to do"),
+        "must no-op cleanly, not fail, when already released"
+    );
 }
 
 #[test]
 fn creates_and_pushes_an_annotated_v_prefixed_tag() {
     let w = workflow();
     assert!(w.contains("git tag -a"), "must create an annotated tag");
-    assert!(w.contains(r#"tag="v$crate""#), "tag must be v-prefixed and derived from the crate version");
-    assert!(w.contains(r#"git push origin "$tag""#), "must push the tag so release.yml's tag trigger fires");
+    assert!(
+        w.contains(r#"tag="v$crate""#),
+        "tag must be v-prefixed and derived from the crate version"
+    );
+    assert!(
+        w.contains(r#"git push origin "$tag""#),
+        "must push the tag so release.yml's tag trigger fires"
+    );
 }
 
 #[test]
