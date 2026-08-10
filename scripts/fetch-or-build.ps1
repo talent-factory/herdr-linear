@@ -103,7 +103,11 @@ if (-not $Version) { Invoke-HlFallback "could not read version from $CargoToml" 
 $Asset = "herdr-linear-$Triple.exe"
 
 $script:TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("hl-fob-" + [System.Guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Path $script:TmpDir -Force | Out-Null
+try {
+    New-Item -ItemType Directory -Path $script:TmpDir -Force | Out-Null
+} catch {
+    Invoke-HlFallback "could not create a temp dir"
+}
 
 # --- version-only match + transparency "ahead" note (best-effort, never a failure) ---------
 $AheadNote = ''
@@ -155,9 +159,17 @@ if ($Actual -ne $Expected) { Invoke-HlFallback "checksum mismatch for $Asset (ex
 # Verified -- move it into place.
 $OutDir = Split-Path -Parent $Out
 if ($OutDir -and -not (Test-Path $OutDir)) {
-    New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
+    try {
+        New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
+    } catch {
+        Invoke-HlFallback "could not create the output directory"
+    }
 }
-Move-Item -Force $TmpBin $Out
+try {
+    Move-Item -Force $TmpBin $Out
+} catch {
+    Invoke-HlFallback "could not install the verified binary to $Out"
+}
 [Console]::Out.WriteLine("herdr-linear: installed prebuilt v$Version ($Triple), verified SHA-256.$AheadNote")
 Remove-Item -Recurse -Force $script:TmpDir -ErrorAction SilentlyContinue
 exit 0
