@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-08-10
+
 ### Added
 
 - Cross-platform release pipeline: checksum-verified prebuilt binaries for macOS/Linux/Windows via tag-triggered GitHub Actions, replacing always-compile-from-source installs
