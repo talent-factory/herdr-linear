@@ -368,9 +368,20 @@ No commit for this task.
 ```bash
 git fetch origin --prune
 git merge-base --is-ancestor origin/worktree-release-pipeline origin/main && echo "worktree-release-pipeline: safe (merged into main)"
-git merge-base --is-ancestor 61bc7e25d90112595de04675a241c777abf9a2bc origin/main && echo "roadmap commit: safe (its content is in main via Task 1's cherry-pick)"
 ```
-Expected: both print their "safe" line. If either does NOT print, STOP and report — do not delete a branch whose content isn't actually preserved elsewhere.
+Expected: prints its "safe" line. If it does NOT, STOP and report — do not delete a branch whose content isn't actually preserved elsewhere.
+
+**Note on the roadmap commit:** `git cherry-pick` in Task 1 creates a brand-new commit object
+with a different SHA than `61bc7e25d90112595de04675a241c777abf9a2bc` (same diff, new parent,
+new timestamp) — an ancestry check against that original SHA would always report "not found"
+even when the content landed correctly, since that exact commit object will never exist on
+`main`. Verify by commit MESSAGE instead (cherry-pick preserves it) or by content:
+
+```bash
+git log origin/main --oneline --grep="mark Phase 1.6 (Smart Issue Selection) complete" | grep -q . \
+  && echo "roadmap commit: safe (found on main by message, cherry-picked in Task 1)" \
+  || echo "roadmap commit: NOT FOUND on main — STOP, do not delete docs/roadmap-phase-1.6-complete"
+```
 
 - [ ] **Step 2: Delete them**
 
