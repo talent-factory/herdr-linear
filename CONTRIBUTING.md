@@ -201,6 +201,12 @@ By contributing, you agree that your contributions will be licensed under the sa
   `.github/workflows/auto-tag-on-main.yml` tags `vX.Y.Z` automatically, which triggers
   `.github/workflows/release.yml` to build and publish checksummed binaries for macOS,
   Linux, and Windows.
+- **That same PR must also rename `CHANGELOG.md`'s `## [Unreleased]` heading** to
+  `## [vX.Y.Z] - YYYY-MM-DD` (with a fresh empty `## [Unreleased]` above it), per Keep a
+  Changelog convention. The version bump alone doesn't touch `CHANGELOG.md` — skipping this
+  step leaves the in-app What's New overlay (TF-585) showing `vX.Y.Z (unreleased)` for an
+  already-published release, since it labels a build "unreleased" whenever `[Unreleased]`
+  still has content, regardless of whether a real tag/release exists.
 - Merging to `main` **without** a version bump is safe — the auto-tag workflow finds that
   the tag for the current version already exists and does nothing. Doc-only or otherwise
   non-release merges into `main` don't need special handling.
