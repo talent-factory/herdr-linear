@@ -2,23 +2,34 @@
 #
 # A "My Issues" panel for Linear: lists the authenticated user's assigned issues in a
 # herdr split pane or tab, with view details / open-in-browser / implement-on-Enter.
-# See docs/superpowers/specs/2026-08-04-herdr-plugin-layer-design.md for the full design.
+# See docs/superpowers/specs/2026-08-04-herdr-plugin-layer-design.md for the full design
+# and docs/superpowers/specs/2026-08-10-release-pipeline-design.md for the release
+# pipeline and Windows support added on top of it.
 #
-# v1 targets linux/macos only. The [[build]] step is a plain `cargo build`, so
-# installing requires a Rust toolchain (no prebuilt-binary download yet).
+# Install downloads a checksum-verified prebuilt binary matching this manifest's
+# declared version when a matching GitHub Release exists, falling back to `cargo build`
+# otherwise — see scripts/fetch-or-build.sh / scripts/fetch-or-build.ps1.
 
 id = "herdr-linear"
 name = "herdr-linear"
 version = "0.1.0"
 description = "A Linear issues panel for Herdr, with implement-on-Enter."
 min_herdr_version = "0.7.0"
-platforms = ["linux", "macos"]
+platforms = ["linux", "macos", "windows"]
 
 [[build]]
-command = ["cargo", "build", "--release", "--features", "plugin"]
+platforms = ["linux", "macos"]
+command = ["/bin/sh", "scripts/fetch-or-build.sh"]
+
+[[build]]
+platforms = ["windows"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts/fetch-or-build.ps1"]
 
 # The Linear panel. herdr performs the split/tab placement on open; the [[actions]]
-# below summon it via the idempotent launcher scripts.
+# below summon it via the idempotent launcher scripts. The Windows actions never invoke
+# this entry via `plugin pane open --entrypoint` — herdr can't spawn a relative pane
+# command via CreateProcessW on Windows — they open the pane themselves, by absolute
+# path (see scripts/open-split-windows.ps1).
 [[panes]]
 id = "linear-panel"
 title = "Linear"
@@ -27,12 +38,28 @@ command = ["./target/release/herdr-linear"]
 
 [[actions]]
 id = "open-split"
+platforms = ["linux", "macos"]
 title = "Open Linear panel"
 description = "Open the Linear issues panel in a split pane beside the current work."
 command = ["bash", "scripts/open-split.sh"]
 
 [[actions]]
+id = "open-split-windows"
+platforms = ["windows"]
+title = "Open Linear panel"
+description = "Open the Linear issues panel in a split pane beside the current work."
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts/open-split-windows.ps1"]
+
+[[actions]]
 id = "open-tab"
+platforms = ["linux", "macos"]
 title = "Open Linear panel (tab)"
 description = "Open the Linear issues panel in its own tab (switch to it if already open)."
 command = ["bash", "scripts/open-tab.sh"]
+
+[[actions]]
+id = "open-tab-windows"
+platforms = ["windows"]
+title = "Open Linear panel (tab)"
+description = "Open the Linear issues panel in its own tab (switch to it if already open)."
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts/open-tab-windows.ps1"]
