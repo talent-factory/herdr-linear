@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Cross-platform release pipeline: checksum-verified prebuilt binaries for macOS
+  (arm64/x86_64), Linux (x86_64 musl), and Windows (x86_64 msvc), published via a
+  tag-triggered GitHub Actions workflow. `herdr plugin install` now downloads and
+  verifies the matching binary in seconds instead of always compiling from source,
+  falling back to a source build on any miss (unsupported platform, network issue,
+  checksum mismatch, or no release for the installed version).
+- Full Windows platform support: `herdr-plugin.toml` now declares `windows` alongside
+  `linux`/`macos`, with dedicated PowerShell action launchers
+  (`open-split-windows`/`open-tab-windows`) that work around a herdr limitation where
+  the plugin's pane can't be spawned via a relative path on Windows.
 - In-app Help overlay (`?` key): What's New / Keybindings / Settings / About (TF-585)
 - Type-to-filter the loaded issue list by title/identifier (TF-580)
 - Guaranteed tab-per-issue on the Linear implement flow (TF-579)

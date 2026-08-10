@@ -224,6 +224,11 @@ issues is read-only; pressing `<Enter>` on a selected issue is not — see "Use"
 herdr plugin install talent-factory/herdr-linear
 ```
 
+This downloads a checksum-verified prebuilt binary for your platform (macOS
+arm64/x86_64, Linux x86_64, or Windows x86_64) when one is published for the
+installed version, falling back to compiling from source with `cargo` otherwise —
+either way, no extra setup beyond `herdr` itself.
+
 For local development, use `herdr plugin link /path/to/herdr-linear` instead.
 
 ### Configure
@@ -298,6 +303,11 @@ type = "plugin_action"
 command = "herdr-linear.open-tab"
 description = "Open Linear panel (tab)"
 ```
+
+**On Windows**, bind `herdr-linear.open-split-windows` / `herdr-linear.open-tab-windows`
+instead — herdr can't spawn the plugin's pane via a relative path on Windows, so the
+Windows actions open it differently internally, but behave identically from the
+keybinding's perspective.
 
 Reload the config, then press the bound key to open the plugin. The panel opens on a
 menu with three options — "My Issues", "Project Issues", and "Team Issues" — all
