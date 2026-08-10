@@ -12,6 +12,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
+use unicode_width::UnicodeWidthChar;
 
 pub fn draw(frame: &mut Frame, app: &App) {
     match app.screen() {
@@ -247,7 +248,7 @@ fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState, status: 
                 let markdown_lines =
                     tui_markdown::from_str_with_options(description, &options).lines;
                 lines.extend(harden_list_item_wrapping(
-                    markdown_lines,
+                    &markdown_lines,
                     detail_area.width as usize,
                 ));
 
@@ -275,6 +276,16 @@ fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState, status: 
 /// (see [`harden_list_item_wrapping`]).
 const LIST_BULLET: char = '•';
 
+/// Minimum body-text budget (`width - marker_width`, in display columns)
+/// [`rewrap_list_item`] requires before hanging-indent-wrapping a list item
+/// itself, rather than falling back to a single un-rewrapped row. Below
+/// this, hard-breaking would put only a couple of characters per row —
+/// technically correct but unreadable, and worse than the ambiguity the
+/// wrap exists to fix (see [`rewrap_list_item`]'s fallback comment). Chosen
+/// as roughly "a short word still fits" (`"item"` is 4 columns, `"marker"`
+/// is 6) rather than derived from any hard constraint.
+const MIN_WRAP_BUDGET: usize = 8;
+
 /// Post-processes `tui_markdown::from_str_with_options`'s output (TF-613, a
 /// follow-up to TF-583) so a list item's marker can never be mistaken for a
 /// wrapped continuation line, and vice versa.
@@ -290,12 +301,14 @@ const LIST_BULLET: char = '•';
 /// code like `cargo test --features plugin -- --ignored live_api` wrapping
 /// right before `--ignored`), it reads exactly like a new top-level bullet
 /// — reproduced live via TF-612's own rendered description.
-/// `tui_markdown::StyleSheet` has no hook for either the marker glyph or
-/// wrap behavior — confirmed against its full trait surface (heading/code/
-/// link/blockquote/metadata/footnote/definition-list/table/image hooks
-/// only) — so both fixes happen here, downstream of the crate, for the same
-/// reason [`MarkdownStyleSheet`]'s doc comment gives for its heading/
-/// code-fence overrides.
+/// `tui_markdown::StyleSheet`'s ~20 hooks (heading/code/link/blockquote/
+/// metadata/footnote/definition-list/table/image/html/math/alert, at the
+/// pinned `tui-markdown` version) cover *what style to render with*, not
+/// *what glyph a marker uses* or *how a line wraps* — neither is
+/// configurable through the trait, so this fix has to happen here,
+/// downstream of the crate, as post-processing of its output rather than
+/// through the extension point [`MarkdownStyleSheet`] itself uses for its
+/// heading/code-fence overrides.
 ///
 /// For each list-item line found (see [`rewrap_list_item`]): the literal
 /// `- ` marker is swapped for [`LIST_BULLET`] (same display width, so
@@ -306,25 +319,29 @@ const LIST_BULLET: char = '•';
 /// text the way `-`/`--` do — but still get the hanging-indent treatment,
 /// since an un-indented wrapped continuation is still visually confusable
 /// with the start of the next item.
-fn harden_list_item_wrapping<'a>(lines: Vec<Line<'a>>, width: usize) -> Vec<Line<'static>> {
+fn harden_list_item_wrapping(lines: &[Line<'_>], width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
     lines
-        .into_iter()
-        .flat_map(|line| {
-            rewrap_list_item(&line, width).unwrap_or_else(|| vec![to_owned_line(&line)])
-        })
+        .iter()
+        .flat_map(|line| rewrap_list_item(line, width).unwrap_or_else(|| vec![to_owned_line(line)]))
         .collect()
 }
 
 /// If `line` is a list-item line as `tui-markdown` renders one — leading
-/// spaces (a multiple of 4; each nesting level indents its marker span by
-/// 4 more) followed by either `- ` (unordered) or `<digits>. ` (ordered) —
-/// returns it rewrapped to `width` columns with a hanging indent (see
+/// spaces (a multiple of 4 for any list depth `tui-markdown` itself would
+/// produce; each nesting level indents its marker span by 4 more) followed
+/// by a first span holding *only* a marker, either `- ` (unordered) or
+/// `<digits>. ` (ordered), with nothing else appended — returns it
+/// rewrapped to `width` columns with a hanging indent (see
 /// [`wrap_list_item_body`]), swapping a leading `-` for [`LIST_BULLET`].
 /// Returns `None` for any other line, which the caller passes through
-/// unchanged. A task-list checkbox (`[ ] `/`[x] `) is recognized whether
-/// `tui-markdown` places it in the same span as the marker (unordered) or
-/// as the following span (ordered) — see `renderer::list::task_list_marker`.
+/// unchanged — including a line that merely *starts with* the marker
+/// pattern but carries more text in the same span (a fenced code-block
+/// line, an escaped `\- ` paragraph): `tui-markdown` never merges body text
+/// into the marker span, so that shape is never a real list item. A
+/// task-list checkbox (`[ ] `/`[x] `) is recognized whether `tui-markdown`
+/// places it in the same span as the marker (unordered) or as the
+/// following span (ordered) — see `renderer::list::task_list_marker`.
 fn rewrap_list_item(line: &Line<'_>, width: usize) -> Option<Vec<Line<'static>>> {
     let first = line.spans.first()?;
     let content = first.content.as_ref();
@@ -343,11 +360,23 @@ fn rewrap_list_item(line: &Line<'_>, width: usize) -> Option<Vec<Line<'static>>>
         return None;
     }
 
+    // `tui-markdown` always renders a list marker as its own span holding
+    // nothing but the marker itself (plus, for an unordered item, an inline
+    // task checkbox) — body text always lives in later spans. A line whose
+    // first span merely *starts with* the marker pattern but carries more
+    // text after it — a fenced code-block line (`- old line` inside a
+    // ```diff block), an escaped `\- ` paragraph — is therefore not a real
+    // list marker; leave it untouched rather than mangling its content.
+    let marker_end = if is_unordered { 2 } else { digits_end + 2 };
+    let rest = &after_indent[marker_end..]; // empty, or a task checkbox like "[ ] "
+    if !(rest.is_empty() || rest == "[ ] " || rest == "[x] ") {
+        return None;
+    }
+
     let mut spans: Vec<Span<'static>> = line.spans.iter().map(to_owned_span).collect();
 
     if is_unordered {
         let indent = &content[..indent_len];
-        let rest = &after_indent[2..]; // empty, or a task checkbox like "[ ] "
         spans[0] = Span::styled(format!("{indent}{LIST_BULLET} {rest}"), spans[0].style);
     }
 
@@ -361,15 +390,48 @@ fn rewrap_list_item(line: &Line<'_>, width: usize) -> Option<Vec<Line<'static>>>
         1
     };
     let marker_width: usize = spans[..marker_span_count].iter().map(Span::width).sum();
+
+    // Below a minimum body-text budget — deep nesting in a narrow pane —
+    // `wrap_list_item_body`'s hanging-indent wrap degenerates into a
+    // spindly, near-unreadable character-per-row hard-break, which is worse
+    // than the ambiguity this whole function exists to fix. The `•` marker
+    // substitution doesn't depend on the hanging indent for its
+    // disambiguation, though: a bullet is never confused with a plain `-`
+    // continuation regardless of indentation. So below that floor, fall
+    // back to just the marker swap on a single un-rewrapped row and leave
+    // wrapping the body to `Paragraph`'s own `Wrap`.
+    if width.saturating_sub(marker_width) < MIN_WRAP_BUDGET {
+        return Some(vec![Line {
+            spans,
+            style: line.style,
+            alignment: line.alignment,
+        }]);
+    }
+
     let body_spans = spans.split_off(marker_span_count);
 
-    Some(wrap_list_item_body(spans, body_spans, width, marker_width))
+    let mut rows = wrap_list_item_body(spans, body_spans, width, marker_width);
+    // Every rebuilt row is a continuation of the same source line, so it
+    // should carry that line's own style/alignment — the same thing
+    // `to_owned_line` (this function's fallback for non-list lines, right
+    // below) already preserves for an unmodified line.
+    for row in &mut rows {
+        row.style = line.style;
+        row.alignment = line.alignment;
+    }
+    Some(rows)
 }
 
+/// Clones `span`'s content into an owned `String` so it outlives the
+/// borrowed `tui_markdown::from_str_with_options` output it came from —
+/// needed because [`harden_list_item_wrapping`] returns `Line<'static>`.
 fn to_owned_span(span: &Span<'_>) -> Span<'static> {
     Span::styled(span.content.to_string(), span.style)
 }
 
+/// [`to_owned_span`] applied to every span of `line`, preserving the line's
+/// own `style`/`alignment` — the fallback [`harden_list_item_wrapping`]
+/// uses for any line [`rewrap_list_item`] didn't recognize as a list item.
 fn to_owned_line(line: &Line<'_>) -> Line<'static> {
     Line {
         spans: line.spans.iter().map(to_owned_span).collect(),
@@ -385,17 +447,57 @@ fn to_owned_line(line: &Line<'_>) -> Line<'static> {
 /// `**bold *emphasis***` spans both a bold-only and a bold+italic run.
 struct Word {
     chars: Vec<(char, Style)>,
-    /// Style of the single space that followed this word in the source
-    /// spans (`None` for the last word). Reused for a same-row separator so
-    /// a space between two same-styled words — e.g. inside one long
-    /// inline-code span — keeps that style instead of reverting to the
-    /// default one, which a plain `Span::raw(" ")` separator would do.
-    trailing_space_style: Option<Style>,
+    /// Style and run-length of the whitespace that followed this word in the
+    /// source spans (`None` when nothing did — ordinarily only the last
+    /// word, unless the body text itself has trailing whitespace). Reused
+    /// for a same-row
+    /// separator so a run of spaces — e.g. deliberate column-alignment
+    /// inside one long inline-code span — survives the rewrap intact
+    /// (matching `Paragraph`'s own `Wrap { trim: false }`, which this
+    /// replaces for list items and does not collapse whitespace either)
+    /// instead of being collapsed to a single default-styled space.
+    trailing_space: Option<(Style, usize)>,
 }
 
 impl Word {
     fn char_len(&self) -> usize {
         self.chars.len()
+    }
+
+    /// Display-column width of the whole word — sum of each character's
+    /// [`unicode_width`] column count, NOT [`Word::char_len`]. Most CJK
+    /// ideographs and many emoji occupy 2 terminal columns despite being a
+    /// single `char`/Unicode scalar value; wrap-budget decisions must use
+    /// this, matching how `marker_width` is measured (`Span::width`), or a
+    /// row containing such characters silently overflows the target width.
+    fn width(&self) -> usize {
+        self.chars
+            .iter()
+            .map(|&(c, _)| UnicodeWidthChar::width(c).unwrap_or(0))
+            .sum()
+    }
+
+    /// Greedily selects the leading characters (starting at char index
+    /// `start`) that fit within `budget` display columns — always at least
+    /// one character, to guarantee forward progress even when a single
+    /// character's own width exceeds `budget` (a pathologically narrow
+    /// pane). Returns `(chars_taken, display_width_taken)`; the former
+    /// indexes [`Word::spans`], the latter becomes the caller's `col`.
+    fn take_within(&self, start: usize, budget: usize) -> (usize, usize) {
+        let mut width = 0usize;
+        let mut count = 0usize;
+        for &(c, _) in &self.chars[start..] {
+            let char_width = UnicodeWidthChar::width(c).unwrap_or(0);
+            if count > 0 && width + char_width > budget {
+                break;
+            }
+            width += char_width;
+            count += 1;
+            if width >= budget {
+                break;
+            }
+        }
+        (count, width)
     }
 
     /// Rebuilds `self.chars[range]` as the minimal run of styled `Span`s,
@@ -412,8 +514,9 @@ impl Word {
     }
 }
 
-/// Splits `spans` into [`Word`]s on space characters (consecutive spaces
-/// collapse to a single separator), discarding leading/trailing whitespace.
+/// Splits `spans` into [`Word`]s on space characters, preserving the exact
+/// run-length of each separator (see [`Word::trailing_space`]) and
+/// discarding leading/trailing whitespace.
 fn styled_words(spans: &[Span<'static>]) -> Vec<Word> {
     let mut words = Vec::new();
     let mut current: Vec<(char, Style)> = Vec::new();
@@ -424,10 +527,13 @@ fn styled_words(spans: &[Span<'static>]) -> Vec<Word> {
                 if !current.is_empty() {
                     words.push(Word {
                         chars: std::mem::take(&mut current),
-                        trailing_space_style: Some(span.style),
+                        trailing_space: Some((span.style, 1)),
                     });
                 } else if let Some(last) = words.last_mut() {
-                    last.trailing_space_style.get_or_insert(span.style);
+                    match &mut last.trailing_space {
+                        Some((_, len)) => *len += 1,
+                        None => last.trailing_space = Some((span.style, 1)),
+                    }
                 }
             } else {
                 current.push((c, span.style));
@@ -437,7 +543,7 @@ fn styled_words(spans: &[Span<'static>]) -> Vec<Word> {
     if !current.is_empty() {
         words.push(Word {
             chars: current,
-            trailing_space_style: None,
+            trailing_space: None,
         });
     }
     words
@@ -461,57 +567,72 @@ fn wrap_list_item_body(
     let words = styled_words(&body_spans);
 
     let mut rows: Vec<Vec<Span<'static>>> = vec![marker_spans];
-    let mut col = 0usize;
+    let mut col = 0usize; // display columns used so far on the current row
     let new_row = || vec![Span::raw(" ".repeat(marker_width))];
 
     for (i, word) in words.iter().enumerate() {
-        let word_len = word.char_len();
+        // `word_width` (display columns, via `Word::width`) drives every fit
+        // decision below, matching the unit `budget`/`marker_width`/`col`
+        // are already measured in. `word.char_len()`/`word.spans(range)`
+        // stay char-index based (that's what indexes `self.chars`), so a
+        // wide-character word's *count* of taken characters and its
+        // *display width* are tracked separately throughout.
+        let word_width = word.width();
 
-        if word_len > budget {
+        if word_width > budget {
             if col > 0 {
                 rows.push(new_row());
             }
+            let char_len = word.char_len();
             let mut start = 0;
             loop {
-                let take = (word_len - start).min(budget);
+                let (take, taken_width) = word.take_within(start, budget);
                 rows.last_mut()
                     .expect("at least the marker row exists")
                     .extend(word.spans(start..start + take));
                 start += take;
-                if start >= word_len {
-                    col = take;
+                if start >= char_len {
+                    col = taken_width;
                     break;
                 }
                 rows.push(new_row());
             }
         } else {
             let needed = if col == 0 {
-                word_len
+                word_width
             } else {
-                col + 1 + word_len
+                let (_, separator_len) =
+                    words[i - 1].trailing_space.unwrap_or((Style::default(), 1));
+                col + separator_len + word_width
             };
             if needed <= budget {
                 if col > 0 {
-                    let separator_style = words[i - 1].trailing_space_style.unwrap_or_default();
+                    let (separator_style, separator_len) =
+                        words[i - 1].trailing_space.unwrap_or((Style::default(), 1));
                     rows.last_mut()
                         .expect("at least the marker row exists")
-                        .push(Span::styled(" ".to_string(), separator_style));
+                        .push(Span::styled(" ".repeat(separator_len), separator_style));
                 }
                 rows.last_mut()
                     .expect("at least the marker row exists")
-                    .extend(word.spans(0..word_len));
+                    .extend(word.spans(0..word.char_len()));
                 col = needed;
             } else {
                 rows.push(new_row());
                 rows.last_mut()
                     .expect("at least the marker row exists")
-                    .extend(word.spans(0..word_len));
-                col = word_len;
+                    .extend(word.spans(0..word.char_len()));
+                col = word_width;
             }
         }
     }
 
-    rows.into_iter().map(Line::from).collect()
+    let lines: Vec<Line<'static>> = rows.into_iter().map(Line::from).collect();
+    debug_assert!(
+        lines.iter().all(|row| row.width() <= width),
+        "wrap_list_item_body produced a row wider than its {width}-column budget: {lines:?}"
+    );
+    lines
 }
 
 /// The About tab's content (TF-585): plugin name, version, description, repo, license —
@@ -937,7 +1058,7 @@ mod tests {
     use crate::plugin::app::{handle_key, App};
     use crate::Issue;
     use crossterm::event::{KeyCode, KeyModifiers};
-    use ratatui::{backend::TestBackend, Terminal};
+    use ratatui::{backend::TestBackend, layout::Alignment, Terminal};
     use serde_json::json;
 
     #[allow(clippy::too_many_arguments)]
@@ -1350,6 +1471,339 @@ mod tests {
         assert!(!text.contains("- Top item"));
         assert!(!text.contains("- Nested item"));
         assert!(!text.contains("- Second top item"));
+    }
+
+    #[test]
+    fn ordered_list_item_keeps_its_digits_and_gets_a_hanging_indent_on_wrap() {
+        // TF-613: ordered markers keep their digits (no bullet
+        // substitution — nothing in them collides with body text the way
+        // `-`/`--` do) but still get the hanging-indent treatment on wrap,
+        // since an un-indented wrapped continuation is just as visually
+        // confusable with the start of the next item.
+        let line = Line::from(vec![Span::raw("1. "), Span::raw("aaaaa bbbbb ccccc ddddd")]);
+        let width = 12; // marker_width = 3, budget = 9
+
+        let rewrapped = rewrap_list_item(&line, width).expect("a `1. ` line is a list item");
+
+        assert!(rewrapped.len() > 1, "test setup should force a wrap");
+        let first: String = rewrapped[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        let second: String = rewrapped[1]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(first.starts_with("1. aaaaa"));
+        assert!(
+            second.starts_with("   "),
+            "continuation row should carry a 3-column hanging indent matching \"1. \", got {second:?}"
+        );
+        assert!(!second.starts_with("1."));
+    }
+
+    #[test]
+    fn unordered_task_checkbox_marker_wraps_with_a_hanging_indent_matching_its_width() {
+        // TF-613: `tui-markdown` folds an unordered task-list checkbox into
+        // the same span as the `- ` marker itself; the whole thing (bullet
+        // + checkbox) is the marker, and the hanging indent must match its
+        // full width, not just the bullet's.
+        let line = Line::from(vec![
+            Span::raw("- [ ] "),
+            Span::raw("aaaaa bbbbb ccccc ddddd"),
+        ]);
+        let width = 14; // marker_width = 6 ("• [ ] "), budget = 8
+
+        let rewrapped = rewrap_list_item(&line, width).expect("a checkbox item is a list item");
+
+        assert!(rewrapped.len() > 1, "test setup should force a wrap");
+        let first: String = rewrapped[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        let second: String = rewrapped[1]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(first.starts_with("• [ ] aaaaa"));
+        assert!(
+            second.starts_with("      "),
+            "continuation row should carry a 6-column hanging indent matching \"• [ ] \", got {second:?}"
+        );
+    }
+
+    #[test]
+    fn ordered_task_checkbox_marker_wraps_with_a_hanging_indent_matching_its_width() {
+        // TF-613: for an *ordered* task-list item, `tui-markdown` places
+        // the checkbox in its own span right after the digit marker
+        // (rather than folding it into the marker span the way it does for
+        // unordered items) — `rewrap_list_item` must recognize that second
+        // span as still part of the marker, not the wrappable body.
+        let line = Line::from(vec![
+            Span::raw("1. "),
+            Span::raw("[ ] "),
+            Span::raw("aaaaa bbbbb ccccc ddddd"),
+        ]);
+        let width = 17; // marker_width = 7 ("1. [ ] "), budget = 10
+
+        let rewrapped =
+            rewrap_list_item(&line, width).expect("an ordered checkbox item is a list item");
+
+        assert!(rewrapped.len() > 1, "test setup should force a wrap");
+        let first: String = rewrapped[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        let second: String = rewrapped[1]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(first.starts_with("1. [ ] aaaaa"));
+        assert!(
+            second.starts_with("       "),
+            "continuation row should carry a 7-column hanging indent matching \"1. [ ] \", got {second:?}"
+        );
+        assert!(!second.starts_with("1."));
+    }
+
+    #[test]
+    fn a_single_word_wider_than_the_wrap_budget_is_hard_broken_across_rows() {
+        // TF-613: `wrap_list_item_body`'s own hard-break path (distinct
+        // from the sibling scroll-estimate function `word_wrapped_row_count`,
+        // which has its own hard-break tests below) must still land every
+        // character of an over-wide word somewhere, with each continuation
+        // row carrying the same hanging indent as an ordinary wrap.
+        let long_word = "a".repeat(20);
+        let line = Line::from(vec![Span::raw("- "), Span::raw(long_word)]);
+        let width = 10; // marker_width = 2, budget = 8
+
+        let rewrapped = rewrap_list_item(&line, width).expect("a `- ` line is a list item");
+
+        assert_eq!(rewrapped.len(), 3, "ceil(20 / 8) == 3 rows");
+        let rows: Vec<String> = rewrapped
+            .iter()
+            .map(|row| {
+                row.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(rows[0], format!("• {}", "a".repeat(8)));
+        assert_eq!(rows[1], format!("  {}", "a".repeat(8)));
+        assert_eq!(rows[2], format!("  {}", "a".repeat(4)));
+    }
+
+    #[test]
+    fn a_word_straddling_a_style_boundary_keeps_each_half_styled_when_wrapped() {
+        // TF-613: `Word` exists specifically so a single word split across
+        // two differently-styled spans (e.g. `**bold**italic` straddling
+        // mid-word, which CommonMark renders as adjacent spans with no
+        // space between them) keeps each half's own style when rebuilt,
+        // rather than losing the boundary.
+        let bold = Style::new().add_modifier(Modifier::BOLD);
+        let italic = Style::new().add_modifier(Modifier::ITALIC);
+        let line = Line::from(vec![
+            Span::raw("- "),
+            Span::styled("bold", bold),
+            Span::styled("italic", italic),
+        ]);
+        let width = 40; // wide enough that this doesn't also need to wrap
+
+        let rewrapped = rewrap_list_item(&line, width).expect("a `- ` line is a list item");
+
+        assert_eq!(rewrapped.len(), 1);
+        let spans = &rewrapped[0].spans;
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "• bolditalic");
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.style == bold && s.content.as_ref() == "bold"),
+            "the bold half should keep its own style as its own span, got {spans:?}"
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.style == italic && s.content.as_ref() == "italic"),
+            "the italic half should keep its own style as its own span, got {spans:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_body_list_item_renders_just_the_marker_without_panicking() {
+        // TF-613: a list item with nothing after the marker (`- ` alone)
+        // must not panic and must still render the substituted bullet.
+        let line = Line::from(vec![Span::raw("- ")]);
+        let width = 20;
+
+        let rewrapped = rewrap_list_item(&line, width).expect("a `- ` line is a list item");
+
+        assert_eq!(rewrapped.len(), 1);
+        let text: String = rewrapped[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(text, "• ");
+    }
+
+    #[test]
+    fn a_line_with_a_non_multiple_of_four_indent_is_not_treated_as_a_list_item() {
+        // A 2-space indent doesn't match any nesting level `tui-markdown`
+        // itself would ever produce (each level adds exactly 4 columns), so
+        // it must be left untouched rather than misidentified as a list
+        // item at some fractional nesting depth.
+        let line = Line::from(vec![Span::raw("  - "), Span::raw("not really a list item")]);
+        let width = 20;
+
+        assert!(rewrap_list_item(&line, width).is_none());
+    }
+
+    #[test]
+    fn falls_back_to_a_single_unwrapped_row_when_the_wrap_budget_is_too_narrow() {
+        // TF-613 regression: deep nesting in a narrow pane must not degrade
+        // into a spindly character-per-row hard-break — that's worse than
+        // the ambiguity it fixes. The `•` marker alone (regardless of
+        // indent) is never confused with a plain `-` continuation, so below
+        // a minimum body-text budget the line should render as a single
+        // un-rewrapped row with just the marker swapped, leaving
+        // continuation wrapping to `Paragraph`'s own `Wrap` instead.
+        let indent = " ".repeat(12); // 3 nesting levels (4 columns each)
+        let line = Line::from(vec![
+            Span::raw(format!("{indent}- ")),
+            Span::raw("ddddd eeeee fffff ggggg"),
+        ]);
+        let width = 18; // budget = 18 - 14 (indent+marker) = 4 columns
+
+        let rewrapped = rewrap_list_item(&line, width).expect("a `- ` line is a list item");
+
+        assert_eq!(
+            rewrapped.len(),
+            1,
+            "narrow-width fallback should not hard-break into many spindly rows"
+        );
+        let text: String = rewrapped[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(text.starts_with(&format!("{indent}• ")));
+        assert!(text.contains("ddddd eeeee fffff ggggg"));
+    }
+
+    #[test]
+    fn rewrapped_list_item_rows_keep_the_source_lines_style_and_alignment() {
+        // TF-613 regression: `rewrap_list_item` rebuilds each row from
+        // scratch, so it must carry the source `Line`'s own `style`/
+        // `alignment` onto every resulting row itself — `to_owned_line`
+        // (the fallback for non-list lines, right above) already does this;
+        // the list-item path shouldn't be a less faithful copy than that.
+        let line = Line::from(vec![Span::raw("- "), Span::raw("aaaaa bbbbb ccccc ddddd")])
+            .style(Style::new().bg(Color::Blue))
+            .alignment(Alignment::Right);
+        let width = 12; // forces the body onto more than one row
+
+        let rewrapped = rewrap_list_item(&line, width).expect("a `- ` line is a list item");
+
+        assert!(rewrapped.len() > 1, "test setup should force a wrap");
+        for row in &rewrapped {
+            assert_eq!(row.style, Style::new().bg(Color::Blue));
+            assert_eq!(row.alignment, Some(Alignment::Right));
+        }
+    }
+
+    #[test]
+    fn multiple_consecutive_spaces_in_a_list_item_body_are_preserved() {
+        // TF-613 regression: the hand-rolled wrapper this file replaces
+        // `Paragraph`'s own `Wrap { trim: false }` with must not be lossier
+        // than what it replaces. `Wrap { trim: false }` preserves a
+        // deliberate multi-space run (e.g. aligned columns inside inline
+        // code); the word-tokenizer here must not collapse it to one space.
+        let line = Line::from(vec![Span::raw("- "), Span::raw("a    b")]);
+        let width = 40;
+
+        let rewrapped = rewrap_list_item(&line, width).expect("a `- ` line is a list item");
+
+        assert_eq!(rewrapped.len(), 1, "should fit on a single row at width 40");
+        let text: String = rewrapped[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(text, "• a    b");
+    }
+
+    #[test]
+    fn wide_characters_are_measured_by_display_width_not_char_count() {
+        // TF-613 regression: word-wrap fit decisions must measure display
+        // columns (what actually determines whether a row overflows the
+        // terminal), not `char`/Unicode-scalar count. CJK ideographs and
+        // most emoji are 2-columns-wide but 1 `char`; undercounting them
+        // lets a row silently overflow `width`, which then forces
+        // `Paragraph`'s own re-wrap — reintroducing, for wide-character
+        // content, exactly the ambiguous-continuation bug this file exists
+        // to prevent.
+        // `tui-markdown` always renders the marker as its own dedicated
+        // span, separate from the body text (see `rewrap_list_item`'s doc
+        // comment) — mirror that shape here rather than a single merged
+        // span, which the false-positive guard would (correctly) reject.
+        let line = Line::from(vec![
+            Span::raw("- "),
+            Span::raw("日本語のテキストがここにあります and trailing words here"),
+        ]);
+        let width = 40;
+
+        let rewrapped = rewrap_list_item(&line, width).expect("a `- ` line is a list item");
+
+        for row in &rewrapped {
+            assert!(
+                row.width() <= width,
+                "row {row:?} is {} columns wide, exceeding the {width}-column budget",
+                row.width()
+            );
+        }
+    }
+
+    #[test]
+    fn code_block_lines_starting_with_a_hyphen_are_not_treated_as_list_markers() {
+        // TF-613 false-positive guard: `rewrap_list_item` identifies a list
+        // marker purely from the *shape* of a rendered line (leading
+        // 4-space-multiple indent + literal `- `), which a fenced code
+        // block's own content — e.g. a diff hunk — can coincidentally match.
+        // A `- ` line inside a ```diff block is diff syntax, not a list
+        // item, and must not have its `-` swapped for `•`.
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue_with_description(
+            "ENG-9",
+            "```diff\n- old line here\n+ new line here\n```",
+        )]);
+
+        let text = rendered_text_with_size(&app, 100, 30);
+        assert!(text.contains("- old line here"));
+        assert!(!text.contains("• old line here"));
+    }
+
+    #[test]
+    fn escaped_hyphen_paragraph_is_not_treated_as_a_list_marker() {
+        // TF-613 false-positive guard: an escaped hyphen (`\-`) renders as a
+        // literal `- ` at the start of a plain paragraph line, which must
+        // not be mistaken for a list item's marker either.
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue_with_description(
+            "ENG-10",
+            "\\- not a list item",
+        )]);
+
+        let text = rendered_text_with_size(&app, 100, 30);
+        assert!(text.contains("- not a list item"));
+        assert!(!text.contains("• not a list item"));
     }
 
     #[test]
