@@ -8,7 +8,10 @@ fn read(rel: &str) -> String {
 #[test]
 fn sh_is_a_posix_shell_script() {
     let s = read("scripts/fetch-or-build.sh");
-    assert!(s.starts_with("#!/bin/sh"), "must be a POSIX sh script, not bash");
+    assert!(
+        s.starts_with("#!/bin/sh"),
+        "must be a POSIX sh script, not bash"
+    );
 }
 
 #[test]
@@ -24,7 +27,10 @@ fn sh_falls_back_to_cargo_build_with_plugin_feature() {
 #[test]
 fn sh_verifies_a_sha256_checksum_before_installing() {
     let s = read("scripts/fetch-or-build.sh");
-    assert!(s.contains("sha256"), "must compute/verify a sha256 checksum");
+    assert!(
+        s.contains("sha256"),
+        "must compute/verify a sha256 checksum"
+    );
     assert!(s.contains("SHA256SUMS"), "must fetch the SHA256SUMS file");
 }
 
@@ -39,8 +45,14 @@ fn sh_uses_overridable_paths_for_testability() {
 #[test]
 fn sh_targets_the_right_repo_and_asset_prefix() {
     let s = read("scripts/fetch-or-build.sh");
-    assert!(s.contains("talent-factory/herdr-linear"), "must point at the right repo");
-    assert!(s.contains("herdr-linear-"), "must use the herdr-linear- asset prefix");
+    assert!(
+        s.contains("talent-factory/herdr-linear"),
+        "must point at the right repo"
+    );
+    assert!(
+        s.contains("herdr-linear-"),
+        "must use the herdr-linear- asset prefix"
+    );
 }
 
 #[test]
@@ -67,7 +79,10 @@ fn ps1_falls_back_to_cargo_build_with_plugin_feature() {
 #[test]
 fn ps1_verifies_a_sha256_checksum_before_installing() {
     let s = read("scripts/fetch-or-build.ps1");
-    assert!(s.contains("SHA256"), "must compute/verify a SHA256 checksum");
+    assert!(
+        s.contains("SHA256"),
+        "must compute/verify a SHA256 checksum"
+    );
     assert!(s.contains("SHA256SUMS"), "must fetch the SHA256SUMS file");
 }
 
@@ -82,9 +97,18 @@ fn ps1_uses_overridable_paths_for_testability() {
 #[test]
 fn ps1_targets_the_right_repo_and_windows_triple() {
     let s = read("scripts/fetch-or-build.ps1");
-    assert!(s.contains("talent-factory/herdr-linear"), "must point at the right repo");
-    assert!(s.contains("x86_64-pc-windows-msvc"), "must map to the msvc triple");
-    assert!(s.contains("herdr-linear-"), "must use the herdr-linear- asset prefix");
+    assert!(
+        s.contains("talent-factory/herdr-linear"),
+        "must point at the right repo"
+    );
+    assert!(
+        s.contains("x86_64-pc-windows-msvc"),
+        "must map to the msvc triple"
+    );
+    assert!(
+        s.contains("herdr-linear-"),
+        "must use the herdr-linear- asset prefix"
+    );
 }
 
 #[test]

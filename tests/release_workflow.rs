@@ -1,8 +1,11 @@
 use std::fs;
 
 fn workflow() -> String {
-    fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/.github/workflows/release.yml"))
-        .expect(".github/workflows/release.yml should exist")
+    fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/.github/workflows/release.yml"
+    ))
+    .expect(".github/workflows/release.yml should exist")
 }
 
 #[test]

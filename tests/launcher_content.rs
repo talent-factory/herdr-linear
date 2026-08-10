@@ -8,24 +8,49 @@ fn read(rel: &str) -> String {
 #[test]
 fn split_script_strips_verbatim_prefix_and_forwards_config_dir() {
     let s = read("scripts/open-split-windows.ps1");
-    assert!(s.contains(r"\\?\"), "must handle herdr's \\?\\ verbatim path prefix");
-    assert!(s.contains("HERDR_PLUGIN_CONFIG_DIR"), "must forward the plugin config dir");
-    assert!(s.contains("plugin config-dir herdr-linear"), "must query herdr for the config dir");
+    assert!(
+        s.contains(r"\\?\"),
+        "must handle herdr's \\?\\ verbatim path prefix"
+    );
+    assert!(
+        s.contains("HERDR_PLUGIN_CONFIG_DIR"),
+        "must forward the plugin config dir"
+    );
+    assert!(
+        s.contains("plugin config-dir herdr-linear"),
+        "must query herdr for the config dir"
+    );
 }
 
 #[test]
 fn split_script_spawns_by_absolute_path_with_call_operator() {
     let s = read("scripts/open-split-windows.ps1");
-    assert!(s.contains("pane run"), "must spawn the binary itself, not rely on plugin pane open");
-    assert!(!s.contains("plugin pane open"), "must not use the relative-path pane-open path (broken on Windows)");
-    assert!(s.contains("herdr-linear.exe"), "must reference the windows binary by name");
+    assert!(
+        s.contains("pane run"),
+        "must spawn the binary itself, not rely on plugin pane open"
+    );
+    assert!(
+        !s.contains("plugin pane open"),
+        "must not use the relative-path pane-open path (broken on Windows)"
+    );
+    assert!(
+        s.contains("herdr-linear.exe"),
+        "must reference the windows binary by name"
+    );
+    assert!(
+        s.contains(r#"pane run $np "& \`"#),
+        "pane run must use the backslash-escaped quoted call operator (a bare `\"` without the backslash breaks on spaced install paths)"
+    );
 }
 
 #[test]
 fn split_script_uses_launch_decision_and_renames_pane_to_linear() {
     let s = read("scripts/open-split-windows.ps1");
     assert!(s.contains("--launch-decision"));
-    assert!(!s.contains("--launch-decision-tab"), "split variant must use the non-tab decision flag");
+    assert!(
+        !s.contains("--launch-decision-tab"),
+        "split variant must use the non-tab decision flag"
+    );
     assert!(s.contains("pane rename"));
     assert!(s.contains("Linear"));
 }
@@ -42,7 +67,10 @@ fn split_script_handles_focus_and_close_decisions() {
 #[test]
 fn split_script_forces_utf8_console_encoding() {
     let s = read("scripts/open-split-windows.ps1");
-    assert!(s.contains("OutputEncoding"), "must force UTF-8 console encoding");
+    assert!(
+        s.contains("OutputEncoding"),
+        "must force UTF-8 console encoding"
+    );
 }
 
 #[test]
@@ -58,15 +86,30 @@ fn tab_script_falls_back_to_open_tab_when_switch_fails() {
     let s = read("scripts/open-tab-windows.ps1");
     let switch_idx = s.find("SWITCHTAB").expect("script must handle SWITCHTAB");
     let after = &s[switch_idx..];
-    assert!(after.contains("Open-Tab"), "SWITCHTAB branch must fall back to Open-Tab on a race (target tab vanished)");
+    assert!(
+        after.contains("Open-Tab"),
+        "SWITCHTAB branch must fall back to Open-Tab on a race (target tab vanished)"
+    );
 }
 
 #[test]
 fn tab_script_forwards_config_dir_and_spawns_by_absolute_path() {
     let s = read("scripts/open-tab-windows.ps1");
+    assert!(
+        s.contains(r"\\?\"),
+        "must handle herdr's \\?\\ verbatim path prefix"
+    );
     assert!(s.contains("HERDR_PLUGIN_CONFIG_DIR"));
+    assert!(
+        s.contains("plugin config-dir herdr-linear"),
+        "must query herdr for the config dir"
+    );
     assert!(s.contains("pane run"));
     assert!(!s.contains("plugin pane open"));
+    assert!(
+        s.contains(r#"pane run $np "& \`"#),
+        "pane run must use the backslash-escaped quoted call operator (a bare `\"` without the backslash breaks on spaced install paths)"
+    );
 }
 
 #[test]

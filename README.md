@@ -226,8 +226,8 @@ herdr plugin install talent-factory/herdr-linear
 
 This downloads a checksum-verified prebuilt binary for your platform (macOS
 arm64/x86_64, Linux x86_64, or Windows x86_64) when one is published for the
-installed version, falling back to compiling from source with `cargo` otherwise —
-either way, no extra setup beyond `herdr` itself.
+installed version, falling back to compiling from source with `cargo` otherwise
+(which does require a Rust toolchain).
 
 For local development, use `herdr plugin link /path/to/herdr-linear` instead.
 
