@@ -674,10 +674,10 @@ pub enum Action {
     /// sequentially, and summarize the results in one status banner. Orchestrated in
     /// `main.rs`'s `start_implementation_many`.
     ImplementMany(Vec<Issue>),
-    /// `c` was pressed on the error screen: open `config.toml` (creating the directory and
-    /// a starter file first if either is missing) in the user's editor. Handled in
-    /// `main.rs`'s `event_loop`, mirroring the existing `OpenInBrowser` → `open::that`
-    /// pattern.
+    /// `c` was pressed (Menu, a loaded view, or the error screen): open `config.toml`
+    /// (creating the directory and a starter file first if either is missing) in the
+    /// user's editor. Handled in `main.rs`'s `event_loop`, mirroring the existing
+    /// `OpenInBrowser` → `open::that` pattern.
     OpenConfig(PathBuf),
 }
 
@@ -688,10 +688,11 @@ pub enum Action {
 /// `modifiers` must be threaded through from the real `KeyEvent` (see `main.rs`'s
 /// `event_loop`) rather than assumed empty: raw mode delivers `Ctrl+C` as an ordinary
 /// `KeyCode::Char('c')` key event, not `SIGINT`, so without checking modifiers it would be
-/// indistinguishable from a plain `c` press — including on the error screen, where a plain
-/// `c` now triggers `Action::OpenConfig` (filesystem writes + spawning an external opener).
-/// The interrupt reflex is handled unconditionally, before any screen-specific dispatch, so
-/// it always quits rather than ever being reinterpreted as a screen's own binding.
+/// indistinguishable from a plain `c` press — which now triggers `Action::OpenConfig`
+/// (filesystem writes + spawning an external opener) from any screen: Menu, a loaded view,
+/// or the error screen. The interrupt reflex is handled unconditionally, before any
+/// screen-specific dispatch, so it always quits rather than ever being reinterpreted as a
+/// screen's own binding.
 ///
 /// `/` opens type-to-filter on a loaded view's issue list (TF-580); once editing, this
 /// function's own filtering branch takes over key dispatch entirely (see
@@ -733,6 +734,9 @@ pub fn handle_key(
                 None
             }
             KeyCode::Enter => app.enter_selected_menu_option(),
+            KeyCode::Char('c') if modifiers.is_empty() => {
+                open_config_action(std::env::var_os("HERDR_PLUGIN_CONFIG_DIR").as_deref())
+            }
             _ => None,
         };
     }
@@ -819,7 +823,7 @@ pub fn handle_key(
         // also keeps e.g. `Alt+C`/`Shift+C` from triggering config-file writes, since this
         // arm's side effect (create + open `config.toml`) is meant for a deliberate, bare
         // `c` press, not any key event that happens to carry the `'c'` character.
-        KeyCode::Char('c') if modifiers.is_empty() && app.is_view_error() => {
+        KeyCode::Char('c') if modifiers.is_empty() => {
             open_config_action(std::env::var_os("HERDR_PLUGIN_CONFIG_DIR").as_deref())
         }
         _ => None,
@@ -1495,10 +1499,10 @@ mod tests {
     // `c`-key handling is split across two layers precisely so it's testable without
     // mutating the real process environment (which, run in parallel with every other test
     // in this binary, would be a data race on shared global state): `open_config_action`
-    // is a pure function taking an injected `Option<&OsStr>`, tested directly here. The one
-    // `handle_key` test that needs to observe the *real* `c`-in-error-state wiring end to
-    // end (`c_key_in_error_state_opens_config_when_dir_is_set`) mutates the process
-    // environment deliberately and guards it with `ENV_LOCK` — see that test's comment.
+    // is a pure function taking an injected `Option<&OsStr>`, tested directly here. The
+    // `handle_key` tests that need to observe the *real* `c`-opens-config wiring end to end
+    // (one per screen: menu, loaded view, error screen) mutate the process environment
+    // deliberately and guard it with `ENV_LOCK` — see that lock's comment.
 
     #[test]
     fn open_config_action_builds_path_when_config_dir_is_known() {
@@ -1520,9 +1524,8 @@ mod tests {
     }
 
     /// Serializes tests that mutate `HERDR_PLUGIN_CONFIG_DIR` (process-global state) against
-    /// each other. Currently only one test needs this, but the lock makes that an enforced
-    /// property rather than an implicit one that silently stops holding the moment a second
-    /// such test is added.
+    /// each other, since Rust runs tests in the same binary concurrently by default and an
+    /// unguarded env var would be a data race across those tests.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
@@ -1541,8 +1544,8 @@ mod tests {
         }
 
         // A concrete, known-non-None expectation — not a self-referential re-read of the
-        // same env var `handle_key` just consulted — so a regression that mis-wires the
-        // `is_view_error()` guard (or deletes the arm entirely, falling through to
+        // same env var `handle_key` just consulted — so a regression that re-adds a
+        // screen guard on this arm (or deletes the arm entirely, falling through to
         // `_ => None`) actually fails this test instead of passing vacuously.
         assert_eq!(
             action,
@@ -1553,13 +1556,47 @@ mod tests {
     }
 
     #[test]
-    fn c_key_outside_error_state_does_nothing() {
-        let mut app = app_in_my_issues_view();
-        app.set_issues(vec![sample_issue("ENG-1")]);
+    fn c_key_on_menu_opens_config_when_dir_is_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR");
+        std::env::set_var("HERDR_PLUGIN_CONFIG_DIR", "/fake/config/dir");
+
+        let mut app = App::new();
+        let action = handle_key(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
+
+        match previous {
+            Some(value) => std::env::set_var("HERDR_PLUGIN_CONFIG_DIR", value),
+            None => std::env::remove_var("HERDR_PLUGIN_CONFIG_DIR"),
+        }
 
         assert_eq!(
-            handle_key(&mut app, KeyCode::Char('c'), KeyModifiers::NONE),
-            None
+            action,
+            Some(Action::OpenConfig(PathBuf::from(
+                "/fake/config/dir/config.toml"
+            )))
+        );
+    }
+
+    #[test]
+    fn c_key_on_loaded_view_opens_config_when_dir_is_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR");
+        std::env::set_var("HERDR_PLUGIN_CONFIG_DIR", "/fake/config/dir");
+
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        let action = handle_key(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
+
+        match previous {
+            Some(value) => std::env::set_var("HERDR_PLUGIN_CONFIG_DIR", value),
+            None => std::env::remove_var("HERDR_PLUGIN_CONFIG_DIR"),
+        }
+
+        assert_eq!(
+            action,
+            Some(Action::OpenConfig(PathBuf::from(
+                "/fake/config/dir/config.toml"
+            )))
         );
     }
 
@@ -1593,6 +1630,30 @@ mod tests {
         // Alt+C (or any other modifier combination besides the Ctrl+C handled above) must
         // not be treated as the bare `c` keybinding — it's not the deliberate press this
         // side-effecting action is meant for.
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Char('c'), KeyModifiers::ALT),
+            None
+        );
+    }
+
+    #[test]
+    fn modified_c_on_menu_does_not_open_config() {
+        let mut app = App::new();
+
+        // Same guard, exercised on the menu screen: `c` opening config is now global, but
+        // it must still be a bare, unmodified press everywhere it fires.
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Char('c'), KeyModifiers::ALT),
+            None
+        );
+    }
+
+    #[test]
+    fn modified_c_on_loaded_view_does_not_open_config() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+
+        // Same guard, exercised on a loaded (non-error) view.
         assert_eq!(
             handle_key(&mut app, KeyCode::Char('c'), KeyModifiers::ALT),
             None
@@ -1664,6 +1725,31 @@ mod tests {
 
         // 'q' would normally quit — while filtering it must be captured as text instead.
         let action = handle_key(&mut app, KeyCode::Char('q'), KeyModifiers::NONE);
+
+        assert_eq!(action, None);
+        assert!(app.is_filtering());
+    }
+
+    #[test]
+    fn c_while_filtering_is_captured_as_query_text_not_open_config() {
+        // TF-614 regression: `c` now opens config.toml from any screen, but a literal `c`
+        // typed into the filter query must stay filter text. `HERDR_PLUGIN_CONFIG_DIR` is
+        // set deliberately, mirroring the other `c`-key tests' comment: an unset env var
+        // would make `None` a vacuous pass even if the filtering guard were deleted and
+        // `c` fell through to the general match's (env-var-gated) `OpenConfig` arm.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR");
+        std::env::set_var("HERDR_PLUGIN_CONFIG_DIR", "/fake/config/dir");
+
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        let action = handle_key(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
+
+        match previous {
+            Some(value) => std::env::set_var("HERDR_PLUGIN_CONFIG_DIR", value),
+            None => std::env::remove_var("HERDR_PLUGIN_CONFIG_DIR"),
+        }
 
         assert_eq!(action, None);
         assert!(app.is_filtering());

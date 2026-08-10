@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `c` (open `config.toml`) now works from any screen — Menu, a loaded view, and the Error
+  screen alike — instead of only firing after actually hitting an error. The Keybindings
+  help overlay's `c` entry moved from "Error screen" to "Global" to match (TF-614)
 - Implement flow: the prompt-landed confirmation now polls the pane continuously until the
   sent prompt has been visible, with no gaps, for a documented stability window — instead of
   checking at exactly two fixed offsets (500ms, then 800ms later) and declaring success from
