@@ -1,5 +1,8 @@
 # Herdr Linear
 
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![Issues](https://img.shields.io/github/issues/talent-factory/herdr-linear)](https://github.com/talent-factory/herdr-linear/issues)
+
 A **pure Rust** client for [Linear.app](https://linear.app)'s GraphQL API. Designed as a plugin for [Herdr](https://herdr.dev), with zero dependencies on Node.js or TypeScript.
 
 ## Features
@@ -207,11 +210,6 @@ match client.get_viewer().await {
 }
 ```
 
-## Issues & Feature Requests
-
-Issues are tracked in Linear at:
-https://linear.app/talent-factory/project/herdr-linear-10dca51ea35b/overview
-
 ## Herdr Plugin
 
 `herdr-linear` also ships as a [Herdr](https://herdr.dev) plugin: a "My Issues"
@@ -369,11 +367,16 @@ Dual-licensed under MIT OR Apache-2.0
 
 ## Contributing
 
+Bugs and feature requests: [open an issue on GitHub](https://github.com/talent-factory/herdr-linear/issues).
+(Linear is used for internal planning only and isn't publicly accessible.)
+
 1. Fork the repository
 2. Create a feature branch: `git checkout -b feature/your-feature`
 3. Commit changes: `git commit -am 'Add feature'`
 4. Push to branch: `git push origin feature/your-feature`
 5. Submit a pull request
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development workflow.
 
 ## Related Projects
 
