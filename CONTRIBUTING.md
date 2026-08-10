@@ -190,6 +190,23 @@ If adding fields to existing types:
 
 By contributing, you agree that your contributions will be licensed under the same dual license (MIT OR Apache-2.0).
 
+## Release Flow
+
+- Feature branches are opened against `develop` and merged via PR, same as always.
+- `main` is the stable, released branch — it's also the GitHub default branch, so an
+  unpinned `herdr plugin install talent-factory/herdr-linear` always gets the last
+  release, never in-progress work.
+- To cut a release: open a PR from `develop` into `main` that bumps the `version` field
+  in **both** `Cargo.toml` and `herdr-plugin.toml` to the same new value. Once merged,
+  `.github/workflows/auto-tag-on-main.yml` tags `vX.Y.Z` automatically, which triggers
+  `.github/workflows/release.yml` to build and publish checksummed binaries for macOS,
+  Linux, and Windows.
+- Merging to `main` **without** a version bump is safe — the auto-tag workflow finds the
+  tag for the current version already exists and does nothing. Doc-only or otherwise
+  non-release merges into `main` don't need special handling.
+- `main` has branch protection: PRs required, CI (`Test`, `Rustfmt`, `Clippy`,
+  `Documentation`) must pass, no force-pushes or deletions.
+
 ---
 
 Thank you for contributing! 🚀
