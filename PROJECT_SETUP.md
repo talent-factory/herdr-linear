@@ -222,26 +222,23 @@ herdr-linear/
 
 ---
 
-## Linear Issue Tracking
+## Issue Tracking
 
-All issues are managed in Linear:
-👉 https://linear.app/talent-factory/project/herdr-linear-10dca51ea35b/overview
+Public bugs & feature requests are managed on GitHub:
+👉 https://github.com/talent-factory/herdr-linear/issues
 
-- Create issues for features & bugs
-- Link PRs to issues
-- Track progress with cycles
-- Use team collaboration tools
+Internally, the Talent Factory team also tracks work in Linear, which isn't publicly accessible.
 
 ---
 
 ## Development Workflow
 
-1. **Create Issue** in Linear or GitHub
+1. **Create Issue** on GitHub
 2. **Create Branch**: `git checkout -b feature/your-feature`
 3. **Make Changes** following guidelines in CONTRIBUTING.md
 4. **Run Checks**: `just check`
 5. **Commit**: `git commit -m "feat: description"`
-6. **Push & PR**: Reference Linear issue
+6. **Push & PR**: Reference the GitHub issue
 
 ---
 
@@ -258,7 +255,7 @@ Choose whichever suits your use case!
 - 📖 Read [README.md](README.md) for usage
 - 🛣️ Check [ROADMAP.md](ROADMAP.md) for plans
 - 🤝 See [CONTRIBUTING.md](CONTRIBUTING.md) for development
-- 🐛 File issues on [Linear](https://linear.app/talent-factory/project/herdr-linear-10dca51ea35b)
+- 🐛 File issues on [GitHub](https://github.com/talent-factory/herdr-linear/issues)
 
 ---
 

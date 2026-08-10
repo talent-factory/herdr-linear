@@ -35,7 +35,8 @@ cargo run --example tracing_demo
 
 ### 1. Create an Issue (or pick an existing one)
 
-Check [Linear Issues](https://linear.app/talent-factory/project/herdr-linear-10dca51ea35b/overview) for tasks.
+Check [GitHub Issues](https://github.com/talent-factory/herdr-linear/issues) for tasks. (Linear is used
+for internal planning only and isn't publicly accessible.)
 
 ### 2. Create a Feature Branch
 
@@ -171,7 +172,7 @@ If adding fields to existing types:
 3. Run linter: `cargo clippy`
 4. Update documentation
 5. Keep PR focused and reasonably sized
-6. Reference related Linear issues in PR description
+6. Reference related GitHub issues in PR description
 
 ## Reporting Issues
 
@@ -184,7 +185,6 @@ If adding fields to existing types:
 
 - Open a discussion on GitHub
 - Comment on related issues
-- Post in Linear workspace
 
 ## License
 

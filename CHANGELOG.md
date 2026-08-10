@@ -211,6 +211,6 @@ See [ROADMAP.md](ROADMAP.md) for planned features and timeline.
 ## Support
 
 For issues or questions about versions:
-- Report bugs in Linear: https://linear.app/talent-factory/project/herdr-linear-10dca51ea35b
-- Ask on GitHub: https://github.com/talent-factory/herdr-linear/discussions
+- Report bugs / request features: https://github.com/talent-factory/herdr-linear/issues
+- Ask questions: https://github.com/talent-factory/herdr-linear/discussions
 - Check documentation: https://github.com/talent-factory/herdr-linear#readme
