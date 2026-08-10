@@ -1,0 +1,31 @@
+name: Live API Tests
+
+# Runs the `#[ignore]`-gated suite in `tests/live_api.rs` against the real
+# Linear GraphQL API. Deliberately kept out of ci.yml's push/pull_request
+# triggers so a flaky or rate-limited upstream API never blocks a PR — this
+# is a canary, not a gate.
+on:
+  workflow_dispatch:
+  schedule:
+    # 03:17 UTC nightly — off the hour, to avoid the GitHub Actions
+    # scheduling stampede at :00.
+    - cron: "17 3 * * *"
+
+env:
+  RUST_BACKTRACE: 1
+
+jobs:
+  live-api:
+    name: Live API (Linear sandbox)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run live API tests
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+        run: cargo test --features plugin -- --ignored live_api
