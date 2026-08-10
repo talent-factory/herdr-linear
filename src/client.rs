@@ -3,9 +3,11 @@
 use crate::error::{api_error, graphql_error, Error, Result};
 use crate::models::*;
 use crate::queries::*;
+use futures_util::future::join_all;
 use reqwest::{Client as HttpClient, StatusCode};
 use serde_json::{json, Value};
 use std::time::Duration;
+use tokio::sync::Semaphore;
 use tracing::{debug, error, warn};
 
 const LINEAR_API_ENDPOINT: &str = "https://api.linear.app/graphql";
@@ -26,6 +28,10 @@ const DEFAULT_MAX_PAGES: usize = 100;
 /// by up to one page's worth of items) this cap on its final page still
 /// succeeds — the cap guards against runaway pagination, not result size.
 const DEFAULT_MAX_ITEMS: usize = 10_000;
+
+/// Default number of requests `execute_batch` runs concurrently when the
+/// caller doesn't override it.
+const DEFAULT_BATCH_CONCURRENCY: usize = 5;
 
 /// Options controlling an auto-paginating `get_all_*` call.
 ///
@@ -607,6 +613,64 @@ impl LinearClient {
                 }
             };
         }
+    }
+
+    /// Run a batch of independent Linear requests concurrently, capped at
+    /// `concurrency` in-flight requests at a time (defaults to 5 when
+    /// `None`).
+    ///
+    /// Each element of `requests` is the future for one request — typically
+    /// produced by calling an existing method on this same client (`query`,
+    /// `mutate`, `get_issue`, `update_issue`, ...), so callers reuse this
+    /// client's single pooled `reqwest::Client` rather than `execute_batch`
+    /// needing to know what kind of request it is or creating one of its
+    /// own. Concurrency is bounded with a [`tokio::sync::Semaphore`] rather
+    /// than spawning tasks, so `requests` can freely borrow from `self` (or
+    /// anything else in scope) without needing to be `'static` or `Send`.
+    ///
+    /// Unlike a `?`-propagating loop that aborts on the first error,
+    /// `execute_batch` always runs every item to completion and returns one
+    /// [`Result`] per input, in the same order as `requests`, so callers can
+    /// tell exactly which of N items succeeded and which failed.
+    ///
+    /// # Examples
+    ///
+    /// Bulk-update a list of issues to a new workflow state, five at a time:
+    ///
+    /// ```no_run
+    /// # use herdr_linear::LinearClient;
+    /// # use serde_json::json;
+    /// # async fn example(client: &LinearClient, issue_ids: Vec<String>, state_id: String) {
+    /// let requests = issue_ids
+    ///     .iter()
+    ///     .map(|id| client.update_issue(id, json!({ "stateId": &state_id })))
+    ///     .collect();
+    ///
+    /// let results = client.execute_batch(requests, None).await;
+    /// let failed = results.iter().filter(|r| r.is_err()).count();
+    /// println!("{failed} of {} updates failed", results.len());
+    /// # }
+    /// ```
+    pub async fn execute_batch<T, Fut>(
+        &self,
+        requests: Vec<Fut>,
+        concurrency: Option<usize>,
+    ) -> Vec<Result<T>>
+    where
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let concurrency = concurrency.unwrap_or(DEFAULT_BATCH_CONCURRENCY).max(1);
+        let semaphore = Semaphore::new(concurrency);
+
+        let futures = requests.into_iter().map(|request| async {
+            let _permit = semaphore
+                .acquire()
+                .await
+                .expect("batch semaphore is never closed");
+            request.await
+        });
+
+        join_all(futures).await
     }
 }
 
@@ -1456,6 +1520,143 @@ mod tests {
             Error::InvalidRequest(msg) => assert!(msg.contains("page_size")),
             other => panic!("expected Error::InvalidRequest, got {other:?}"),
         }
+        mock.assert_async().await;
+    }
+
+    /// JSON body for a successful `viewer` query, matching the shape used by
+    /// `get_viewer_parses_successful_response` above.
+    fn viewer_response_body() -> String {
+        json!({
+            "data": {
+                "viewer": {
+                    "id": "user-1",
+                    "email": "alice@example.com",
+                    "name": "Alice",
+                    "createdAt": "2026-01-01T00:00:00Z",
+                    "updatedAt": "2026-01-01T00:00:00Z"
+                }
+            },
+            "errors": null
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn execute_batch_runs_every_request_and_reports_success() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(viewer_response_body())
+            .expect(4)
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let requests: Vec<_> = (0..4).map(|_| client.get_viewer()).collect();
+
+        let results = client.execute_batch(requests, None).await;
+
+        assert_eq!(results.len(), 4);
+        assert!(
+            results.iter().all(|r| r.is_ok()),
+            "expected every item to succeed: {results:?}"
+        );
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn execute_batch_returns_a_result_per_item_on_partial_failure() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(viewer_response_body())
+            .expect(2)
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        // Item 1 fails without touching the network at all — execute_batch
+        // doesn't care what produces a request's `Result`, only that it
+        // collects one per item, in order, without letting a single failure
+        // abort the rest of the batch.
+        let client_ref = &client;
+        let requests: Vec<_> = (0..3)
+            .map(|i| async move {
+                if i == 1 {
+                    Err(Error::NotFound(format!("synthetic failure for item {i}")))
+                } else {
+                    client_ref.get_viewer().await
+                }
+            })
+            .collect();
+
+        let results = client.execute_batch(requests, Some(2)).await;
+
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_ok(), "{:?}", results[0]);
+        assert!(results[1].is_err(), "{:?}", results[1]);
+        assert!(results[2].is_ok(), "{:?}", results[2]);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn execute_batch_bounds_concurrency_to_the_configured_limit() {
+        let mut server = mockito::Server::new_async().await;
+        let delay = Duration::from_millis(150);
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_chunked_body(move |w| {
+                // mockito's callback is a plain `Write`, not async — sleep the
+                // underlying (blocking-friendly) thread to simulate network
+                // latency for this response.
+                std::thread::sleep(delay);
+                w.write_all(viewer_response_body().as_bytes())
+            })
+            .expect(4)
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        // 2N requests with concurrency capped at N should complete in ~2
+        // waves — clearly more than one wave (fully unbounded) and clearly
+        // less than four (fully sequential).
+        let requests: Vec<_> = (0..4).map(|_| client.get_viewer()).collect();
+
+        let start = std::time::Instant::now();
+        let results = client.execute_batch(requests, Some(2)).await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(results.len(), 4);
+        assert!(
+            results.iter().all(|r| r.is_ok()),
+            "expected every item to succeed: {results:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "expected at least ~2 waves of {delay:?}, completed in {elapsed:?} \
+             (too fast — concurrency isn't bounded)"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "expected ~2 waves of {delay:?}, completed in {elapsed:?} \
+             (too slow — requests are running sequentially)"
+        );
+
         mock.assert_async().await;
     }
 }
