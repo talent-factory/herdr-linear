@@ -13,7 +13,8 @@ GitHub default branch, so an unpinned `herdr plugin install talent-factory/herdr
 clones in-progress work, not a released version.
 
 Two related, unmerged branches also surfaced during this work:
-- `worktree-release-pipeline` — fully merged into `develop`, now redundant (already deleted).
+- `worktree-release-pipeline` — fully merged into `develop`, now redundant, still present
+  on `origin` (not yet deleted).
 - `docs/roadmap-phase-1.6-complete` — has one commit (`ROADMAP.md` update marking Phase 1.6
   complete) not present on `develop`, created by a concurrent session working in the shared
   checkout while this session worked in an isolated worktree.
@@ -65,8 +66,8 @@ only unique content is preserved.
 git branch main origin/develop
 git push origin main
 gh repo edit talent-factory/herdr-linear --default-branch main
+git push origin --delete worktree-release-pipeline
 ```
-(`worktree-release-pipeline` is already deleted as of this session.)
 
 ### 3. New workflow — `.github/workflows/auto-tag-on-main.yml`
 
