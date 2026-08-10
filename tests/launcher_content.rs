@@ -44,3 +44,34 @@ fn split_script_forces_utf8_console_encoding() {
     let s = read("scripts/open-split-windows.ps1");
     assert!(s.contains("OutputEncoding"), "must force UTF-8 console encoding");
 }
+
+#[test]
+fn tab_script_uses_tab_create_and_launch_decision_tab() {
+    let s = read("scripts/open-tab-windows.ps1");
+    assert!(s.contains("tab create"));
+    assert!(s.contains("--launch-decision-tab"));
+    assert!(s.contains("SWITCHTAB"));
+}
+
+#[test]
+fn tab_script_falls_back_to_open_tab_when_switch_fails() {
+    let s = read("scripts/open-tab-windows.ps1");
+    let switch_idx = s.find("SWITCHTAB").expect("script must handle SWITCHTAB");
+    let after = &s[switch_idx..];
+    assert!(after.contains("Open-Tab"), "SWITCHTAB branch must fall back to Open-Tab on a race (target tab vanished)");
+}
+
+#[test]
+fn tab_script_forwards_config_dir_and_spawns_by_absolute_path() {
+    let s = read("scripts/open-tab-windows.ps1");
+    assert!(s.contains("HERDR_PLUGIN_CONFIG_DIR"));
+    assert!(s.contains("pane run"));
+    assert!(!s.contains("plugin pane open"));
+}
+
+#[test]
+fn tab_script_labels_the_tab_linear() {
+    let s = read("scripts/open-tab-windows.ps1");
+    assert!(s.contains("--label"));
+    assert!(s.contains("Linear"));
+}
