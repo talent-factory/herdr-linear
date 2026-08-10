@@ -81,3 +81,12 @@ fn does_not_touch_release_yml() {
     .expect(".github/workflows/release.yml should still exist unchanged");
     assert!(release_yml.contains(r#"tags: ["v*"]"#));
 }
+
+#[test]
+fn checkout_uses_a_pat_not_the_default_token() {
+    let w = workflow();
+    assert!(
+        w.contains("token: ${{ secrets.RELEASE_TAG_TOKEN }}"),
+        "the default GITHUB_TOKEN cannot trigger release.yml's tag-push listener (GitHub's own loop-prevention rule) — checkout must use a PAT/App-token instead"
+    );
+}
