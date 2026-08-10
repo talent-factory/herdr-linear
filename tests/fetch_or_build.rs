@@ -54,3 +54,44 @@ fn sh_covers_macos_and_linux_musl_triples() {
         assert!(s.contains(triple), "must map to {triple}");
     }
 }
+
+#[test]
+fn ps1_falls_back_to_cargo_build_with_plugin_feature() {
+    let s = read("scripts/fetch-or-build.ps1");
+    assert!(
+        s.contains("cargo build --release --features plugin"),
+        "windows fallback build must pass --features plugin"
+    );
+}
+
+#[test]
+fn ps1_verifies_a_sha256_checksum_before_installing() {
+    let s = read("scripts/fetch-or-build.ps1");
+    assert!(s.contains("SHA256"), "must compute/verify a SHA256 checksum");
+    assert!(s.contains("SHA256SUMS"), "must fetch the SHA256SUMS file");
+}
+
+#[test]
+fn ps1_uses_overridable_paths_for_testability() {
+    let s = read("scripts/fetch-or-build.ps1");
+    for var in ["HL_REPO_ROOT", "HL_CARGO_TOML", "HL_OUT", "HL_BASE_URL"] {
+        assert!(s.contains(var), "must support override env var {var}");
+    }
+}
+
+#[test]
+fn ps1_targets_the_right_repo_and_windows_triple() {
+    let s = read("scripts/fetch-or-build.ps1");
+    assert!(s.contains("talent-factory/herdr-linear"), "must point at the right repo");
+    assert!(s.contains("x86_64-pc-windows-msvc"), "must map to the msvc triple");
+    assert!(s.contains("herdr-linear-"), "must use the herdr-linear- asset prefix");
+}
+
+#[test]
+fn ps1_forces_tls12() {
+    let s = read("scripts/fetch-or-build.ps1");
+    assert!(
+        s.contains("Tls12"),
+        "must force TLS 1.2 (Windows PowerShell 5.1's default can be rejected by GitHub's CDN)"
+    );
+}
