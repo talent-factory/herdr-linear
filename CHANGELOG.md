@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Detail pane: unordered Markdown list items now render with a `•` bullet and a hanging
+  indent for wrapped continuation lines, so a wrapped line starting with `--` (e.g. inline
+  code like `` `cargo test --features plugin -- --ignored` `` wrapping right before
+  `--ignored`) can no longer be mistaken for a new bullet (TF-613)
+
 ## [0.1.1] - 2026-08-10
 
 ### Added
