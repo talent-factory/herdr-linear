@@ -185,7 +185,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 See [ROADMAP.md](ROADMAP.md) for planned features and timeline.
 
-### Phase 1.5 - Stability
+### Phase 1.7 - Stability
 - [ ] Improved test coverage
 - [ ] Integration tests
 - [ ] Performance benchmarks

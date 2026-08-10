@@ -120,7 +120,7 @@ just lint
 ### 🚀 Ready to Implement
 
 See [ROADMAP.md](ROADMAP.md) for planned features:
-- Phase 1.5: Stability & coverage
+- Phase 1.7: Stability & coverage
 - Phase 2: Webhooks, batch operations
 - Phase 3: Herdr integration
 - Phase 4: Production release
