@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Auto-paginating `LinearClient` helpers — `get_all_issues`, `get_all_teams`, `get_all_team_issues`, `get_all_projects` — that loop through every page of a query and return the full result set, with a configurable page size and safety caps on total pages/items (TF-609)
+- `LinearClient` now automatically retries requests that fail with `Error::RateLimitExceeded`: it waits the server's `Retry-After` value (falling back to exponential backoff when Linear doesn't send a usable one), retries up to 3 total attempts, and still surfaces the original `RateLimitExceeded` error unchanged if the budget is exhausted. Opt out via `LinearClient::without_rate_limit_retry()` to keep the old fail-fast behavior (TF-610)
 
 ### Fixed
 

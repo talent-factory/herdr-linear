@@ -11,6 +11,16 @@ use tracing::{debug, error, warn};
 const LINEAR_API_ENDPOINT: &str = "https://api.linear.app/graphql";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Default number of attempts made for a single GraphQL operation before a
+/// persistent `Error::RateLimitExceeded` is surfaced to the caller. Counts
+/// the initial request, so `3` means up to 2 automatic retries.
+const DEFAULT_RATE_LIMIT_MAX_ATTEMPTS: u32 = 3;
+
+/// Base delay for the exponential-backoff fallback used when a 429 response
+/// doesn't carry a usable `retry_after_ms` (i.e. it's `0`). Attempt `n`
+/// (1-indexed) waits `RATE_LIMIT_BACKOFF_BASE * 2^(n-1)`.
+const RATE_LIMIT_BACKOFF_BASE: Duration = Duration::from_millis(500);
+
 /// Default number of items requested per page by `get_all_*` calls that don't
 /// override it — matches the default used by the single-page methods.
 const DEFAULT_PAGE_SIZE: i32 = 50;
@@ -85,6 +95,7 @@ pub struct LinearClient {
     http_client: HttpClient,
     api_key: String,
     endpoint: String,
+    rate_limit_retry: bool,
 }
 
 impl LinearClient {
@@ -111,6 +122,7 @@ impl LinearClient {
             http_client,
             api_key,
             endpoint: LINEAR_API_ENDPOINT.to_string(),
+            rate_limit_retry: true,
         })
     }
 
@@ -124,6 +136,17 @@ impl LinearClient {
         let mut client = Self::new(api_key)?;
         client.endpoint = endpoint;
         Ok(client)
+    }
+
+    /// Disable automatic retry-with-backoff on `Error::RateLimitExceeded`,
+    /// restoring the fail-fast behavior: a 429 response is surfaced to the
+    /// caller immediately instead of being retried.
+    ///
+    /// Retry is enabled by default; use this when the caller wants to own
+    /// its own wait-and-retry (or backoff) strategy.
+    pub fn without_rate_limit_retry(mut self) -> Self {
+        self.rate_limit_retry = false;
+        self
     }
 
     /// Get the authenticated user (viewer)
@@ -445,8 +468,56 @@ impl LinearClient {
         self.execute_graphql(mutation, variables, true).await
     }
 
-    /// Internal method to execute GraphQL operations
+    /// Internal method to execute GraphQL operations, transparently retrying
+    /// on `Error::RateLimitExceeded` (unless disabled via
+    /// [`without_rate_limit_retry`](Self::without_rate_limit_retry)).
+    ///
+    /// Waits the server-provided `retry_after_ms` between attempts, falling
+    /// back to exponential backoff when that value is `0` (not usable).
+    /// Gives up after [`DEFAULT_RATE_LIMIT_MAX_ATTEMPTS`] attempts and
+    /// returns the last `Error::RateLimitExceeded` unchanged.
     async fn execute_graphql<T: serde::de::DeserializeOwned>(
+        &self,
+        operation: &str,
+        variables: Value,
+        is_mutation: bool,
+    ) -> Result<T> {
+        let mut attempt: u32 = 1;
+
+        loop {
+            match self
+                .execute_graphql_once(operation, variables.clone(), is_mutation)
+                .await
+            {
+                Err(Error::RateLimitExceeded { retry_after_ms })
+                    if self.rate_limit_retry && attempt < DEFAULT_RATE_LIMIT_MAX_ATTEMPTS =>
+                {
+                    let wait = Self::rate_limit_backoff(attempt, retry_after_ms);
+                    warn!(
+                        "Rate limited by Linear API (attempt {attempt}/{DEFAULT_RATE_LIMIT_MAX_ATTEMPTS}), retrying in {}ms",
+                        wait.as_millis()
+                    );
+                    tokio::time::sleep(wait).await;
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    /// Computes the wait before a rate-limit retry attempt (1-indexed).
+    /// Uses `retry_after_ms` when it's usable (non-zero); otherwise falls
+    /// back to exponential backoff seeded from `RATE_LIMIT_BACKOFF_BASE`.
+    fn rate_limit_backoff(attempt: u32, retry_after_ms: u64) -> Duration {
+        if retry_after_ms > 0 {
+            Duration::from_millis(retry_after_ms)
+        } else {
+            RATE_LIMIT_BACKOFF_BASE * 2u32.pow(attempt.saturating_sub(1))
+        }
+    }
+
+    /// Performs a single GraphQL request/response round-trip with no retry.
+    async fn execute_graphql_once<T: serde::de::DeserializeOwned>(
         &self,
         operation: &str,
         variables: Value,
@@ -499,10 +570,20 @@ impl LinearClient {
                 ))
             }
             StatusCode::TOO_MANY_REQUESTS => {
-                warn!("Rate limited by Linear API");
-                Err(Error::RateLimitExceeded {
-                    retry_after_ms: 60000,
-                })
+                // Linear reports the wait via the standard `Retry-After` header
+                // (RFC 7231 §7.1.3 `delay-seconds` form). `0` means "not usable" —
+                // header missing, non-numeric, or the server didn't send one —
+                // which tells the retry wrapper to fall back to exponential backoff
+                // instead of trusting a bogus/absent value.
+                let retry_after_ms = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.trim().parse::<u64>().ok())
+                    .map(|secs| secs.saturating_mul(1000))
+                    .unwrap_or(0);
+                warn!("Rate limited by Linear API (retry_after_ms={retry_after_ms})");
+                Err(Error::RateLimitExceeded { retry_after_ms })
             }
             _ => {
                 let body = response.text().await.unwrap_or_default();
@@ -628,6 +709,10 @@ mod tests {
 
     #[tokio::test]
     async fn get_viewer_parses_successful_response() {
+        // Also covers "a request that succeeds on the first try incurs no
+        // retry overhead/delay": `mock.assert_async()` below requires
+        // exactly 1 hit (mockito's default), so a spurious retry would fail
+        // this test.
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("POST", "/graphql")
@@ -704,11 +789,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rate_limited_response_maps_to_rate_limit_exceeded() {
+    async fn rate_limited_request_succeeds_after_one_retry() {
+        // Registered first: mockito prefers a still-"missing-hits" mock in
+        // registration order, so the first request hits this 429 mock and
+        // the second (retried) request falls through to `ok` below.
+        // `Retry-After: 1` keeps the real wait the retry performs short
+        // enough for a unit test.
         let mut server = mockito::Server::new_async().await;
-        server
+        let rate_limited = server
             .mock("POST", "/graphql")
             .with_status(429)
+            .with_header("retry-after", "1")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let ok = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "data": {
+                        "viewer": {
+                            "id": "user-1",
+                            "email": "alice@example.com",
+                            "name": "Alice",
+                            "avatarUrl": null,
+                            "createdAt": "2026-01-01T00:00:00Z",
+                            "updatedAt": "2026-01-01T00:00:00Z"
+                        }
+                    },
+                    "errors": null
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let viewer = client.get_viewer().await.unwrap();
+
+        assert_eq!(viewer.name, "Alice");
+        rate_limited.assert_async().await;
+        ok.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn repeated_rate_limiting_exhausts_the_retry_budget_and_surfaces_the_error() {
+        // No `Retry-After` header, so each wait also exercises the
+        // exponential-backoff fallback (500ms, 1000ms — short enough for a
+        // unit test).
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(429)
+            .expect(DEFAULT_RATE_LIMIT_MAX_ATTEMPTS as usize)
             .create_async()
             .await;
 
@@ -719,6 +859,56 @@ mod tests {
         let err = client.get_viewer().await.unwrap_err();
 
         assert!(matches!(err, Error::RateLimitExceeded { .. }));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn rate_limit_retry_can_be_opted_out() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(429)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap()
+                .without_rate_limit_retry();
+
+        let err = client.get_viewer().await.unwrap_err();
+
+        assert!(matches!(err, Error::RateLimitExceeded { .. }));
+        mock.assert_async().await;
+    }
+
+    #[test]
+    fn rate_limit_backoff_uses_the_servers_retry_after_when_usable() {
+        assert_eq!(
+            LinearClient::rate_limit_backoff(1, 250),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            LinearClient::rate_limit_backoff(2, 250),
+            Duration::from_millis(250)
+        );
+    }
+
+    #[test]
+    fn rate_limit_backoff_falls_back_to_exponential_backoff_when_retry_after_is_unusable() {
+        assert_eq!(
+            LinearClient::rate_limit_backoff(1, 0),
+            RATE_LIMIT_BACKOFF_BASE
+        );
+        assert_eq!(
+            LinearClient::rate_limit_backoff(2, 0),
+            RATE_LIMIT_BACKOFF_BASE * 2
+        );
+        assert_eq!(
+            LinearClient::rate_limit_backoff(3, 0),
+            RATE_LIMIT_BACKOFF_BASE * 4
+        );
     }
 
     #[tokio::test]

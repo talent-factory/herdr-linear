@@ -23,7 +23,7 @@ A **pure Rust** client for [Linear.app](https://linear.app)'s GraphQL API. Desig
 
 ✅ **Error Handling**
 - Comprehensive error types with context
-- Automatic rate limit detection
+- Automatic rate-limit retry with backoff (opt-out available)
 
 ✅ **Logging**
 - Structured logging with tracing
@@ -156,6 +156,19 @@ let response = client.query::<MyType>(query_string, variables).await?;
 let response = client.mutate::<MyType>(mutation_string, variables).await?;
 ```
 
+### Rate Limiting
+
+When Linear responds with `429 Too Many Requests`, `LinearClient` automatically waits and
+retries — up to 3 total attempts — before giving up. It waits the server's `Retry-After` value
+when present, falling back to exponential backoff (500ms, 1s, ...) otherwise. If the retry
+budget is exhausted, the original `Error::RateLimitExceeded` is still returned, unchanged.
+
+Retry is on by default; opt out for the old fail-fast behavior:
+
+```rust
+let client = LinearClient::new(api_key)?.without_rate_limit_retry();
+```
+
 ## Project Structure
 
 ```
@@ -231,6 +244,8 @@ match client.get_viewer().await {
     Ok(user) => println!("User: {}", user.name),
     Err(Error::AuthenticationFailed(msg)) => eprintln!("Auth failed: {}", msg),
     Err(Error::RateLimitExceeded { retry_after_ms }) => {
+        // Only reached once the automatic retry budget is exhausted (see
+        // "Rate Limiting" above), or when retry was opted out of.
         eprintln!("Rate limited, retry after {}ms", retry_after_ms);
     }
     Err(e) => eprintln!("Error: {}", e),
