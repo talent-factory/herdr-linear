@@ -13,6 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Implement flow: the prompt-landed confirmation now polls the pane continuously until the
+  sent prompt has been visible, with no gaps, for a documented stability window — instead of
+  checking at exactly two fixed offsets (500ms, then 800ms later) and declaring success from
+  those two samples alone. A live repro against a slow-starting target showed the prompt land,
+  pass both of those samples, and then still get wiped by the target's own async startup
+  finishing after that 1.3s window had already elapsed, reporting success on an agent left with
+  an empty prompt box (TF-619)
 - Detail pane: unordered Markdown list items now render with a `•` bullet and a hanging
   indent for wrapped continuation lines, so a wrapped line starting with `--` (e.g. inline
   code like `` `cargo test --features plugin -- --ignored live_api` `` wrapping right

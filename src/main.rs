@@ -148,24 +148,50 @@ async fn ensure_loaded(
 }
 
 /// How many times [`send_prompt_until_visible`] will (re)send the implement prompt before
-/// giving up.
+/// giving up. Combined with [`PROMPT_SEND_ATTEMPT_TIMEOUT`], this bounds the worst case (every
+/// attempt timing out) at `PROMPT_SEND_ATTEMPTS` × `PROMPT_SEND_ATTEMPT_TIMEOUT` = 30s per issue
+/// — up from the ~6.5s worst case of the two-fixed-point check this replaced. The TUI's event
+/// loop `.await`s [`send_prompt_until_visible`] inline (`Action::Implement`/
+/// `Action::ImplementMany`), so the UI is unresponsive for the full duration of a worst-case run;
+/// a genuinely broken target is expected to be rare enough that trading UI responsiveness for a
+/// wider stability-confirmation window (see [`PROMPT_SEND_STABILITY_DURATION`]) is the right
+/// default, but this is the number to revisit first if that tradeoff stops holding.
 const PROMPT_SEND_ATTEMPTS: u32 = 5;
 
-/// How long [`send_prompt_until_visible`] waits after each `agent_send` before the first read
-/// back. `agent_wait`'s "idle" status (checked by the caller before this runs) has been observed
-/// resolving in as little as 5ms — long before a `headroom wrap claude ...`-style multi-process
-/// `agent_command` has actually started rendering — so the first attempt routinely lands in a
-/// window where nothing is reading the pty yet; this delay just gives the terminal a chance to
-/// catch up before checking.
-const PROMPT_SEND_SETTLE_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+/// How often [`wait_for_prompt_stable`] re-reads the pane while confirming a sent prompt.
+/// `agent_wait`'s "idle" status (checked by the caller before any of this runs) has been
+/// observed resolving in as little as 5ms — long before a `headroom wrap claude ...`-style
+/// multi-process `agent_command` has actually started rendering — so a fast cadence is needed to
+/// catch the pane settling without either missing a brief landing or waiting unnecessarily long
+/// once it's genuinely stable. Unlike the two-fixed-point check this replaced, the first poll
+/// happens immediately with no upfront delay — an early miss just costs one no-op iteration (and
+/// one `poll_interval` sleep) rather than a wasted wait, since [`next_prompt_poll_step`] keeps
+/// polling regardless of how the very first sample comes back.
+const PROMPT_SEND_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// How long [`send_prompt_until_visible`] waits, after first seeing the prompt land, before
-/// re-reading to confirm it *stuck*. Required because the failure mode isn't only "never
-/// appeared" — live TF-579 repros showed the prompt appear, get counted as landed, and then
-/// silently vanish moments later, almost certainly wiped by the target's own slower async
-/// startup (e.g. memory/code-graph loading in `headroom wrap`) finishing and resetting the
-/// input widget after the prompt box had already been painted once.
-const PROMPT_SEND_CONFIRM_DELAY: std::time::Duration = std::time::Duration::from_millis(800);
+/// TF-619: how long the prompt must remain *continuously* visible — with no gap, measured in
+/// real wall-clock time across consecutive [`PROMPT_SEND_POLL_INTERVAL`]-spaced polls — before
+/// [`wait_for_prompt_stable`] declares it landed. Replaces the two-fixed-point check this
+/// constant's predecessors (`PROMPT_SEND_SETTLE_DELAY` + `PROMPT_SEND_CONFIRM_DELAY`, 500ms +
+/// 800ms = 1.3s total, exactly two samples) used, after a live repro against TF-614's implement
+/// flow showed the exact race TF-587 thought it had narrowed reappearing one level later: the
+/// prompt landed, passed both of those two samples, and was *still* wiped by the target's own
+/// slower async startup (memory/code-graph loading, which scales with codebase size) finishing
+/// sometime after that 1.3s window had already elapsed and declared success. 2s — roughly 1.5x
+/// the old 1.3s total window — was chosen as comfortably longer than that observed startup tail
+/// without making a genuinely-stuck target wait unreasonably long per (re)send attempt;
+/// [`PROMPT_SEND_ATTEMPTS`] still bounds the total worst case across resends (see its own doc for
+/// the concrete worst-case total).
+const PROMPT_SEND_STABILITY_DURATION: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Overall wall-clock budget for a single (re)send attempt's polling in
+/// [`wait_for_prompt_stable`] — so a genuinely broken/never-appearing prompt still fails this
+/// attempt in bounded time instead of polling forever, rather than relying solely on
+/// [`PROMPT_SEND_STABILITY_DURATION`] never being reached. Set to 3x that duration: comfortable
+/// room for the prompt to land, flicker, and still hold continuously visible for the *entire*
+/// stability window within one attempt, without the timeout itself becoming the limiting factor
+/// for a target that's merely slow rather than actually stuck.
+const PROMPT_SEND_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
 
 /// Starter content written to `config.toml` by the `c` keybinding when the file doesn't
 /// exist yet, so pressing `c` never fails with "file not found" and always opens something
@@ -181,6 +207,126 @@ const CONFIG_TEMPLATE: &str = r#"# herdr-linear plugin config. See README.md for
 # "repo-name" = "linear-project-id"
 "#;
 
+/// Outcome of a single poll in [`wait_for_prompt_stable`]'s loop — split out as a pure state
+/// transition, the same way `herdr_cli::next_retry_budget_ms` is, so the actual "keep polling vs.
+/// declare stable vs. give up" decision is exhaustively unit-testable without any real waiting.
+#[derive(Debug, PartialEq, Eq)]
+enum PromptPollStep {
+    /// Not yet continuously visible for the full stability window, and there's still time left
+    /// in this attempt — keep polling.
+    KeepPolling,
+    /// The prompt has been continuously visible, with no gap, for at least
+    /// [`PROMPT_SEND_STABILITY_DURATION`] — declare this attempt landed.
+    Stable,
+    /// [`PROMPT_SEND_ATTEMPT_TIMEOUT`] elapsed without ever reaching [`PromptPollStep::Stable`].
+    TimedOut,
+}
+
+/// Decides the next [`PromptPollStep`] by comparing the streak-tracking and attempt-timing state
+/// [`wait_for_prompt_stable`] measures on each poll against the two thresholds below.
+///
+/// `stable_for` is how long the prompt has been continuously visible so far, measured by the
+/// caller in real wall-clock time (zero if the most recent poll didn't find it) — see
+/// [`wait_for_prompt_stable`] for how that's tracked. `elapsed` is how long this attempt has been
+/// running in total, measured independently against `attempt_timeout`, so a prompt that flickers
+/// forever without ever holding still still fails this attempt instead of polling indefinitely.
+///
+/// Deliberately takes already-measured real durations rather than a `landed: bool` plus an
+/// accumulator it updates itself: an earlier version of this function *did* own that
+/// accounting, crediting each landed poll a full `poll_interval` regardless of the read
+/// latency actually observed between polls — a fencepost bug (the streak's start poll was
+/// credited time it hadn't earned) that also left the measured window vulnerable to shrinking
+/// further under real (non-negligible) `agent_read` latency, since the credited total didn't
+/// track wall-clock time at all. Delegating the real-time measurement to [`std::time::Instant`]
+/// in the caller closes both problems by construction — there's no accumulator left to drift.
+fn next_prompt_poll_step(
+    stable_for: std::time::Duration,
+    elapsed: std::time::Duration,
+    stability_duration: std::time::Duration,
+    attempt_timeout: std::time::Duration,
+) -> PromptPollStep {
+    if stable_for >= stability_duration {
+        PromptPollStep::Stable
+    } else if elapsed >= attempt_timeout {
+        PromptPollStep::TimedOut
+    } else {
+        PromptPollStep::KeepPolling
+    }
+}
+
+/// Polls `pane_id` every `poll_interval` until `prompt` has been continuously visible, in real
+/// wall-clock time, for `stability_duration` — or `attempt_timeout` elapses first — the
+/// genuine-polling replacement for the old two-fixed-point check (see
+/// [`PROMPT_SEND_STABILITY_DURATION`]'s doc for the TF-619 investigation this responds to). Used
+/// by [`send_prompt_until_visible`] once per (re)send attempt, with the real
+/// [`PROMPT_SEND_POLL_INTERVAL`]/[`PROMPT_SEND_STABILITY_DURATION`]/
+/// [`PROMPT_SEND_ATTEMPT_TIMEOUT`] constants; parameterized here (rather than reading the
+/// constants directly) purely so tests can drive the same logic with millisecond-scale durations
+/// instead of the real multi-second ones.
+///
+/// `stable_since` tracks the start of the current unbroken landed streak: `None` while the
+/// prompt isn't visible, set to `Instant::now()` on the poll where it's *first* seen landed, and
+/// left untouched (not bumped forward) on every subsequent landed poll, so `stable_since.elapsed()`
+/// is always the real time the streak has held — not an approximation built from
+/// `poll_interval`-sized credits. Any poll that comes back empty resets it to `None`; that reset
+/// is the actual TF-619 fix — the original false positive was exactly a case where the prompt
+/// landed, was observed as visible, and then reappeared as empty again after a two-point check
+/// had already declared success and stopped looking. Any single gap anywhere in the sequence
+/// restarts the streak from scratch, so only a prompt that's *never* absent for the full
+/// stability window can satisfy it.
+async fn wait_for_prompt_stable(
+    herdr_bin: &str,
+    pane_id: &plugin::herdr_cli::PaneId,
+    prompt: &str,
+    poll_interval: std::time::Duration,
+    stability_duration: std::time::Duration,
+    attempt_timeout: std::time::Duration,
+) -> std::result::Result<(), String> {
+    let start = std::time::Instant::now();
+    let mut stable_since: Option<std::time::Instant> = None;
+    let mut ever_landed = false;
+
+    loop {
+        let landed = match plugin::herdr_cli::agent_read(herdr_bin, pane_id, "visible", 60).await {
+            Ok(text) => plugin::implement::prompt_landed(&text, prompt),
+            Err(err) => {
+                // Unlike the old settle-delay design, nothing else in this loop paces the very
+                // first read — so without this sleep, a transient herdr transport error (a
+                // subprocess spawn hiccup, a closed socket) would return instantly and let the
+                // caller's resend loop burn through every attempt back-to-back with no backoff.
+                tokio::time::sleep(poll_interval).await;
+                return Err(format!("failed to verify implement command landed ({err})"));
+            }
+        };
+        ever_landed |= landed;
+
+        stable_since = if landed {
+            Some(stable_since.unwrap_or_else(std::time::Instant::now))
+        } else {
+            None
+        };
+        let stable_for = stable_since.map_or(std::time::Duration::ZERO, |since| since.elapsed());
+
+        match next_prompt_poll_step(
+            stable_for,
+            start.elapsed(),
+            stability_duration,
+            attempt_timeout,
+        ) {
+            PromptPollStep::Stable => return Ok(()),
+            PromptPollStep::TimedOut => {
+                return Err(if ever_landed {
+                    "the implement command appeared but then disappeared before it stuck"
+                        .to_string()
+                } else {
+                    "the implement command never appeared in the pane".to_string()
+                });
+            }
+            PromptPollStep::KeepPolling => tokio::time::sleep(poll_interval).await,
+        }
+    }
+}
+
 /// Sends `prompt` to `pane_id` and confirms it actually landed — and *stayed* landed — before
 /// returning success.
 ///
@@ -190,54 +336,77 @@ const CONFIG_TEMPLATE: &str = r#"# herdr-linear plugin config. See README.md for
 /// (`headroom wrap claude --memory --code-graph`) during the TF-579 investigation:
 /// - Sent too early: the keystrokes land in a pty nothing is reading yet and are silently
 ///   dropped, not queued — the prompt never appears at all.
-/// - Sent into an intermediate "painted but not fully started" state: the prompt appears,
-///   passing a single, one-shot check — then the target's slower background init finishes and
-///   wipes the input widget, leaving the pane empty with no error and no trace.
+/// - Sent into an intermediate "painted but not fully started" state: the prompt appears, then
+///   the target's slower background init finishes and wipes the input widget, leaving the pane
+///   empty with no error and no trace. TF-619: this used to be checked with exactly two fixed
+///   samples (500ms after send, then 800ms later), which just narrows the window the same race
+///   can reappear in rather than closing it — see [`wait_for_prompt_stable`].
 ///
-/// This resends up to [`PROMPT_SEND_ATTEMPTS`] times. Each attempt waits
-/// [`PROMPT_SEND_SETTLE_DELAY`] before its first read; if the prompt is visible there, it waits
-/// [`PROMPT_SEND_CONFIRM_DELAY`] more and re-reads before declaring success — only a prompt that
-/// survives both checks counts as landed. Either check failing falls through to the next
-/// (re)send rather than trusting the single earlier sighting.
+/// Thin wrapper around [`send_prompt_until_visible_with`] that supplies the real
+/// [`PROMPT_SEND_ATTEMPTS`]/[`PROMPT_SEND_POLL_INTERVAL`]/[`PROMPT_SEND_STABILITY_DURATION`]/
+/// [`PROMPT_SEND_ATTEMPT_TIMEOUT`] constants — split out purely so tests can drive the retry loop
+/// itself (resend-after-timeout, exhaustion-after-N-attempts) with millisecond-scale values
+/// instead of the real multi-second ones, the same reason [`wait_for_prompt_stable`] takes its
+/// durations as parameters rather than reading the constants directly.
 async fn send_prompt_until_visible(
     herdr_bin: &str,
     pane_id: &plugin::herdr_cli::PaneId,
     prompt: &str,
 ) -> std::result::Result<(), String> {
+    send_prompt_until_visible_with(
+        herdr_bin,
+        pane_id,
+        prompt,
+        PROMPT_SEND_ATTEMPTS,
+        PROMPT_SEND_POLL_INTERVAL,
+        PROMPT_SEND_STABILITY_DURATION,
+        PROMPT_SEND_ATTEMPT_TIMEOUT,
+    )
+    .await
+}
+
+/// See [`send_prompt_until_visible`]. This resends up to `attempts` times, delegating each
+/// attempt's confirmation to [`wait_for_prompt_stable`]; a `TimedOut`/error result falls through
+/// to the next (re)send rather than trusting an early sighting. Every attempt's failure is logged
+/// via `tracing::debug!` before moving on (see `main.rs::init_tracing`, and `agent_start`'s
+/// `agent_name_taken` retry loop in `herdr_cli.rs` for the established convention this follows)
+/// — only the *last* attempt's error is returned to the caller, so a log-enabled session is the
+/// only way to see what the earlier, discarded attempts actually failed with.
+async fn send_prompt_until_visible_with(
+    herdr_bin: &str,
+    pane_id: &plugin::herdr_cli::PaneId,
+    prompt: &str,
+    attempts: u32,
+    poll_interval: std::time::Duration,
+    stability_duration: std::time::Duration,
+    attempt_timeout: std::time::Duration,
+) -> std::result::Result<(), String> {
     let mut last_err = None;
-    for attempt in 1..=PROMPT_SEND_ATTEMPTS {
+    for attempt in 1..=attempts {
         if let Err(err) = plugin::herdr_cli::agent_send(herdr_bin, pane_id, prompt).await {
+            tracing::debug!(
+                "send_prompt_until_visible: attempt {attempt} failed to send ({err}), retrying"
+            );
             last_err = Some(format!("failed to send implement command ({err})"));
             continue;
         }
 
-        tokio::time::sleep(PROMPT_SEND_SETTLE_DELAY).await;
-
-        match plugin::herdr_cli::agent_read(herdr_bin, pane_id, "visible", 60).await {
-            Ok(text) if plugin::implement::prompt_landed(&text, prompt) => {
-                tokio::time::sleep(PROMPT_SEND_CONFIRM_DELAY).await;
-
-                match plugin::herdr_cli::agent_read(herdr_bin, pane_id, "visible", 60).await {
-                    Ok(text) if plugin::implement::prompt_landed(&text, prompt) => return Ok(()),
-                    Ok(_) => {
-                        last_err = Some(format!(
-                            "the implement command appeared after attempt {attempt} but then \
-                             disappeared before it stuck"
-                        ));
-                    }
-                    Err(err) => {
-                        last_err =
-                            Some(format!("failed to confirm implement command stuck ({err})"));
-                    }
-                }
-            }
-            Ok(_) => {
-                last_err = Some(format!(
-                    "sent the implement command {attempt} time(s) but it never appeared in the pane"
-                ));
-            }
+        match wait_for_prompt_stable(
+            herdr_bin,
+            pane_id,
+            prompt,
+            poll_interval,
+            stability_duration,
+            attempt_timeout,
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
             Err(err) => {
-                last_err = Some(format!("failed to verify implement command landed ({err})"));
+                tracing::debug!(
+                    "send_prompt_until_visible: attempt {attempt} failed ({err}), retrying"
+                );
+                last_err = Some(format!("attempt {attempt}: {err}"));
             }
         }
     }
@@ -1215,6 +1384,154 @@ esac
         ))
     }
 
+    /// A sibling of [`write_dispatching_herdr_script`] (TF-619) exposing `tab create` (so a real
+    /// [`plugin::herdr_cli::PaneId`] can be minted the same way production code always does — the
+    /// type has no public constructor of its own) plus `agent send`/`agent read`, so
+    /// [`send_prompt_until_visible`]/[`wait_for_prompt_stable`] can be driven directly without
+    /// also having to script `agent_start`/`pane_close`/`agent_wait`. `agent send` always
+    /// succeeds (its own failure path is exercised elsewhere); each `agent read` call returns the
+    /// next entry from `read_responses` in order, then sticks on the last entry once exhausted —
+    /// so a short list can script "landed, landed, reverted-to-empty, landed-and-stays-that-way"
+    /// without needing one entry per poll for however many polls it actually takes to reach
+    /// stability. A counter file alongside the script tracks how many `agent read` calls have
+    /// happened so far, since each invocation is a fresh process with no other shared state.
+    fn write_prompt_send_read_sequence_script(
+        read_responses: &[&str],
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let last = read_responses.len().saturating_sub(1);
+        let (dir, script) = write_fake_herdr_script(&format!(
+            r#"
+case "$1 $2" in
+  "tab create")
+    echo '{{"result":{{"tab":{{"tab_id":"t1","label":"TF-579"}},"root_pane":{{"pane_id":"p1"}}}}}}'
+    exit 0
+    ;;
+  "agent send") echo '{{"result":{{}}}}'; exit 0 ;;
+  "agent read")
+    script_dir=$(dirname "$0")
+    count_file="$script_dir/read_count"
+    n=0
+    [ -f "$count_file" ] && n=$(cat "$count_file")
+    idx=$n
+    if [ "$idx" -gt {last} ]; then idx={last}; fi
+    echo $((n + 1)) > "$count_file"
+    cat "$script_dir/response_${{idx}}.json"
+    exit 0
+    ;;
+  *)
+    echo '{{"error":{{"message":"unexpected herdr call: $1 $2"}}}}'
+    exit 1
+    ;;
+esac
+"#
+        ));
+
+        for (i, text) in read_responses.iter().enumerate() {
+            let body = json!({"result": {"read": {"text": text}}}).to_string();
+            std::fs::write(dir.path().join(format!("response_{i}.json")), body).unwrap();
+        }
+
+        (dir, script)
+    }
+
+    /// How many `agent read` calls a script written by [`write_prompt_send_read_sequence_script`]
+    /// has actually served so far — lets a test assert genuine polling happened (more than the
+    /// old two fixed samples), not just that the final outcome was correct.
+    fn read_call_count(dir: &tempfile::TempDir) -> u32 {
+        std::fs::read_to_string(dir.path().join("read_count"))
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// A sibling of [`write_prompt_send_read_sequence_script`] for exercising
+    /// [`send_prompt_until_visible_with`]'s cross-*attempt* retry behavior, where
+    /// [`write_prompt_send_read_sequence_script`]'s per-*read* counter would be flaky: how many
+    /// `agent read` polls a given attempt takes before timing out varies with real subprocess
+    /// spawn latency, so there's no reliable read-count boundary to plant a landed/empty switch
+    /// on. This script instead switches on how many `agent send` calls have happened — i.e. which
+    /// *attempt* is in flight — so every read within an attempt gets the same answer regardless
+    /// of how many polls that attempt actually takes: attempts before `lands_on_attempt` always
+    /// read `empty_text`, and attempt `lands_on_attempt` onward always reads `landed_text`.
+    fn write_prompt_send_lands_on_attempt_script(
+        landed_text: &str,
+        empty_text: &str,
+        lands_on_attempt: u32,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let (dir, script) = write_fake_herdr_script(&format!(
+            r#"
+case "$1 $2" in
+  "tab create")
+    echo '{{"result":{{"tab":{{"tab_id":"t1","label":"TF-579"}},"root_pane":{{"pane_id":"p1"}}}}}}'
+    exit 0
+    ;;
+  "agent send")
+    script_dir=$(dirname "$0")
+    count_file="$script_dir/send_count"
+    n=0
+    [ -f "$count_file" ] && n=$(cat "$count_file")
+    echo $((n + 1)) > "$count_file"
+    echo '{{"result":{{}}}}'
+    exit 0
+    ;;
+  "agent read")
+    script_dir=$(dirname "$0")
+    count_file="$script_dir/send_count"
+    n=0
+    [ -f "$count_file" ] && n=$(cat "$count_file")
+    if [ "$n" -ge {lands_on_attempt} ]; then
+      cat "$script_dir/landed.json"
+    else
+      cat "$script_dir/empty.json"
+    fi
+    exit 0
+    ;;
+  *)
+    echo '{{"error":{{"message":"unexpected herdr call: $1 $2"}}}}'
+    exit 1
+    ;;
+esac
+"#
+        ));
+
+        std::fs::write(
+            dir.path().join("landed.json"),
+            json!({"result": {"read": {"text": landed_text}}}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("empty.json"),
+            json!({"result": {"read": {"text": empty_text}}}).to_string(),
+        )
+        .unwrap();
+
+        (dir, script)
+    }
+
+    /// A sibling of [`write_prompt_send_read_sequence_script`] for [`wait_for_prompt_stable`]
+    /// tests that only need a single fixed `agent read` behavior for the whole attempt — no need
+    /// for the response-file sequencing.
+    fn write_prompt_read_always_script(
+        read_response: &str,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        write_fake_herdr_script(&format!(
+            r#"
+case "$1 $2" in
+  "tab create")
+    echo '{{"result":{{"tab":{{"tab_id":"t1","label":"TF-579"}},"root_pane":{{"pane_id":"p1"}}}}}}'
+    exit 0
+    ;;
+  "agent send") echo '{{"result":{{}}}}'; exit 0 ;;
+  "agent read") {read_response} ;;
+  *)
+    echo '{{"error":{{"message":"unexpected herdr call: $1 $2"}}}}'
+    exit 1
+    ;;
+esac
+"#
+        ))
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn implement_one_fails_immediately_when_tab_create_fails() {
@@ -1364,6 +1681,245 @@ esac
         assert!(
             message.contains("failed to load workflow states"),
             "unexpected message: {message}"
+        );
+    }
+
+    #[test]
+    fn next_prompt_poll_step_keeps_polling_while_not_yet_stable_and_within_budget() {
+        let step = next_prompt_poll_step(
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(6),
+        );
+        assert_eq!(step, PromptPollStep::KeepPolling);
+    }
+
+    #[test]
+    fn next_prompt_poll_step_declares_stable_once_the_window_is_reached() {
+        let step = next_prompt_poll_step(
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(6),
+        );
+        assert_eq!(step, PromptPollStep::Stable);
+    }
+
+    #[test]
+    fn next_prompt_poll_step_times_out_once_the_attempt_budget_is_exhausted() {
+        // TF-619: `stable_for` resetting to zero on every gap (see `wait_for_prompt_stable`'s
+        // `stable_since` tracking) is the actual fix — a prompt that lands, is briefly counted,
+        // then disappears can never satisfy the stability window just by having been visible for
+        // two isolated samples; here it's simulated as never having accumulated any stable time
+        // at all by the time the attempt budget runs out.
+        let step = next_prompt_poll_step(
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(6),
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(6),
+        );
+        assert_eq!(step, PromptPollStep::TimedOut);
+    }
+
+    #[test]
+    fn next_prompt_poll_step_prefers_stable_over_timed_out_when_both_are_reached_at_once() {
+        let step = next_prompt_poll_step(
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(6),
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(6),
+        );
+        assert_eq!(step, PromptPollStep::Stable);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_prompt_until_visible_rides_out_a_brief_flicker_instead_of_trusting_two_samples() {
+        // TF-619 regression: reproduces the exact false positive from the ticket — the prompt
+        // lands, is visible on the first two polls (exactly what the old fixed 500ms + 800ms
+        // two-point check sampled), then reverts to empty on the next poll before recovering and
+        // holding stable from then on. The old logic would have declared success right after
+        // those first two samples, never seeing the revert at all. The fix must not just get the
+        // final answer right — it must have actually kept polling past two reads to get there.
+        let prompt = plugin::implement::build_implement_prompt("TF-579");
+        let landed = format!("❯ {prompt}\n");
+        let empty = "❯ \n";
+        let (dir, script) =
+            write_prompt_send_read_sequence_script(&[&landed, &landed, empty, &landed]);
+        let tab = plugin::herdr_cli::tab_create(script.to_str().unwrap(), dir.path(), "TF-579")
+            .await
+            .expect("stub tab_create must succeed");
+
+        let outcome =
+            send_prompt_until_visible(script.to_str().unwrap(), &tab.root_pane_id, &prompt).await;
+
+        assert_eq!(
+            outcome,
+            Ok(()),
+            "must eventually succeed once the prompt genuinely holds stable"
+        );
+        assert!(
+            read_call_count(&dir) > 2,
+            "must poll more than the old fixed two samples to notice the revert: {} reads",
+            read_call_count(&dir)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wait_for_prompt_stable_times_out_when_the_prompt_never_holds_still() {
+        let prompt = plugin::implement::build_implement_prompt("TF-579");
+        let landed = format!("❯ {prompt}\n");
+        let empty = "❯ \n";
+        // Lands once, then reverts to empty and stays that way for the rest of the attempt
+        // (write_prompt_send_read_sequence_script sticks on the last entry once exhausted rather
+        // than cycling) — never continuously visible long enough to be declared stable within
+        // the 60ms attempt_timeout given below.
+        let (dir, script) = write_prompt_send_read_sequence_script(&[&landed, empty]);
+        let tab = plugin::herdr_cli::tab_create(script.to_str().unwrap(), dir.path(), "TF-579")
+            .await
+            .expect("stub tab_create must succeed");
+
+        let outcome = wait_for_prompt_stable(
+            script.to_str().unwrap(),
+            &tab.root_pane_id,
+            &prompt,
+            std::time::Duration::from_millis(5),
+            std::time::Duration::from_millis(30),
+            std::time::Duration::from_millis(60),
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            Err("the implement command appeared but then disappeared before it stuck".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wait_for_prompt_stable_reports_never_appeared_when_the_prompt_is_always_absent() {
+        // Review gap: the `ever_landed == false` branch of the `TimedOut` message had no direct
+        // test — only the "appeared but then disappeared" branch did.
+        let prompt = plugin::implement::build_implement_prompt("TF-579");
+        let (dir, script) = write_prompt_read_always_script(
+            r#"echo '{"result":{"read":{"text":"no prompt here"}}}'; exit 0"#,
+        );
+        let tab = plugin::herdr_cli::tab_create(script.to_str().unwrap(), dir.path(), "TF-579")
+            .await
+            .expect("stub tab_create must succeed");
+
+        let outcome = wait_for_prompt_stable(
+            script.to_str().unwrap(),
+            &tab.root_pane_id,
+            &prompt,
+            std::time::Duration::from_millis(5),
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(30),
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            Err("the implement command never appeared in the pane".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wait_for_prompt_stable_surfaces_a_read_error_instead_of_treating_it_as_not_landed() {
+        // Review gap: a genuine `agent_read` transport failure had no direct test — nothing
+        // pinned down that it surfaces its own error message rather than being silently treated
+        // as just another "not landed" poll.
+        let prompt = plugin::implement::build_implement_prompt("TF-579");
+        let (dir, script) = write_prompt_read_always_script(
+            r#"echo '{"error":{"message":"pane closed"}}'; exit 1"#,
+        );
+        let tab = plugin::herdr_cli::tab_create(script.to_str().unwrap(), dir.path(), "TF-579")
+            .await
+            .expect("stub tab_create must succeed");
+
+        let outcome = wait_for_prompt_stable(
+            script.to_str().unwrap(),
+            &tab.root_pane_id,
+            &prompt,
+            std::time::Duration::from_millis(5),
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(30),
+        )
+        .await;
+
+        assert!(
+            outcome
+                .as_ref()
+                .is_err_and(|err| err.contains("failed to verify implement command landed")),
+            "expected a read-error message, got {outcome:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_prompt_until_visible_resends_after_an_attempt_times_out() {
+        // Review gap: send_prompt_until_visible's cross-attempt retry logic (does a timed-out
+        // attempt actually trigger a resend, and can a later attempt succeed?) had no test at
+        // all. `write_prompt_send_lands_on_attempt_script` switches on the `agent send` count
+        // rather than the `agent read` count so this isn't sensitive to how many polls either
+        // attempt actually takes.
+        let prompt = plugin::implement::build_implement_prompt("TF-579");
+        let landed = format!("❯ {prompt}\n");
+        let empty = "❯ \n";
+        let (dir, script) = write_prompt_send_lands_on_attempt_script(&landed, empty, 2);
+        let tab = plugin::herdr_cli::tab_create(script.to_str().unwrap(), dir.path(), "TF-579")
+            .await
+            .expect("stub tab_create must succeed");
+
+        let outcome = send_prompt_until_visible_with(
+            script.to_str().unwrap(),
+            &tab.root_pane_id,
+            &prompt,
+            2,
+            std::time::Duration::from_millis(5),
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(30),
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            Ok(()),
+            "attempt 2 must succeed after attempt 1 times out"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_prompt_until_visible_returns_the_last_attempts_error_once_attempts_are_exhausted()
+    {
+        // Review gap: nothing verified that exhausting every attempt returns the *last*
+        // attempt's error (rather than the first, or panicking/looping forever) once
+        // `attempts` is reached.
+        let prompt = plugin::implement::build_implement_prompt("TF-579");
+        let empty = "❯ \n";
+        let (dir, script) = write_prompt_send_lands_on_attempt_script(empty, empty, 99);
+        let tab = plugin::herdr_cli::tab_create(script.to_str().unwrap(), dir.path(), "TF-579")
+            .await
+            .expect("stub tab_create must succeed");
+
+        let outcome = send_prompt_until_visible_with(
+            script.to_str().unwrap(),
+            &tab.root_pane_id,
+            &prompt,
+            2,
+            std::time::Duration::from_millis(5),
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(30),
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            Err("attempt 2: the implement command never appeared in the pane".to_string())
         );
     }
 }
