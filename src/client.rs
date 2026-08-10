@@ -11,6 +11,75 @@ use tracing::{debug, error, warn};
 const LINEAR_API_ENDPOINT: &str = "https://api.linear.app/graphql";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Default number of items requested per page by `get_all_*` calls that don't
+/// override it — matches the default used by the single-page methods.
+const DEFAULT_PAGE_SIZE: i32 = 50;
+
+/// Default safety cap on the number of pages a `get_all_*` call will fetch
+/// before aborting with `Error::InvalidRequest`, in case a misbehaving API
+/// never reports `hasNextPage: false`.
+const DEFAULT_MAX_PAGES: usize = 100;
+
+/// Default safety cap on the total number of items a `get_all_*` call will
+/// accumulate before aborting with `Error::InvalidRequest`. Checked only when
+/// more pages remain, so a call that finishes exactly on (or slightly past,
+/// by up to one page's worth of items) this cap on its final page still
+/// succeeds — the cap guards against runaway pagination, not result size.
+const DEFAULT_MAX_ITEMS: usize = 10_000;
+
+/// Options controlling an auto-paginating `get_all_*` call.
+///
+/// All fields are optional; unset fields fall back to this crate's default
+/// page size (50), max page count (100), and max item count (10,000)
+/// respectively. The caps exist so a `get_all_*` call can't loop forever (or
+/// exhaust memory) against an API that keeps reporting more pages than
+/// expected.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PaginationOptions {
+    /// Number of items requested per page.
+    pub page_size: Option<i32>,
+    /// Maximum number of pages to fetch before aborting.
+    pub max_pages: Option<usize>,
+    /// Maximum number of items to accumulate before aborting.
+    pub max_items: Option<usize>,
+}
+
+impl PaginationOptions {
+    /// Override the page size requested per call. Must be positive (a
+    /// non-positive value is rejected before any request is sent). Linear's
+    /// API caps `first` at 250 regardless of what's requested here.
+    pub fn with_page_size(mut self, page_size: i32) -> Self {
+        self.page_size = Some(page_size);
+        self
+    }
+
+    /// Override the max-pages safety cap.
+    pub fn with_max_pages(mut self, max_pages: usize) -> Self {
+        self.max_pages = Some(max_pages);
+        self
+    }
+
+    /// Override the max-items safety cap.
+    pub fn with_max_items(mut self, max_items: usize) -> Self {
+        self.max_items = Some(max_items);
+        self
+    }
+}
+
+/// Build a filter matching issues belonging to `team_id`.
+///
+/// Shared by [`LinearClient::get_team_issues`] and
+/// [`LinearClient::get_all_team_issues`] so the two stay in sync.
+fn team_filter(team_id: &str) -> Value {
+    json!({
+        "team": {
+            "id": {
+                "eq": team_id
+            }
+        }
+    })
+}
+
 /// Linear GraphQL API client
 pub struct LinearClient {
     http_client: HttpClient,
@@ -70,7 +139,7 @@ impl LinearClient {
             .ok_or_else(|| graphql_error("Failed to parse viewer data"))
     }
 
-    /// Get all teams
+    /// Get one page of teams
     pub async fn get_teams(
         &self,
         limit: Option<i32>,
@@ -78,7 +147,7 @@ impl LinearClient {
     ) -> Result<Connection<Team>> {
         debug!("Fetching teams");
         let variables = json!({
-            "first": limit.unwrap_or(50),
+            "first": limit.unwrap_or(DEFAULT_PAGE_SIZE),
             "after": after
         });
 
@@ -90,6 +159,17 @@ impl LinearClient {
             .get("teams")
             .and_then(|t| serde_json::from_value(t.clone()).ok())
             .ok_or_else(|| graphql_error("Failed to parse teams data"))
+    }
+
+    /// Fetch every team by transparently paging through [`Self::get_teams`]
+    /// until `hasNextPage` is `false`.
+    ///
+    /// See [`PaginationOptions`] for page-size and safety-cap configuration.
+    pub async fn get_all_teams(&self, options: PaginationOptions) -> Result<Vec<Team>> {
+        self.paginate_all(options, move |page_size, after| {
+            self.get_teams(Some(page_size), after)
+        })
+        .await
     }
 
     /// Get a team by ID
@@ -120,7 +200,7 @@ impl LinearClient {
     ) -> Result<Connection<Issue>> {
         debug!("Fetching issues with filter: {:?}", filter);
         let variables = json!({
-            "first": limit.unwrap_or(50),
+            "first": limit.unwrap_or(DEFAULT_PAGE_SIZE),
             "after": after,
             "filter": filter.unwrap_or(Value::Null)
         });
@@ -133,6 +213,21 @@ impl LinearClient {
             .get("issues")
             .and_then(|i| serde_json::from_value(i.clone()).ok())
             .ok_or_else(|| graphql_error("Failed to parse issues data"))
+    }
+
+    /// Fetch every issue matching `filter` by transparently paging through
+    /// [`Self::get_issues`] until `hasNextPage` is `false`.
+    ///
+    /// See [`PaginationOptions`] for page-size and safety-cap configuration.
+    pub async fn get_all_issues(
+        &self,
+        filter: Option<Value>,
+        options: PaginationOptions,
+    ) -> Result<Vec<Issue>> {
+        self.paginate_all(options, move |page_size, after| {
+            self.get_issues(filter.clone(), Some(page_size), after)
+        })
+        .await
     }
 
     /// Get a single issue by ID
@@ -156,15 +251,22 @@ impl LinearClient {
         limit: Option<i32>,
     ) -> Result<Connection<Issue>> {
         debug!("Fetching issues for team: {}", team_id);
-        let filter = json!({
-            "team": {
-                "id": {
-                    "eq": team_id
-                }
-            }
-        });
+        self.get_issues(Some(team_filter(team_id)), limit, None)
+            .await
+    }
 
-        self.get_issues(Some(filter), limit, None).await
+    /// Fetch every issue for a specific team by transparently paging through
+    /// [`Self::get_all_issues`] with a team filter applied, until
+    /// `hasNextPage` is `false`.
+    ///
+    /// See [`PaginationOptions`] for page-size and safety-cap configuration.
+    pub async fn get_all_team_issues(
+        &self,
+        team_id: &str,
+        options: PaginationOptions,
+    ) -> Result<Vec<Issue>> {
+        self.get_all_issues(Some(team_filter(team_id)), options)
+            .await
     }
 
     /// Create a new issue
@@ -248,7 +350,7 @@ impl LinearClient {
             .ok_or_else(|| graphql_error("Failed to add comment"))
     }
 
-    /// Get all projects
+    /// Get one page of projects
     ///
     /// # Arguments
     /// * `filter` - Optional filter criteria (JSON value)
@@ -262,7 +364,7 @@ impl LinearClient {
     ) -> Result<Connection<Project>> {
         debug!("Fetching projects");
         let variables = json!({
-            "first": limit.unwrap_or(50),
+            "first": limit.unwrap_or(DEFAULT_PAGE_SIZE),
             "after": after,
             "filter": filter.unwrap_or(Value::Null)
         });
@@ -277,12 +379,27 @@ impl LinearClient {
             .ok_or_else(|| graphql_error("Failed to parse projects data"))
     }
 
+    /// Fetch every project matching `filter` by transparently paging through
+    /// [`Self::get_projects`] until `hasNextPage` is `false`.
+    ///
+    /// See [`PaginationOptions`] for page-size and safety-cap configuration.
+    pub async fn get_all_projects(
+        &self,
+        filter: Option<Value>,
+        options: PaginationOptions,
+    ) -> Result<Vec<Project>> {
+        self.paginate_all(options, move |page_size, after| {
+            self.get_projects(filter.clone(), Some(page_size), after)
+        })
+        .await
+    }
+
     /// Get cycles for a team
     pub async fn get_cycles(&self, team_id: &str, limit: Option<i32>) -> Result<Connection<Cycle>> {
         debug!("Fetching cycles for team: {}", team_id);
         let variables = json!({
             "filter": {"team": {"id": {"eq": team_id}}},
-            "first": limit.unwrap_or(50)
+            "first": limit.unwrap_or(DEFAULT_PAGE_SIZE)
         });
 
         let response = self
@@ -392,6 +509,103 @@ impl LinearClient {
                 error!("HTTP error {}: {}", status, body);
                 Err(api_error(format!("HTTP {}: {}", status, body)))
             }
+        }
+    }
+
+    /// Repeatedly calls `fetch_page` with an advancing `after` cursor,
+    /// accumulating `nodes` from each [`Connection<T>`] until
+    /// `page_info.has_next_page` is `false`.
+    ///
+    /// This is a client-side loop built on top of the existing single-page
+    /// methods; it does not change their behavior. See [`PaginationOptions`]
+    /// for the page-size and safety-cap knobs.
+    ///
+    /// # Errors
+    /// Returns `Error::InvalidRequest` if:
+    /// - `options` resolves to a non-positive `page_size`, or a zero
+    ///   `max_pages`/`max_items` — these can never yield a usable result, so
+    ///   they're rejected before any request is sent.
+    /// - `max_pages` is exceeded while more pages remain.
+    /// - `max_items` is exceeded while more pages remain (a final page that
+    ///   completes the result is still returned even if it pushes the total
+    ///   past `max_items` — the cap guards against runaway pagination, not
+    ///   result size).
+    /// - the API reports `hasNextPage: true` without an `end_cursor` to
+    ///   continue from — an API contract violation that would otherwise be
+    ///   indistinguishable from a legitimately complete (but silently
+    ///   truncated) result.
+    async fn paginate_all<T, F, Fut>(
+        &self,
+        options: PaginationOptions,
+        mut fetch_page: F,
+    ) -> Result<Vec<T>>
+    where
+        F: FnMut(i32, Option<String>) -> Fut,
+        Fut: std::future::Future<Output = Result<Connection<T>>>,
+    {
+        let page_size = options.page_size.unwrap_or(DEFAULT_PAGE_SIZE);
+        let max_pages = options.max_pages.unwrap_or(DEFAULT_MAX_PAGES);
+        let max_items = options.max_items.unwrap_or(DEFAULT_MAX_ITEMS);
+
+        if page_size <= 0 {
+            return Err(Error::InvalidRequest(format!(
+                "auto-pagination rejected: page_size must be positive, got {page_size}"
+            )));
+        }
+        if max_pages == 0 {
+            return Err(Error::InvalidRequest(
+                "auto-pagination rejected: max_pages must be at least 1".to_string(),
+            ));
+        }
+        if max_items == 0 {
+            return Err(Error::InvalidRequest(
+                "auto-pagination rejected: max_items must be at least 1".to_string(),
+            ));
+        }
+
+        let mut items: Vec<T> = Vec::new();
+        let mut after: Option<String> = None;
+        let mut pages_fetched = 0usize;
+
+        loop {
+            if pages_fetched >= max_pages {
+                return Err(Error::InvalidRequest(format!(
+                    "auto-pagination aborted: exceeded max_pages ({max_pages}) with more pages remaining ({} item(s) fetched so far)",
+                    items.len()
+                )));
+            }
+
+            let connection = fetch_page(page_size, after).await?;
+            pages_fetched += 1;
+            items.extend(connection.nodes);
+
+            if !connection.page_info.has_next_page {
+                // Complete: return everything gathered, even if the final
+                // page happened to push the total past `max_items` — the cap
+                // exists to bound an unbounded/misbehaving loop, not to
+                // reject an otherwise-correct, already-finished result.
+                return Ok(items);
+            }
+
+            if items.len() > max_items {
+                return Err(Error::InvalidRequest(format!(
+                    "auto-pagination aborted: exceeded max_items ({max_items}) after {pages_fetched} page(s), with more pages remaining"
+                )));
+            }
+
+            after = match connection.page_info.end_cursor {
+                Some(cursor) => Some(cursor),
+                // A well-behaved API always pairs `hasNextPage: true` with a
+                // cursor to continue from. Treat the absence of one as a
+                // detected API contract violation and fail loudly, rather
+                // than silently returning a truncated result as `Ok`.
+                None => {
+                    return Err(Error::InvalidRequest(format!(
+                        "auto-pagination aborted: API reported hasNextPage=true with no end_cursor after {pages_fetched} page(s) ({} item(s) fetched, result may be incomplete)",
+                        items.len()
+                    )));
+                }
+            };
         }
     }
 }
@@ -662,6 +876,586 @@ mod tests {
                 .map(|c| c.team.key.as_str()),
             Some("ENG")
         );
+        mock.assert_async().await;
+    }
+
+    // --- get_all_* auto-pagination helpers -------------------------------
+
+    /// Minimal but schema-complete `Issue` JSON matching everything
+    /// `QUERY_ISSUES` selects, so it deserializes into `Issue` successfully.
+    fn sample_issue_json(id: &str, identifier: &str) -> Value {
+        json!({
+            "id": id,
+            "identifier": identifier,
+            "title": "Test issue",
+            "description": null,
+            "priority": 0,
+            "estimate": null,
+            "url": format!("https://linear.app/team/issue/{identifier}"),
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:00:00Z",
+            "startedAt": null,
+            "completedAt": null,
+            "state": { "id": "state-1", "name": "Todo", "type": "unstarted" },
+            "team": {
+                "id": "team-1", "key": "ENG", "name": "Engineering",
+                "description": null,
+                "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z"
+            },
+            "assignee": null,
+            "creator": null,
+            "cycle": null,
+            "project": null,
+            "labels": { "nodes": [] }
+        })
+    }
+
+    /// Minimal `Team` JSON matching `QUERY_TEAMS`'s selection.
+    fn sample_team_json(id: &str, key: &str) -> Value {
+        json!({
+            "id": id,
+            "key": key,
+            "name": key,
+            "description": null,
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:00:00Z"
+        })
+    }
+
+    fn issues_page(nodes: Value, has_next_page: bool, end_cursor: Option<&str>) -> String {
+        json!({
+            "data": {
+                "issues": {
+                    "nodes": nodes,
+                    "pageInfo": {
+                        "hasNextPage": has_next_page,
+                        "hasPreviousPage": false,
+                        "startCursor": null,
+                        "endCursor": end_cursor
+                    }
+                }
+            },
+            "errors": null
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn get_all_issues_returns_empty_vec_for_an_empty_result() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(issues_page(json!([]), false, None))
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let issues = client
+            .get_all_issues(None, PaginationOptions::default())
+            .await
+            .unwrap();
+
+        assert!(issues.is_empty());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn get_all_issues_follows_the_cursor_across_multiple_pages() {
+        let mut server = mockito::Server::new_async().await;
+
+        let page1 = server
+            .mock("POST", "/graphql")
+            .match_body(mockito::Matcher::Regex(r#""after":null"#.to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(issues_page(
+                json!([sample_issue_json("issue-1", "ENG-1")]),
+                true,
+                Some("cursor-1"),
+            ))
+            .create_async()
+            .await;
+
+        let page2 = server
+            .mock("POST", "/graphql")
+            .match_body(mockito::Matcher::Regex(r#""after":"cursor-1""#.to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(issues_page(
+                json!([sample_issue_json("issue-2", "ENG-2")]),
+                false,
+                None,
+            ))
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let issues = client
+            .get_all_issues(None, PaginationOptions::default())
+            .await
+            .unwrap();
+
+        let identifiers: Vec<&str> = issues.iter().map(|i| i.identifier.as_str()).collect();
+        assert_eq!(identifiers, vec!["ENG-1", "ENG-2"]);
+        page1.assert_async().await;
+        page2.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn get_all_issues_aborts_when_the_page_cap_is_hit() {
+        let mut server = mockito::Server::new_async().await;
+        // Always reports another page — mimics a misbehaving API that never
+        // reports `hasNextPage: false`.
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(issues_page(
+                json!([sample_issue_json("issue-1", "ENG-1")]),
+                true,
+                Some("cursor-1"),
+            ))
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let err = client
+            .get_all_issues(None, PaginationOptions::default().with_max_pages(1))
+            .await
+            .unwrap_err();
+
+        match err {
+            Error::InvalidRequest(msg) => assert!(msg.contains("max_pages")),
+            other => panic!("expected Error::InvalidRequest, got {other:?}"),
+        }
+        // Aborts before issuing a second request, past the one-page cap.
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn get_all_issues_aborts_when_the_item_cap_is_hit() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(issues_page(
+                json!([
+                    sample_issue_json("issue-1", "ENG-1"),
+                    sample_issue_json("issue-2", "ENG-2")
+                ]),
+                true,
+                Some("cursor-1"),
+            ))
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let err = client
+            .get_all_issues(None, PaginationOptions::default().with_max_items(1))
+            .await
+            .unwrap_err();
+
+        match err {
+            Error::InvalidRequest(msg) => assert!(msg.contains("max_items")),
+            other => panic!("expected Error::InvalidRequest, got {other:?}"),
+        }
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn get_all_teams_honors_a_custom_page_size_and_stops_on_a_single_page() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            // PartialJson matches on structure/value regardless of key order,
+            // unlike a literal-position regex — robust even if serde_json's
+            // key ordering ever changes (e.g. the `preserve_order` feature).
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "variables": { "first": 7 }
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "data": {
+                        "teams": {
+                            "nodes": [sample_team_json("team-1", "ENG")],
+                            "pageInfo": {
+                                "hasNextPage": false,
+                                "hasPreviousPage": false,
+                                "startCursor": null,
+                                "endCursor": null
+                            }
+                        }
+                    },
+                    "errors": null
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let teams = client
+            .get_all_teams(PaginationOptions::default().with_page_size(7))
+            .await
+            .unwrap();
+
+        assert_eq!(teams.len(), 1);
+        assert_eq!(teams[0].key, "ENG");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn get_all_team_issues_scopes_the_request_to_the_team() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .match_body(mockito::Matcher::Regex(
+                r#""filter":\{"team":\{"id":\{"eq":"team-1"\}\}\}"#.to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(issues_page(
+                json!([sample_issue_json("issue-1", "ENG-1")]),
+                false,
+                None,
+            ))
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let issues = client
+            .get_all_team_issues("team-1", PaginationOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(issues.len(), 1);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn get_all_projects_paginates_through_get_projects() {
+        let mut server = mockito::Server::new_async().await;
+
+        fn projects_page(node_id: &str, has_next_page: bool, end_cursor: Option<&str>) -> String {
+            json!({
+                "data": {
+                    "projects": {
+                        "nodes": [{
+                            "id": node_id,
+                            "name": "herdr-linear",
+                            "description": null,
+                            "url": "https://linear.app/talent-factory/project/herdr-linear",
+                            "leadId": null,
+                            "lead": null,
+                            "status": {
+                                "id": "status-1",
+                                "name": "Backlog",
+                                "type": "backlog"
+                            },
+                            "createdAt": "2026-01-01T00:00:00Z",
+                            "updatedAt": "2026-01-01T00:00:00Z",
+                            "startDate": null,
+                            "targetDate": null
+                        }],
+                        "pageInfo": {
+                            "hasNextPage": has_next_page,
+                            "hasPreviousPage": false,
+                            "startCursor": null,
+                            "endCursor": end_cursor
+                        }
+                    }
+                },
+                "errors": null
+            })
+            .to_string()
+        }
+
+        let page1 = server
+            .mock("POST", "/graphql")
+            .match_body(mockito::Matcher::Regex(r#""after":null"#.to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(projects_page("project-1", true, Some("cursor-1")))
+            .create_async()
+            .await;
+
+        let page2 = server
+            .mock("POST", "/graphql")
+            .match_body(mockito::Matcher::Regex(r#""after":"cursor-1""#.to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(projects_page("project-2", false, None))
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let projects = client
+            .get_all_projects(None, PaginationOptions::default())
+            .await
+            .unwrap();
+
+        let ids: Vec<&str> = projects.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, vec!["project-1", "project-2"]);
+        page1.assert_async().await;
+        page2.assert_async().await;
+    }
+
+    // --- get_all_* auto-pagination: edge cases added on review -----------
+
+    #[tokio::test]
+    async fn get_all_issues_errors_when_has_next_page_is_true_but_end_cursor_is_missing() {
+        // API contract violation: `hasNextPage: true` must always be paired
+        // with an `endCursor` to continue from. Regression test for the fix
+        // that turned this from a silent `Ok(items)` truncation into a loud
+        // `Err` — see `paginate_all`'s final `match` arm.
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(issues_page(
+                json!([sample_issue_json("issue-1", "ENG-1")]),
+                true,
+                None,
+            ))
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let err = client
+            .get_all_issues(None, PaginationOptions::default())
+            .await
+            .unwrap_err();
+
+        match err {
+            Error::InvalidRequest(msg) => {
+                assert!(msg.contains("end_cursor"), "unexpected message: {msg}")
+            }
+            other => panic!("expected Error::InvalidRequest, got {other:?}"),
+        }
+        // Aborts rather than issuing a second, cursor-less request.
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn get_all_issues_requests_the_default_page_size_on_the_wire() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "variables": { "first": DEFAULT_PAGE_SIZE }
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(issues_page(json!([]), false, None))
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        client
+            .get_all_issues(None, PaginationOptions::default())
+            .await
+            .unwrap();
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn get_all_issues_succeeds_when_the_final_page_lands_exactly_on_max_items() {
+        // The final, completing page pushes `items.len()` to exactly
+        // `max_items` — this must succeed, not abort: the cap guards against
+        // runaway pagination, not against a correctly-sized finished result.
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(issues_page(
+                json!([
+                    sample_issue_json("issue-1", "ENG-1"),
+                    sample_issue_json("issue-2", "ENG-2")
+                ]),
+                false,
+                None,
+            ))
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let issues = client
+            .get_all_issues(None, PaginationOptions::default().with_max_items(2))
+            .await
+            .unwrap();
+
+        assert_eq!(issues.len(), 2);
+        mock.assert_async().await;
+    }
+
+    // Note: `get_all_issues_aborts_when_the_item_cap_is_hit` (above) already
+    // covers "still aborts when max_items is exceeded and more pages
+    // remain" — that's the strictly-over-cap counterpart to the
+    // exactly-on-cap success case just above.
+
+    #[tokio::test]
+    async fn get_all_issues_succeeds_when_the_last_page_lands_exactly_on_max_pages() {
+        let mut server = mockito::Server::new_async().await;
+
+        let page1 = server
+            .mock("POST", "/graphql")
+            .match_body(mockito::Matcher::Regex(r#""after":null"#.to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(issues_page(
+                json!([sample_issue_json("issue-1", "ENG-1")]),
+                true,
+                Some("cursor-1"),
+            ))
+            .create_async()
+            .await;
+
+        let page2 = server
+            .mock("POST", "/graphql")
+            .match_body(mockito::Matcher::Regex(r#""after":"cursor-1""#.to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(issues_page(
+                json!([sample_issue_json("issue-2", "ENG-2")]),
+                false,
+                None,
+            ))
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let issues = client
+            .get_all_issues(None, PaginationOptions::default().with_max_pages(2))
+            .await
+            .unwrap();
+
+        assert_eq!(issues.len(), 2);
+        page1.assert_async().await;
+        page2.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn get_all_issues_rejects_a_zero_max_pages_without_making_any_request() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(issues_page(json!([]), false, None))
+            .expect(0)
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let err = client
+            .get_all_issues(None, PaginationOptions::default().with_max_pages(0))
+            .await
+            .unwrap_err();
+
+        match err {
+            Error::InvalidRequest(msg) => assert!(msg.contains("max_pages")),
+            other => panic!("expected Error::InvalidRequest, got {other:?}"),
+        }
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn get_all_issues_rejects_a_zero_max_items_without_making_any_request() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(issues_page(json!([]), false, None))
+            .expect(0)
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let err = client
+            .get_all_issues(None, PaginationOptions::default().with_max_items(0))
+            .await
+            .unwrap_err();
+
+        match err {
+            Error::InvalidRequest(msg) => assert!(msg.contains("max_items")),
+            other => panic!("expected Error::InvalidRequest, got {other:?}"),
+        }
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn get_all_issues_rejects_a_non_positive_page_size_without_making_any_request() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(issues_page(json!([]), false, None))
+            .expect(0)
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let err = client
+            .get_all_issues(None, PaginationOptions::default().with_page_size(0))
+            .await
+            .unwrap_err();
+
+        match err {
+            Error::InvalidRequest(msg) => assert!(msg.contains("page_size")),
+            other => panic!("expected Error::InvalidRequest, got {other:?}"),
+        }
         mock.assert_async().await;
     }
 }

@@ -96,27 +96,54 @@ client.get_viewer().await?  // Get current authenticated user
 ### Teams
 
 ```rust
-client.get_teams(limit, after).await?           // List all teams
+client.get_teams(limit, after).await?           // List one page of teams
 client.get_team("team_id").await?               // Get single team
-client.get_team_issues("team_id", limit).await? // Get team's issues
+client.get_team_issues("team_id", limit).await? // Get team's issues (one page)
+client.get_all_teams(options).await?            // Fetch every team, auto-paginated
 ```
 
 ### Issues
 
 ```rust
-client.get_issues(filter, limit, after).await?  // List issues (with optional filter)
+client.get_issues(filter, limit, after).await?  // List one page of issues (with optional filter)
 client.get_issue("issue_id").await?             // Get single issue
 client.create_issue(title, team_id, description, priority).await?  // Create issue
 client.update_issue("issue_id", updates).await? // Update issue
 client.add_comment("issue_id", "body").await?   // Add comment to issue
+client.get_all_issues(filter, options).await?   // Fetch every matching issue, auto-paginated
+client.get_all_team_issues("team_id", options).await? // Fetch every issue for a team, auto-paginated
 ```
 
 ### Projects & Cycles
 
 ```rust
-client.get_projects(filter, limit, after).await? // List projects
+client.get_projects(filter, limit, after).await? // List one page of projects
 client.get_cycles("team_id", limit).await?      // Get team's cycles
 client.get_workflow_states("team_id").await?    // Get team's workflow states
+client.get_all_projects(filter, options).await? // Fetch every matching project, auto-paginated
+```
+
+### Auto-Pagination
+
+The `get_all_*` methods above transparently page through their single-page
+counterparts, following the API's cursor until every result has been
+fetched. Configure page size and safety caps via `PaginationOptions`
+(defaults: page size 50, max 100 pages, max 10,000 items — a call that
+would exceed either cap returns `Error::InvalidRequest` instead of looping
+or silently truncating):
+
+```rust
+use herdr_linear::PaginationOptions;
+
+// Defaults are fine for most cases:
+let all_issues = client.get_all_issues(None, PaginationOptions::default()).await?;
+
+// Tune page size and/or safety caps as needed:
+let options = PaginationOptions::default()
+    .with_page_size(100)
+    .with_max_pages(500)
+    .with_max_items(50_000);
+let all_projects = client.get_all_projects(None, options).await?;
 ```
 
 ### Raw Queries

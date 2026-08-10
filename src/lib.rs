@@ -29,6 +29,6 @@ pub mod queries;
 #[cfg(feature = "plugin")]
 pub mod plugin;
 
-pub use client::LinearClient;
+pub use client::{LinearClient, PaginationOptions};
 pub use error::{Error, Result};
 pub use models::*;
