@@ -216,6 +216,32 @@ match client.get_viewer().await {
 panel you can open as a split pane or a tab from inside a Herdr session. Browsing
 issues is read-only; pressing `<Enter>` on a selected issue is not — see "Use" below.
 
+<table>
+<tr>
+<td width="33%">
+
+**Menu**
+
+![Plugin menu: My Issues, Project Issues, Team Issues](docs/screenshots/menu.png)
+
+</td>
+<td width="33%">
+
+**Issue detail**
+
+![Project Issues list with a Markdown-rendered issue detail pane](docs/screenshots/issue-detail.png)
+
+</td>
+<td width="33%">
+
+**Implement on `<Enter>`**
+
+![`<Enter>` on a selected issue starting a coding agent in a new herdr tab](docs/screenshots/implement-flow.png)
+
+</td>
+</tr>
+</table>
+
 ### Install
 
 ```bash
