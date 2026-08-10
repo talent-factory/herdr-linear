@@ -23,9 +23,13 @@ $ErrorActionPreference = 'Continue'
 
 # PowerShell 5.1 otherwise decodes herdr's UTF-8 JSON with the legacy console code page;
 # non-ASCII pane titles or paths can corrupt the JSON and trigger the OPEN fallback.
-$Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-[Console]::OutputEncoding = $Utf8NoBom
-$OutputEncoding = $Utf8NoBom
+try {
+    $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [Console]::OutputEncoding = $Utf8NoBom
+    $OutputEncoding = $Utf8NoBom
+} catch {
+    # Best-effort only -- never let a redirected/piped stdout abort the launcher.
+}
 
 $HerdrBin = if ($env:HERDR_BIN_PATH) { $env:HERDR_BIN_PATH } else { 'herdr' }
 
@@ -81,7 +85,7 @@ function Open-Pane {
         # the binary never starts. `& "<path>"` executes it; the `\"` escaping survives
         # Windows PowerShell 5.1's native-arg quote-stripping so herdr receives the
         # quotes intact.
-        & $HerdrBin pane run $np "& `"$LinearBin`""
+        & $HerdrBin pane run $np "& \`"$LinearBin\`""
         # Label it so a later invocation's launch-decision recognises it (best-effort).
         & $HerdrBin pane rename $np Linear *> $null
     }
