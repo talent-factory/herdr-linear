@@ -75,10 +75,10 @@ Closed out ahead of the original September estimate. Tracked as issues in the
 - [x] Fixed implement-prompt confirmation false-positives when agent startup
       outlasts the fixed 800ms window (TF-619)
 
-**Known gap**: `execute_batch` (TF-611) isn't wired into `main.rs`'s
-multi-issue implement flow yet — it's still explicitly sequential. Performance
-benchmarks and open-ended "user feedback incorporation" were dropped from this
-phase's original scope; benchmarks move to Phase 2a below.
+Performance benchmarks and open-ended "user feedback incorporation" were
+dropped from this phase's original scope; benchmarks move to Phase 2a below.
+The one loose end this phase left — `execute_batch` (TF-611) not yet wired
+into `main.rs`'s multi-issue implement flow — closed via TF-622 (Phase 2a).
 
 ### Phase 2a: Filtering, Batching & Performance Foundations
 
@@ -87,7 +87,7 @@ phase's original scope; benchmarks move to Phase 2a below.
 (Phase 2a milestone). Closes out Phase 1.7's two loose ends, then delivers the
 first slice of Phase 2's "Filtering & Search".
 
-- [ ] Wire `execute_batch` (TF-611) into `main.rs`'s multi-issue implement
+- [x] Wire `execute_batch` (TF-611) into `main.rs`'s multi-issue implement
       flow, replacing its still-sequential per-issue loop (TF-622)
 - [ ] Performance benchmarks (`criterion`) for pagination, batch execution,
       and rate-limit retry (TF-623)
@@ -112,7 +112,8 @@ TF-615→616→617's dependency chain.
   - Project change events
 
 - [ ] **Batch Operations**
-  - Efficient multi-issue queries (beyond the implement flow — see Phase 2a)
+  - Efficient multi-issue queries (beyond the implement flow, which now runs
+    through `execute_batch` — see Phase 2a/TF-622)
   - Transaction support
 
 - [ ] **Filtering & Search** — first slice in progress, see Phase 2a above
@@ -201,10 +202,9 @@ TF-615→616→617's dependency chain.
 ### Current (Will be addressed)
 
 1. **No Webhook Support**: Events must be polled
-2. **Limited Batch Operations**: `main.rs`'s multi-issue implement flow is
-   still sequential — the bounded-concurrency primitive it would use
-   (`LinearClient::execute_batch`) shipped in Phase 1.7 (TF-611) but isn't
-   wired in yet
+2. **Limited Batch Operations**: `execute_batch` (TF-611) is wired into
+   `main.rs`'s multi-issue implement flow (TF-622); bulk issue updates and
+   multi-issue queries elsewhere still go one request at a time
 3. **No Offline Mode**: Requires live connection
 
 ### By Design

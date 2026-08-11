@@ -829,8 +829,10 @@ const MAX_STATUS_DETAILS: usize = 8;
 /// caller uses to decide whether to clear the marked-issue selection) is unit-testable without
 /// spawning a process or a Linear client, the same way [`status_with_warnings`] already is.
 ///
-/// `results` is `(issue.identifier, outcome)` pairs in the order the issues were processed
-/// (list order — see `App::marked_issues`). The summary is `"N/M started"`; every issue that
+/// `results` is `(issue.identifier, outcome)` pairs in list order (see `App::marked_issues`) —
+/// since [`implement_many`] (TF-622) runs issues concurrently, that's list order regardless of
+/// completion order, guaranteed by `execute_batch`'s use of `buffered()` rather than by issues
+/// being processed one after another. The summary is `"N/M started"`; every issue that
 /// didn't start or finished with a warning is appended as a semicolon-separated
 /// `"<identifier>: <message>"` segment after it (up to [`MAX_STATUS_DETAILS`], see its doc),
 /// rather than one banner per issue. Within that detail list, `Failed` entries are always kept
@@ -878,18 +880,59 @@ fn summarize_many(
     (status, started == total)
 }
 
+/// Runs [`implement_one`] for every issue in `issues` under the same already-resolved `command`,
+/// concurrently, via [`herdr_linear::LinearClient::execute_batch`] (TF-622) — each issue gets its
+/// own herdr tab/pane (see [`implement_one`]'s per-issue `agent_name`), so the interactive
+/// `herdr agent wait`/`agent send`/`agent read` cycles for different issues don't target the same
+/// pane and are safe to interleave. `execute_batch` is called with `None` concurrency, i.e. its
+/// own default cap (5) — deliberately not surfaced as config here; revisit only if a real need
+/// shows up. Each future owns its `issue` and carries its `identifier` through to the returned
+/// tuple, so pairing an outcome back up with the issue it belongs to doesn't rely on
+/// `execute_batch` preserving input order (it does, via `buffered()`, but this stays correct even
+/// if that ever changed) — a batch item's *value-level* failure can only ever affect its own
+/// tuple, never another item's. `implement_one` never actually returns `Err`; the `Ok(...)`
+/// wrapper below exists purely to match `execute_batch`'s `Fut: Future<Output =
+/// herdr_linear::Result<T>>` bound, and the `.expect(...)` on it can't panic today as a result —
+/// but that per-item isolation is only true for `Err` values, not for an actual Rust panic mid-poll
+/// (a bug introduced later, or one surfacing from a dependency): `execute_batch`'s own doc notes a
+/// panicking future unwinds through the whole batch like any other `join`-style combinator, same
+/// as the sequential loop this replaced, so a hypothetical panic here would still lose every
+/// in-flight issue's outcome, not just the panicking one's. Split out from
+/// [`start_implementation_many`] (rather than inlined there) so it can be
+/// driven directly in tests against a fake `herdr_bin` path, the same way [`implement_one`]
+/// already is — `start_implementation_many` itself resolves `herdr_bin` from the environment via
+/// [`plugin::herdr_cli::herdr_bin`], which isn't something a test can point at a fake script.
+async fn implement_many(
+    herdr_bin: &str,
+    client: &herdr_linear::LinearClient,
+    issues: Vec<herdr_linear::Issue>,
+    command: &plugin::implement::ValidatedAgentCommand,
+) -> Vec<(String, ImplementOutcome)> {
+    let requests = issues.into_iter().map(|issue| async move {
+        let identifier = issue.identifier.clone();
+        let outcome = implement_one(herdr_bin, client, &issue, command).await;
+        Ok::<_, herdr_linear::Error>((identifier, outcome))
+    });
+    client
+        .execute_batch(requests.collect(), None)
+        .await
+        .into_iter()
+        .map(|outcome| {
+            outcome.expect("implement_one's future is infallible — see the `Ok(...)` wrapper above")
+        })
+        .collect()
+}
+
 /// Multi-issue `<Enter>` flow (TF-590, one or more issues marked —
 /// [`plugin::app::Action::ImplementMany`]): resolves the coding-agent command once via
 /// [`resolve_validated_agent_command`] (not once per issue — see that function's doc for the
-/// cross-issue command drift this avoids), then runs [`implement_one`] for every issue under
-/// that one command, sequentially — not concurrently, since each run drives the same interactive
-/// `herdr agent wait`/`agent send`/`agent read` cycle main.rs already serializes for a single
-/// issue, and herdr's own per-pane semantics aren't documented as safe to interleave — then
-/// summarizes the results in one status banner via [`summarize_many`] instead of one banner per
-/// issue. Returns whether every issue started, so the caller (`event_loop`'s
-/// `Action::ImplementMany` arm) only clears the marked-issue selection on a fully successful run
-/// — a partial or total failure leaves the marks intact so the user can retry without re-marking
-/// everything (TF-590).
+/// cross-issue command drift this avoids), then runs every issue under that one command
+/// concurrently via [`implement_many`] (TF-622), and summarizes the results in one status banner
+/// via [`summarize_many`] instead of one banner per issue, with the same per-issue success/failure
+/// detail a fully sequential loop would have produced. Returns whether every issue started, so the
+/// caller (`event_loop`'s `Action::ImplementMany` arm) only clears the marked-issue selection on a
+/// fully successful run — a partial or total failure leaves the marks intact so the user can retry
+/// without re-marking everything (TF-590).
 async fn start_implementation_many(
     app: &mut plugin::app::App,
     client: &herdr_linear::LinearClient,
@@ -915,11 +958,7 @@ async fn start_implementation_many(
         }
     };
 
-    let mut results = Vec::with_capacity(total);
-    for issue in issues {
-        let outcome = implement_one(&herdr_bin, client, &issue, &command).await;
-        results.push((issue.identifier, outcome));
-    }
+    let results = implement_many(&herdr_bin, client, issues, &command).await;
 
     let (status, all_started) = summarize_many(total, results);
     app.set_status(status);
@@ -996,9 +1035,14 @@ fn is_buffered_quit_key(
 /// `update_issue`'s 30s HTTP timeout each, `tab_create`/`pane_close`/`agent_send`/`agent_list`
 /// at `DEFAULT_CLI_TIMEOUT` (15s) each, and `agent_start` at up to `DEFAULT_CLI_TIMEOUT` times
 /// `1 + AGENT_START_NAME_TAKEN_MAX_RETRIES` (TF-590's `agent_name_taken` retry loop, ~45s
-/// worst case, not a flat 15s) — but they're sequential (and, for `Action::ImplementMany`,
-/// repeated once per marked issue — TF-590), so the flow as a whole can run well past any
-/// single step's bound in the worst case. A buffered `q` *or* Ctrl+C (see
+/// worst case, not a flat 15s) — but within one issue they're sequential, so the flow as a
+/// whole can run well past any single step's bound in the worst case. For `Action::ImplementMany`
+/// this per-issue budget no longer simply multiplies by the marked-issue count: since TF-622,
+/// [`implement_many`] runs issues concurrently through `execute_batch`, bounded to
+/// `DEFAULT_BATCH_CONCURRENCY` (5) at a time, so the worst case is closer to `ceil(marked_count /
+/// 5)` waves of the per-issue budget rather than one wave per issue — still well past any single
+/// step's bound for more than a handful of marked issues, which is what matters here. A buffered
+/// `q` *or* Ctrl+C (see
 /// [`is_buffered_quit_key`]) is honored instead of silently discarded (returns `true`), since
 /// the user very plausibly pressed one of them because the panel looked hung. Every other
 /// buffered key (Space, `r`, `c`, arrows, ...) is intentionally dropped with no replay — the
@@ -2328,6 +2372,163 @@ esac
         assert!(
             message.contains("failed to load workflow states"),
             "unexpected message: {message}"
+        );
+    }
+
+    /// Writes a fake `herdr` handling exactly the calls [`implement_many`] drives per issue up to
+    /// (and stopping at) its first real side effect: `agent list` responds successfully but is
+    /// never actually invoked by
+    /// [`implement_many_runs_issues_concurrently_up_to_the_default_batch_limit`] below — that test
+    /// drives `implement_many` directly with an already-built `command`, bypassing
+    /// `resolve_validated_agent_command` (the only caller that would issue `agent list`); the
+    /// branch is kept here only so this fake `herdr` would also serve a test that went through
+    /// that path instead. `tab create` sleeps `delay` before succeeding — recording, in
+    /// `<dir>/peaks/<pid>`, how many `tab create` calls were in flight at once when it started —
+    /// and `agent start` then fails immediately, echoing the requested agent name (`$3`) back in
+    /// its error message so a caller can verify each `ImplementOutcome::Failed` stayed paired with
+    /// the issue it actually belongs to, not just any issue sharing the same generic failure text.
+    /// This makes `implement_one` return `Failed` right after `tab create` without ever reaching
+    /// `get_workflow_states`/`update_issue`/`agent_wait`/the prompt-stability poll (TF-579's ~2s
+    /// floor — see `PROMPT_SEND_STABILITY_DURATION`), keeping the probe fast and its timing signal
+    /// attributable to `tab create`'s concurrency alone. The "in flight" count comes from each
+    /// invocation creating a uniquely-named file (`$$`, its own PID) under `<dir>/inflight` before
+    /// sleeping and removing it after — no cross-process locking needed, since every writer only
+    /// ever touches its own file; `peak_concurrency` below then takes the max over every recorded
+    /// snapshot once the whole batch has finished.
+    #[cfg(unix)]
+    fn write_batch_concurrency_probe_script(
+        delay: std::time::Duration,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        write_fake_herdr_script(&format!(
+            r#"case "$1 $2" in
+  "agent list")
+    echo '{{"result":{{"agents":[{{"agent":"claude"}}]}}}}'
+    exit 0
+    ;;
+  "tab create")
+    script_dir=$(dirname "$0")
+    mkdir -p "$script_dir/inflight" "$script_dir/peaks"
+    : > "$script_dir/inflight/$$"
+    count=$(ls "$script_dir/inflight" | wc -l | tr -d ' ')
+    echo "$count" > "$script_dir/peaks/$$"
+    sleep {delay_secs}
+    rm -f "$script_dir/inflight/$$"
+    echo '{{"result":{{"tab":{{"tab_id":"t1","label":"batch"}},"root_pane":{{"pane_id":"p1"}}}}}}'
+    exit 0
+    ;;
+  "agent start")
+    echo "{{\"error\":{{\"message\":\"agent start intentionally fails for the concurrency probe (name: $3)\"}}}}"
+    exit 1
+    ;;
+  *)
+    echo '{{"error":{{"message":"unexpected herdr call: $1 $2"}}}}'
+    exit 1
+    ;;
+esac
+"#,
+            delay_secs = delay.as_secs_f64()
+        ))
+    }
+
+    /// Highest value recorded across every `<dir>/peaks/*` snapshot written by the script above —
+    /// how many `tab create` calls were simultaneously in flight at their most overlapped moment.
+    /// `#[cfg(unix)]` to match its sole caller (the script above uses `$$`/PID-named files, a
+    /// Unix-only technique) rather than being compiled in vain on non-Unix targets.
+    #[cfg(unix)]
+    fn peak_concurrency(dir: &tempfile::TempDir) -> usize {
+        let peaks_dir = dir.path().join("peaks");
+        std::fs::read_dir(&peaks_dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| std::fs::read_to_string(entry.ok()?.path()).ok())
+                    .filter_map(|content| content.trim().parse::<usize>().ok())
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0)
+    }
+
+    /// TF-622: `implement_many` must actually run issues through `execute_batch` rather than a
+    /// sequential loop — bounded to `execute_batch`'s own default concurrency cap (5, see
+    /// `client.rs`'s `DEFAULT_BATCH_CONCURRENCY`), not left unbounded and not silently still
+    /// sequential. Uses more issues than the cap so the two failure modes stay distinguishable:
+    /// a sequential loop would show a peak of 1 (this test would fail the ">1" assertion); an
+    /// unbounded batch would show a peak of `ISSUE_COUNT` (failing the "<= 5" assertion). These
+    /// peak-concurrency assertions are the load-bearing check and are deterministic — they depend
+    /// only on how many `tab create` subprocesses were ever alive at the same instant, never on a
+    /// wall-clock margin. A single `elapsed >= delay` sanity check backs them up (mirroring
+    /// `client.rs`'s own `execute_batch_bounds_concurrency_to_the_configured_limit` test, one layer
+    /// up) but deliberately stops short of asserting an *upper* elapsed-time bound: a previous
+    /// version of this test also asserted `elapsed < ~2 waves of delay`, which is redundant with
+    /// `peak <= DEFAULT_BATCH_CONCURRENCY` for catching "still sequential"/"unbounded" and flaked
+    /// under load (observed once across a full `cargo test --all-features` run, where real
+    /// subprocess-spawn overhead across ~500 tests pushed a run past the window) without ever
+    /// catching a real regression — see PR #37 review discussion. Also verifies each returned
+    /// `(identifier, outcome)` pair stayed correctly matched: the fake `agent start` above echoes
+    /// the agent name it was invoked with back into its failure message, and
+    /// [`plugin::implement::build_agent_name`] derives that name from `command` plus the issue's
+    /// own identifier, so a pairing bug (e.g. a future refactor that zips `issues` against
+    /// `execute_batch`'s output by position after either side got reordered) would surface here as
+    /// a mismatched name rather than being masked by every issue sharing one generic message.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn implement_many_runs_issues_concurrently_up_to_the_default_batch_limit() {
+        const DEFAULT_BATCH_CONCURRENCY: usize = 5;
+        const ISSUE_COUNT: usize = 2 * DEFAULT_BATCH_CONCURRENCY;
+        let delay = std::time::Duration::from_millis(300);
+
+        let (dir, script) = write_batch_concurrency_probe_script(delay);
+        let client = herdr_linear::LinearClient::new("lin_api_test_key").unwrap();
+        let issues: Vec<_> = (0..ISSUE_COUNT)
+            .map(|i| sample_issue(&format!("TF-{i}")))
+            .collect();
+        let command = plugin::implement::ValidatedAgentCommand::parse("hr".to_string()).unwrap();
+
+        let started = std::time::Instant::now();
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            implement_many(script.to_str().unwrap(), &client, issues, &command),
+        )
+        .await
+        .expect("implement_many hung");
+        let elapsed = started.elapsed();
+
+        assert_eq!(results.len(), ISSUE_COUNT);
+        for (identifier, outcome) in &results {
+            let ImplementOutcome::Failed(message) = outcome else {
+                panic!("expected every issue to fail (agent start always fails): {identifier} -> {outcome:?}");
+            };
+            assert!(
+                message.contains("agent start intentionally fails"),
+                "unexpected failure for {identifier}: {message}"
+            );
+            // Pairing check: the fake `agent start` echoed back the name it was actually invoked
+            // with, which is derived from this same `identifier` — if a future change shuffled
+            // identifiers against the wrong outcome, this issue's expected name wouldn't appear
+            // in its own message.
+            let expected_name = plugin::implement::build_agent_name(command.as_str(), identifier);
+            assert!(
+                message.contains(&expected_name),
+                "outcome for {identifier} doesn't carry its own agent name {expected_name:?} — \
+                 got: {message} (identifier/outcome pairing may be broken)"
+            );
+        }
+
+        let peak = peak_concurrency(&dir);
+        assert!(
+            peak > 1,
+            "peak concurrent `tab create` calls was {peak} — issues are running sequentially, \
+             not through execute_batch"
+        );
+        assert!(
+            peak <= DEFAULT_BATCH_CONCURRENCY,
+            "peak concurrent `tab create` calls was {peak}, above the documented default \
+             concurrency cap of {DEFAULT_BATCH_CONCURRENCY}"
+        );
+        assert!(
+            elapsed >= delay,
+            "completed in {elapsed:?}, faster than a single `tab create` delay of {delay:?} \
+             (too fast — every issue should wait out at least one delay)"
         );
     }
 
