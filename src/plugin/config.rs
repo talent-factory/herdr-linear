@@ -34,6 +34,11 @@ struct ConfigFile {
     /// [`crate::plugin::data::resolve_team_id`] for when this is used (only when the
     /// workspace has more than one team; a single-team workspace never needs it).
     team_id: Option<String>,
+    /// The editor command to use when opening config.toml with `c` (TF-614). If set and
+    /// non-empty, overrides the default editor resolution — see
+    /// [`crate::plugin::editor::resolve_editor_command`]. `None`/unset means default
+    /// (`nvim`, `PATH`) resolution.
+    editor: Option<String>,
 }
 
 /// Reads and parses `config_dir/config.toml`, if `config_dir` is given and the file
@@ -176,6 +181,17 @@ pub fn resolve_team_id_override(config_dir: Option<&Path>) -> Result<Option<Stri
     Ok(team_id)
 }
 
+/// Resolve an `editor` override: `config_dir/config.toml`'s `editor` field, if set and
+/// non-empty. `Ok(None)` means "no override" (callers fall back to the default editor
+/// resolution — see [`crate::plugin::editor::resolve_editor_command`]). Pure function —
+/// callers own reading the real environment (see [`load_editor_override`]).
+pub fn resolve_editor_override(config_dir: Option<&Path>) -> Result<Option<String>> {
+    let editor = read_config_file(config_dir)?
+        .and_then(|file| file.editor)
+        .filter(|cmd| !cmd.trim().is_empty());
+    Ok(editor)
+}
+
 /// Three-way outcome of resolving `config.toml`'s presence/validity — mirrors
 /// [`read_config_file`]'s own `Result<Option<ConfigFile>>` shape (`Ok(None)` = missing,
 /// `Ok(Some(_))` = parsed, `Err(_)` = present but invalid) rather than collapsing it to a
@@ -210,6 +226,7 @@ pub(crate) struct ResolvedConfigSummary {
     pub api_key_set: bool,
     pub agent_command: Option<String>,
     pub team_id: Option<String>,
+    pub editor: Option<String>,
     pub project_overrides: BTreeMap<String, String>,
 }
 
@@ -330,6 +347,7 @@ pub(crate) fn resolved_summary(
             api_key_set: has_env_key,
             agent_command: None,
             team_id: None,
+            editor: None,
             project_overrides: BTreeMap::new(),
         },
         Ok(Some(file)) => {
@@ -343,6 +361,7 @@ pub(crate) fn resolved_summary(
                     .team_id
                     .map(|id| id.trim().to_string())
                     .filter(|id| !id.is_empty()),
+                editor: file.editor.filter(|ed| !ed.trim().is_empty()),
                 project_overrides: file.project_overrides,
             }
         }
@@ -352,6 +371,7 @@ pub(crate) fn resolved_summary(
             api_key_set: false,
             agent_command: None,
             team_id: None,
+            editor: None,
             project_overrides: BTreeMap::new(),
         },
     }
@@ -391,6 +411,14 @@ pub fn load_team_id_override() -> Result<Option<String>> {
     resolve_team_id_override(config_dir.as_deref())
 }
 
+/// Resolve the `editor` override from the real environment:
+/// `$HERDR_PLUGIN_CONFIG_DIR/config.toml`. Thin wrapper around
+/// [`resolve_editor_override`]; called from `main.rs`'s OpenConfig handler.
+pub fn load_editor_override() -> Result<Option<String>> {
+    let config_dir = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR").map(std::path::PathBuf::from);
+    resolve_editor_override(config_dir.as_deref())
+}
+
 /// [`config_path_hint`] resolved against the real environment's `HERDR_PLUGIN_CONFIG_DIR`.
 /// Thin wrapper so callers outside this module (e.g.
 /// [`crate::plugin::data::fetch_current_project_issues`]'s error-message building, and the
@@ -405,8 +433,8 @@ pub fn current_config_path_hint() -> String {
 mod tests {
     use super::{
         api_key_value_line_range, config_path_hint, redact_api_key_value_lines,
-        resolve_agent_command_override, resolve_api_key, resolve_project_id_override,
-        resolve_team_id_override, resolved_summary, ConfigFileStatus,
+        resolve_agent_command_override, resolve_api_key, resolve_editor_override,
+        resolve_project_id_override, resolve_team_id_override, resolved_summary, ConfigFileStatus,
     };
     use std::fs;
 
@@ -839,6 +867,64 @@ mod tests {
     }
 
     #[test]
+    fn reads_editor_from_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.toml"), "editor = \"vim\"\n").unwrap();
+
+        let editor = resolve_editor_override(Some(dir.path())).unwrap();
+
+        assert_eq!(editor, Some("vim".to_string()));
+    }
+
+    #[test]
+    fn returns_none_when_config_file_missing_for_editor() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let editor = resolve_editor_override(Some(dir.path())).unwrap();
+
+        assert_eq!(editor, None);
+    }
+
+    #[test]
+    fn returns_none_when_editor_is_empty_or_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.toml"), "editor = \"   \"\n").unwrap();
+
+        let editor = resolve_editor_override(Some(dir.path())).unwrap();
+
+        assert_eq!(editor, None);
+    }
+
+    #[test]
+    fn returns_none_when_config_file_has_no_editor() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.toml"), "api_key = \"lin_api_x\"\n").unwrap();
+
+        let editor = resolve_editor_override(Some(dir.path())).unwrap();
+
+        assert_eq!(editor, None);
+    }
+
+    #[test]
+    fn returns_none_when_config_dir_is_unknown_for_editor() {
+        let editor = resolve_editor_override(None).unwrap();
+
+        assert_eq!(editor, None);
+    }
+
+    #[test]
+    fn errors_immediately_on_malformed_toml_for_editor() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.toml"), "this is [invalid toml\n").unwrap();
+
+        let err = resolve_editor_override(Some(dir.path())).unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("not valid TOML"));
+        assert!(message.contains(dir.path().to_str().unwrap()));
+    }
+
+    #[test]
     fn resolved_summary_reports_not_found_when_config_dir_is_unknown() {
         let summary = resolved_summary(None, None);
 
@@ -846,6 +932,7 @@ mod tests {
         assert!(!summary.api_key_set);
         assert_eq!(summary.agent_command, None);
         assert_eq!(summary.team_id, None);
+        assert_eq!(summary.editor, None);
         assert!(summary.project_overrides.is_empty());
     }
 
@@ -864,7 +951,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("config.toml"),
-            "api_key = \"lin_api_x\"\nagent_command = \"my-agent\"\nteam_id = \"team-123\"\n\
+            "api_key = \"lin_api_x\"\nagent_command = \"my-agent\"\nteam_id = \"team-123\"\neditor = \"nvim\"\n\
              [project_overrides]\n\"herdr-linear\" = \"proj-1\"\n",
         )
         .unwrap();
@@ -875,6 +962,7 @@ mod tests {
         assert!(summary.api_key_set);
         assert_eq!(summary.agent_command, Some("my-agent".to_string()));
         assert_eq!(summary.team_id, Some("team-123".to_string()));
+        assert_eq!(summary.editor, Some("nvim".to_string()));
         assert_eq!(
             summary.project_overrides.get("herdr-linear"),
             Some(&"proj-1".to_string())

@@ -868,6 +868,12 @@ fn settings_lines_from(
     let agent_command_display = summary.agent_command.as_deref().unwrap_or("(default)");
     lines.push(format!("agent_command    = {agent_command_display}"));
 
+    let editor_display = summary
+        .editor
+        .as_deref()
+        .unwrap_or("(default: nvim if on PATH)");
+    lines.push(format!("editor           = {editor_display}"));
+
     let team_id_display = summary.team_id.as_deref().unwrap_or("Not set");
     lines.push(format!("team_id          = {team_id_display}"));
 
@@ -2182,6 +2188,7 @@ mod tests {
             api_key_set: false,
             agent_command: None,
             team_id: None,
+            editor: None,
             project_overrides: std::collections::BTreeMap::new(),
         };
 
@@ -2205,6 +2212,7 @@ mod tests {
             api_key_set: false,
             agent_command: None,
             team_id: None,
+            editor: None,
             project_overrides: std::collections::BTreeMap::new(),
         };
 
@@ -2227,6 +2235,7 @@ mod tests {
             api_key_set: true,
             agent_command: Some("my-agent".to_string()),
             team_id: Some("team-123".to_string()),
+            editor: Some("vim".to_string()),
             project_overrides,
         };
 
@@ -2236,6 +2245,7 @@ mod tests {
         assert!(lines.contains("✓ Set"));
         assert!(!lines.contains("lin_api_"));
         assert!(lines.contains("my-agent"));
+        assert!(lines.contains("editor           = vim"));
         assert!(lines.contains("team-123"));
         assert!(lines.contains("herdr-linear"));
         assert!(lines.contains("proj-1"));
@@ -2249,6 +2259,7 @@ mod tests {
             api_key_set: false,
             agent_command: None,
             team_id: None,
+            editor: None,
             project_overrides: std::collections::BTreeMap::new(),
         };
 

@@ -11,9 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Auto-paginating `LinearClient` helpers — `get_all_issues`, `get_all_teams`, `get_all_team_issues`, `get_all_projects` — that loop through every page of a query and return the full result set, with a configurable page size and safety caps on total pages/items (TF-609)
 - `LinearClient` now automatically retries requests that fail with `Error::RateLimitExceeded`: it waits the server's `Retry-After` value (falling back to exponential backoff, capped at 60s, when Linear doesn't send a usable one), retries up to 3 total attempts, and still surfaces the original `RateLimitExceeded` error unchanged if the budget is exhausted. Rate limiting is detected both via Linear's documented HTTP 400 + `RATELIMITED` GraphQL error code and via a plain HTTP 429 (kept as a defense-in-depth fallback). Opt out via `LinearClient::with_rate_limit_retry(false)` to keep the old fail-fast behavior (TF-610)
+- `c` (open `config.toml`) now opens `nvim` inside a herdr pane by default — usable over SSH, where the previous OS-default-opener behavior wasn't. Set `editor` in `config.toml` to use a different editor instead; if neither resolves or the herdr pane can't be opened, `c` falls back to the OS's default opener as before. Repeated `c` presses reuse the same editor pane (TF-614)
 
 ### Fixed
 
+- `c` (open `config.toml`) now works from any screen and view state — Menu, a view still
+  loading, a loaded view, and the Error screen alike — instead of only firing after actually
+  hitting an error. The Keybindings help overlay's `c` entry moved from "Error screen" to
+  "Global" to match (TF-614)
 - Implement flow: the prompt-landed confirmation now polls the pane continuously until the
   sent prompt has been visible, with no gaps, for a documented stability window — instead of
   checking at exactly two fixed offsets (500ms, then 800ms later) and declaring success from
