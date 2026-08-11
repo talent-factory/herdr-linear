@@ -40,11 +40,20 @@ pub fn parse_context_cwd(json: Option<&str>) -> Option<PathBuf> {
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or_default();
 
-    raw.focused_pane_cwd
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| raw.workspace_cwd.filter(|s| !s.trim().is_empty()))
-        .or_else(|| raw.cwd.filter(|s| !s.trim().is_empty()))
+    non_blank(raw.focused_pane_cwd)
+        .or_else(|| non_blank(raw.workspace_cwd))
+        .or_else(|| non_blank(raw.cwd))
         .map(PathBuf::from)
+}
+
+/// Trim a candidate field and discard it if that leaves nothing — unlike a bare
+/// `.filter(|s| !s.trim().is_empty())`, this actually returns the trimmed value, so stray
+/// whitespace from the host never survives into the `PathBuf` callers pass on to `git` and the
+/// `herdr` CLI.
+fn non_blank(field: Option<String>) -> Option<String> {
+    field
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Resolve the real working directory from the actual environment: `$HERDR_PLUGIN_CONTEXT_JSON`
@@ -125,6 +134,26 @@ mod tests {
         let json = r#"{"focused_pane_cwd":"","workspace_cwd":"","cwd":""}"#;
 
         assert_eq!(parse_context_cwd(Some(json)), None);
+    }
+
+    #[test]
+    fn whitespace_padded_values_are_trimmed() {
+        // A stray leading/trailing space or newline from whatever produced the host JSON must
+        // not survive into the returned PathBuf — it flows straight into `git`'s `current_dir`
+        // and the `herdr` CLI's `--cwd` argument, neither of which is guaranteed to tolerate it.
+        let json = r#"{"focused_pane_cwd":" /space/verba \n"}"#;
+
+        assert_eq!(
+            parse_context_cwd(Some(json)),
+            Some(PathBuf::from("/space/verba"))
+        );
+    }
+
+    #[test]
+    fn whitespace_only_values_are_skipped_after_trimming() {
+        let json = r#"{"focused_pane_cwd":"   ","workspace_cwd":"/space"}"#;
+
+        assert_eq!(parse_context_cwd(Some(json)), Some(PathBuf::from("/space")));
     }
 
     #[test]
