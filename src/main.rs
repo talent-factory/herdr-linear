@@ -1248,12 +1248,24 @@ esac
     #[tokio::test]
     async fn open_config_in_herdr_pane_does_not_close_a_pane_when_agent_replaced_the_root_pane() {
         // `agent_start`'s pane id equals the tab's root pane id here (herdr replaced rather
-        // than split) — `pane close` must not run at all; the script fails loudly if it does.
+        // than split) — `pane close` must not run at all. A marker file (rather than just a
+        // loudly-failing script) proves this: `pane_close` failures are unconditionally
+        // swallowed into `tracing::warn!` elsewhere in this function (see the sibling test
+        // `..._succeeds_even_when_cleanup_pane_close_fails`), so "the script failed" and "the
+        // script never ran" are indistinguishable from `result` alone — both yield `Ok(())`.
+        // A separate tempdir (rather than the herdr script's own) sidesteps the
+        // chicken-and-egg problem of needing the marker path before `write_editor_herdr_script`
+        // (which owns and returns the script's tempdir) has run.
+        let marker_dir = tempfile::tempdir().unwrap();
+        let marker_path = marker_dir.path().join("pane_close_was_called");
         let (_dir, script) = write_editor_herdr_script(
             r#"echo '{"error":{"message":"agent target config not found"}}'; exit 1"#,
             r#"echo '{"result":{"tab":{"tab_id":"t2","label":"config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
             r#"echo '{"result":{"agent":{"pane_id":"p9","tab_id":"t2"}}}'; exit 0"#,
-            r#"echo 'pane close should not run'; exit 1"#,
+            &format!(
+                r#"touch "{}"; echo 'pane close should not run'; exit 1"#,
+                marker_path.to_str().unwrap()
+            ),
         );
 
         let result = open_config_in_herdr_pane(
@@ -1264,6 +1276,10 @@ esac
         .await;
 
         assert_eq!(result, Ok(()));
+        assert!(
+            !marker_path.exists(),
+            "pane_close must not run when agent_start's pane replaced the tab's root pane"
+        );
     }
 
     #[cfg(unix)]
