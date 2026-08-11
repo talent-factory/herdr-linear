@@ -42,7 +42,10 @@ pub fn find_on_path(path_env: Option<&str>, binary: &str) -> Option<PathBuf> {
 /// 1. If `config_editor` is set (from `config.toml`'s `editor` field), use it.
 /// 2. Otherwise, if `nvim` is found on `PATH`, use `"nvim"`.
 /// 3. Otherwise, return `None` (caller falls back to OS default opener).
-pub fn resolve_editor_command(config_editor: Option<String>, path_env: Option<&str>) -> Option<String> {
+pub fn resolve_editor_command(
+    config_editor: Option<String>,
+    path_env: Option<&str>,
+) -> Option<String> {
     config_editor.or_else(|| find_on_path(path_env, "nvim").map(|_| "nvim".to_string()))
 }
 
@@ -141,7 +144,10 @@ mod tests {
 
     #[test]
     fn build_editor_argv_pairs_the_command_with_the_config_path() {
-        let argv = build_editor_argv("nvim", Path::new("/home/user/.config/herdr-linear/config.toml"));
+        let argv = build_editor_argv(
+            "nvim",
+            Path::new("/home/user/.config/herdr-linear/config.toml"),
+        );
 
         assert_eq!(
             argv,
