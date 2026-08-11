@@ -2232,7 +2232,7 @@ mod tests {
             api_key_set: true,
             agent_command: Some("my-agent".to_string()),
             team_id: Some("team-123".to_string()),
-            editor: None,
+            editor: Some("vim".to_string()),
             project_overrides,
         };
 
@@ -2242,6 +2242,7 @@ mod tests {
         assert!(lines.contains("✓ Set"));
         assert!(!lines.contains("lin_api_"));
         assert!(lines.contains("my-agent"));
+        assert!(lines.contains("vim"));
         assert!(lines.contains("team-123"));
         assert!(lines.contains("herdr-linear"));
         assert!(lines.contains("proj-1"));
