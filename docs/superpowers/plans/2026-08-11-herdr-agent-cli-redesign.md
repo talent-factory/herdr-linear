@@ -225,10 +225,11 @@ git commit -m "fix: agent_wait --status to --until, rename agent_send to agent_p
 **Files:**
 - Modify: `src/plugin/herdr_cli.rs`
 - Modify: `src/error.rs`
+- Modify: `src/plugin/editor.rs`
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: nothing new — this is pure deletion. `AgentStarted`, `agent_start`, `run_for_agent_start`, `parse_agent_started`, `next_name_taken_retry`, `AGENT_START_NAME_TAKEN_MAX_RETRIES`, `parse_agent_name_taken_error`, `Error::AgentNameTaken` all go away. Callers are fixed in Tasks 4 and 5.
+- Produces: nothing new — this is pure deletion. `AgentStarted`, `agent_start`, `run_for_agent_start`, `parse_agent_started`, `next_name_taken_retry`, `AGENT_START_NAME_TAKEN_MAX_RETRIES`, `parse_agent_name_taken_error`, `Error::AgentNameTaken`, and `agent_focus` all go away. Both of `agent_start`'s callers (Task 5, Task 6) and `agent_focus`'s one caller (Task 5) are already rewritten — by this point in the plan, none of these are called anywhere outside their own now-to-be-deleted tests.
 
 - [ ] **Step 1: Delete these items from `src/plugin/herdr_cli.rs`** (in file order):
   - The `AgentStarted` struct (lines ~64-69).
@@ -237,6 +238,7 @@ git commit -m "fix: agent_wait --status to --until, rename agent_send to agent_p
   - `parse_agent_started` (lines ~347-368).
   - `parse_agent_name_taken_error` (lines ~198-243).
   - `run_for_agent_start` (lines ~343-349).
+  - `agent_focus` in its entirety, and its doc comment (the whole function — Task 5 already rewrote its only caller, `open_config_in_herdr_pane`, to use a `tab list`/label-match check instead, so this is now fully orphaned). Also delete its two dedicated unit tests in the `#[cfg(test)] mod tests` block (search for `agent_focus(` — two tests call it directly, asserting success and error-propagation respectively).
 
 - [ ] **Step 2: Simplify `interpret_output`/`run_with_timeout`/`run`** — remove the now-unused `check_agent_name_taken: bool` parameter and its call-site branch:
 
@@ -341,16 +343,49 @@ with:
 //! `open_config_in_herdr_pane` to open/reuse a config-editor tab the same way.
 ```
 
-- [ ] **Step 6: Run tests**
+- [ ] **Step 6: Fix `agent_focus`'s two now-stale mentions in `src/plugin/editor.rs`** (Step 1 deleted the function itself; these are separate, purely descriptive doc-comment references to it that are now inaccurate) —
 
-Run: `cargo build --all-targets 2>&1 | grep -E "^error"`
-Expected: errors only in `main.rs` (call sites fixed in Tasks 4-5) — no errors remaining in `herdr_cli.rs`/`error.rs` themselves.
+`EDITOR_AGENT_NAME`'s doc comment: change
 
-- [ ] **Step 7: Commit**
+```
+/// *same* pane rather than each spawning its own — that's the whole point of
+/// `main.rs::open_config_in_herdr_pane` trying `agent_focus` before creating a new tab.
+```
+
+to
+
+```
+/// *same* pane rather than each spawning its own — that's the whole point of
+/// `main.rs::open_config_in_herdr_pane` checking `herdr_cli::find_existing_editor_tab` before
+/// creating a new tab.
+```
+
+`resolve_editor_command`'s doc comment: change
+
+```
+///    module's `main.rs` callers confirm the launched process actually stays up), and, on the
+///    `c` keybinding's every-later-press `agent_focus` reuse, keep repeating that same silent
+///    no-op indefinitely.
+```
+
+to
+
+```
+///    module's `main.rs` callers confirm the launched process actually stays up), and, on the
+///    `c` keybinding's every-later-press tab-reuse check, keep repeating that same silent
+///    no-op indefinitely.
+```
+
+- [ ] **Step 7: Run tests**
+
+Run: `cargo build --all-features --all-targets 2>&1 | grep -E "^error"`
+Expected: **empty output — the crate now builds fully clean everywhere.** Both of `agent_start`'s callers (Task 5, Task 6) and `agent_focus`'s caller (Task 5) were already rewritten before this task ran, so their deletion introduces no new breakage; this is the last task in this plan expected to change the crate's build-error count.
+
+- [ ] **Step 8: Commit**
 
 ```bash
-git add src/plugin/herdr_cli.rs src/error.rs
-git commit -m "refactor: remove agent_start and the now-unreachable agent_name_taken retry logic (TF-624)"
+git add src/plugin/herdr_cli.rs src/error.rs src/plugin/editor.rs
+git commit -m "refactor: remove agent_start/agent_focus and the now-unreachable agent_name_taken retry logic (TF-624)"
 ```
 
 ---
