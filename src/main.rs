@@ -384,7 +384,7 @@ async fn send_prompt_until_visible_with(
 ) -> std::result::Result<(), String> {
     let mut last_err = None;
     for attempt in 1..=attempts {
-        if let Err(err) = plugin::herdr_cli::agent_send(herdr_bin, pane_id, prompt).await {
+        if let Err(err) = plugin::herdr_cli::agent_prompt(herdr_bin, pane_id, prompt).await {
             tracing::debug!(
                 "send_prompt_until_visible: attempt {attempt} failed to send ({err}), retrying"
             );
@@ -483,10 +483,9 @@ async fn resolve_validated_agent_command(
 /// ([`start_implementation`] for the single-issue case, [`start_implementation_many`] for the
 /// marked-multiple case) can turn it into whatever status banner fits their situation,
 /// mirroring `ensure_loaded`'s "inline error instead of crashing" philosophy. Any non-fatal
-/// warnings collected along the way (the agent landing in an unexpected tab, closing the tab's
-/// redundant root pane, workflow-state lookup, the actual state transition) are preserved in
-/// *every* terminal outcome, not just the final success case — a failure late in the flow (e.g.
-/// `agent_wait` timing out) must not hide
+/// warnings collected along the way (a failed cosmetic agent rename, workflow-state lookup, the
+/// actual state transition) are preserved in *every* terminal outcome, not just the final
+/// success case — a failure late in the flow (e.g. `agent_wait` timing out) must not hide
 /// an earlier one (e.g. the issue never actually reaching "In Progress"). See
 /// docs/superpowers/specs/2026-08-05-implement-on-enter-design.md for the full original data
 /// flow this extends, and docs/superpowers/specs/2026-08-06-guaranteed-tab-per-issue-design.md
@@ -501,15 +500,13 @@ async fn resolve_validated_agent_command(
 /// split-only caveat this replaces. `resolve_cwd` itself never fails outright (see its own
 /// doc), so this function separately guards against the one case that matters here: both its
 /// launch-context parse *and* its `current_dir()` fallback failing, which would otherwise pass
-/// an empty `--cwd` straight through to `tab_create` and `agent_start`.
+/// an empty `--cwd` straight through to `tab_create`.
 async fn implement_one(
     herdr_bin: &str,
     client: &herdr_linear::LinearClient,
     issue: &herdr_linear::Issue,
     command: &plugin::implement::ValidatedAgentCommand,
 ) -> ImplementOutcome {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-    let argv = plugin::implement::build_shell_argv(&shell, command);
     let cwd = plugin::host::resolve_cwd();
     if cwd.as_os_str().is_empty() {
         return ImplementOutcome::Failed(
@@ -534,58 +531,22 @@ async fn implement_one(
         Err(err) => return ImplementOutcome::Failed(format!("failed to create a tab: {err}")),
     };
 
-    let started = match plugin::herdr_cli::agent_start(
-        herdr_bin,
-        &agent_name,
-        &cwd,
-        &created_tab.tab_id,
-        &argv,
-    )
-    .await
+    // A `pane_run` `Err` does not necessarily mean the agent never started — the most likely
+    // cause is `run_with_timeout` giving up on a `herdr` call that's still running in the
+    // background (no `kill_on_drop`), so the agent may well be up despite the error. Don't
+    // assert the tab is empty; tell the user to check first.
+    if let Err(err) =
+        plugin::herdr_cli::pane_run(herdr_bin, &created_tab.root_pane_id, command.as_str()).await
     {
-        Ok(started) => started,
-        Err(err) => {
-            // `agent_start` returning `Err` does not necessarily mean the agent never started —
-            // the most likely cause is `run_with_timeout` giving up on a `herdr` call that's
-            // still running in the background (no `kill_on_drop`), so the agent may well be up
-            // despite the error. Don't assert the tab is empty; tell the user to check first.
-            return ImplementOutcome::Failed(format!(
-                "tab created but the agent-start call failed ({err}) — check the '{}' tab: it \
-                 may be empty (safe to close) or the agent may have started anyway despite the \
-                 error, so verify before closing it",
-                issue.identifier
-            ));
-        }
-    };
-
-    let mut warnings = Vec::new();
-
-    // TF-579 regression guard: `--tab` should have placed the agent inside `created_tab.tab_id`.
-    // If herdr ever placed it elsewhere, the guarantee this whole flow exists for silently
-    // didn't hold — surface that rather than quietly accepting whatever tab herdr picked.
-    if started.tab_id != created_tab.tab_id {
-        warnings.push(format!(
-            "agent started in tab {} instead of the requested tab {} — herdr may have ignored \
-             --tab",
-            started.tab_id.as_str(),
-            created_tab.tab_id.as_str()
+        return ImplementOutcome::Failed(format!(
+            "tab created but launching the agent failed ({err}) — check the '{}' tab: it may \
+             be empty (safe to close) or the agent may have started anyway despite the error, \
+             so verify before closing it",
+            issue.identifier
         ));
     }
 
-    // `agent_start` is assumed to split alongside a tab's existing panes rather than replace
-    // them (see docs/superpowers/specs/2026-08-06-guaranteed-tab-per-issue-design.md's addendum
-    // — verified live against herdr 0.7.3, but a future herdr version could change this). Guard
-    // against that assumption breaking: if the agent's own pane turned out to *be*
-    // `root_pane_id` (herdr replaced rather than split), there is no redundant pane left to
-    // close — closing it anyway would kill the agent's own pane instead of a leftover one.
-    if started.pane_id != created_tab.root_pane_id {
-        if let Err(err) = plugin::herdr_cli::pane_close(herdr_bin, &created_tab.root_pane_id).await
-        {
-            warnings.push(format!(
-                "failed to close the tab's now-redundant empty pane: {err}"
-            ));
-        }
-    }
+    let mut warnings = Vec::new();
 
     match client.get_workflow_states(&issue.team.id).await {
         Ok(states) => match plugin::implement::pick_in_progress_state(&states) {
@@ -605,7 +566,7 @@ async fn implement_one(
     // From here on, every early return must still report `warnings` — a failure below doesn't
     // undo (or excuse hiding) a warning collected above it.
     if let Err(err) =
-        plugin::herdr_cli::agent_wait(herdr_bin, &started.pane_id, "idle", 30_000).await
+        plugin::herdr_cli::agent_wait(herdr_bin, &created_tab.root_pane_id, "idle", 30_000).await
     {
         return ImplementOutcome::Failed(status_with_warnings(
             format!("agent didn't become ready ({err}) — run manually: {prompt}"),
@@ -613,7 +574,19 @@ async fn implement_one(
         ));
     }
 
-    if let Err(err) = send_prompt_until_visible(herdr_bin, &started.pane_id, &prompt).await {
+    // Cosmetic only (TF-590's original motivation — avoiding a launch-time name collision —
+    // no longer applies, since `pane_run` never passes a name to herdr): best-effort, so a
+    // failure here is a warning, not a reason to abandon an otherwise-working flow.
+    if let Err(err) =
+        plugin::herdr_cli::agent_rename(herdr_bin, &created_tab.root_pane_id, &agent_name).await
+    {
+        warnings.push(format!(
+            "failed to rename the agent pane to {agent_name:?}: {err}"
+        ));
+    }
+
+    if let Err(err) = send_prompt_until_visible(herdr_bin, &created_tab.root_pane_id, &prompt).await
+    {
         return ImplementOutcome::Failed(status_with_warnings(
             format!("{err} — run manually: {prompt}"),
             &warnings,

@@ -85,10 +85,10 @@ pub fn resolve_agent_command(derived: Option<&str>, config_override: Option<&str
     config_override.or(derived).unwrap_or("hr").to_string()
 }
 
-/// True if `command` is safe to interpolate into `sh -i -c <command>` (see
-/// [`build_shell_argv`]) without unintended shell expansion: rejects command/variable
-/// substitution, chaining, redirection, quoting, newlines, glob metacharacters, and (since the
-/// shell runs with `-i`, interactive mode) `!` history expansion. Spaces and flags are allowed,
+/// True if `command` is safe to type as a literal command line into the tab's already-running
+/// interactive shell (via `pane_run`) without unintended shell expansion: rejects command/
+/// variable substitution, chaining, redirection, quoting, newlines, glob metacharacters, and
+/// (since it's an interactive shell) `!` history expansion. Spaces and flags are allowed,
 /// so a real-world `agent_command` value like `"headroom wrap claude --memory"` still passes.
 /// `derived` (from `herdr agent list`) and `config_override` (the user's own `config.toml`) are
 /// both low-risk inputs already, but this catches a mistyped/malicious value before it reaches
@@ -123,10 +123,11 @@ pub fn is_valid_agent_command(command: &str) -> bool {
         })
 }
 
-/// An `agent_command` string that has passed [`is_valid_agent_command`]. [`build_shell_argv`]
-/// only accepts this type rather than a bare `&str`, so the shell-injection guard is enforced
-/// by the compiler at every call site — not by remembering to call `is_valid_agent_command`
-/// first and never reordering or bypassing that call in a future refactor.
+/// An `agent_command` string that has passed [`is_valid_agent_command`], so `pane_run`'s caller
+/// only ever receives a validated command rather than a bare `&str` — the shell-injection guard
+/// is enforced by the compiler at every call site, not by remembering to call
+/// `is_valid_agent_command` first and never reordering or bypassing that call in a future
+/// refactor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedAgentCommand(String);
 
@@ -145,18 +146,6 @@ impl ValidatedAgentCommand {
     pub fn as_str(&self) -> &str {
         &self.0
     }
-}
-
-/// Build the argv to run `command` through an interactive instance of `shell`, so both a bare
-/// binary name (e.g. `"claude"`) and a shell alias/function defined in an rc file (e.g.
-/// `"hr"`) resolve correctly.
-pub fn build_shell_argv(shell: &str, command: &ValidatedAgentCommand) -> Vec<String> {
-    vec![
-        shell.to_string(),
-        "-i".to_string(),
-        "-c".to_string(),
-        command.as_str().to_string(),
-    ]
 }
 
 /// Build the literal prompt injected into the agent's pane once it's ready.
@@ -320,21 +309,6 @@ mod tests {
     #[test]
     fn resolve_agent_command_falls_back_to_hr_by_default() {
         assert_eq!(resolve_agent_command(None, None), "hr");
-    }
-
-    #[test]
-    fn build_shell_argv_wraps_the_command_through_an_interactive_shell() {
-        let command = ValidatedAgentCommand::parse("hr".to_string()).unwrap();
-
-        assert_eq!(
-            build_shell_argv("/bin/zsh", &command),
-            vec![
-                "/bin/zsh".to_string(),
-                "-i".to_string(),
-                "-c".to_string(),
-                "hr".to_string()
-            ]
-        );
     }
 
     #[test]
@@ -509,8 +483,8 @@ mod tests {
 
     #[test]
     fn is_valid_agent_command_rejects_glob_and_history_expansion_characters() {
-        // `build_shell_argv` runs the command through `sh -i`, so bash-style history expansion
-        // (`!`) is live in addition to the usual glob metacharacters.
+        // `pane_run` types the command into the tab's already-interactive shell, so bash-style
+        // history expansion (`!`) is live in addition to the usual glob metacharacters.
         assert!(!is_valid_agent_command("claude *"));
         assert!(!is_valid_agent_command("claude file?.txt"));
         assert!(!is_valid_agent_command("claude [a-z]"));
