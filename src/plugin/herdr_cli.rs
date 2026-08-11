@@ -10,12 +10,14 @@
 //!
 //! ## `agent_wait`'s retry-on-missing-`result` workaround
 //!
-//! herdr v0.7.3 has a reproducible bug: `herdr agent wait --status idle`'s underlying
+//! herdr v0.7.3 has a reproducible bug: `herdr agent wait --until idle`'s underlying
 //! `events.subscribe` stream closes as soon as the target pane's *agent identity* is first
 //! detected (e.g. `previous_agent=None → agent=Some(Claude)`, logged the moment herdr notices
 //! which CLI is running in the pane), not when its *status* actually reaches the requested
-//! value — confirmed via `herdr-server.log` on every observed `agent.start` call, each followed
+//! value — confirmed via `herdr-server.log` on every observed agent launch, each followed
 //! within ~200ms by `outcome="stream_closed"`, long before the agent could plausibly be idle.
+//! (The flag was spelled `--status` when this was first diagnosed; herdr 0.8.0 renamed it to
+//! `--until`, TF-624 — the underlying stream-close behavior is unchanged.)
 //! The CLI then exits 0 with valid JSON missing the `result` field its own schema (`herdr api
 //! schema --json`) declares `required`. `agent_wait` retries specifically on this response (see
 //! `is_missing_result_response`) — the identity-transition event fires at most once per pane,
@@ -170,7 +172,7 @@ fn is_missing_result_response(error: &Error) -> bool {
 
 /// Wall-clock ceiling for `herdr` subprocess calls that don't carry their own `--timeout`
 /// argument (everything routed through [`run`]: `agent_list`, `tab_create`, `agent_prompt`,
-/// `pane_close`, `pane_run`, `tab_list`, `tab_focus`, `agent_rename`). Without this, a hung
+/// `agent_read`, `pane_run`, `tab_list`, `tab_focus`, `agent_rename`). Without this, a hung
 /// `herdr` daemon blocks the single-threaded TUI's event loop indefinitely — `agent_wait` is the
 /// exception, since it computes its own call-specific bound in [`agent_wait`] instead of using
 /// this constant.
@@ -275,12 +277,13 @@ fn parse_tab_created(result: &Value) -> Result<TabCreated> {
 /// single root pane herdr creates inside it by default). Labeling at creation time (rather than
 /// via a follow-up `tab rename`) means the label is correct from the very first frame, with no
 /// window in which the tab could be confused with — or have its label stolen by — a different,
-/// already-running tab. `root_pane_id` exists to be closed once [`agent_start`] has placed the
-/// real agent pane into this tab — `agent_start` never replaces or consumes a tab's existing
-/// panes, it only adds a split alongside them, so without closing it every tab would carry a
-/// permanent extra empty shell pane. See
-/// docs/superpowers/specs/2026-08-06-guaranteed-tab-per-issue-design.md for why this replaced a
-/// rename-after-`agent_start` sequence.
+/// already-running tab. `root_pane_id` is the pane every caller then actually works in: it comes
+/// up at an interactive shell prompt, and [`pane_run`] types the agent/editor command straight
+/// into it, so it *is* the agent's pane — it must never be closed (TF-624; before herdr 0.8.0's
+/// CLI redesign the launch call instead split a separate agent pane alongside it, which is why
+/// callers used to close this one as redundant). See
+/// docs/superpowers/specs/2026-08-06-guaranteed-tab-per-issue-design.md for why creating a
+/// pre-labeled tab replaced the older rename-after-launch sequence.
 pub async fn tab_create(herdr_bin: &str, cwd: &Path, label: &str) -> Result<TabCreated> {
     let cwd_str = cwd.to_string_lossy().to_string();
     let result = run(
@@ -291,15 +294,6 @@ pub async fn tab_create(herdr_bin: &str, cwd: &Path, label: &str) -> Result<TabC
     )
     .await?;
     parse_tab_created(&result)
-}
-
-/// `herdr pane close <pane_id>`. Used to close the now-redundant root pane [`tab_create`] leaves
-/// behind once [`agent_start`] has placed the real agent pane into the same tab (`agent_start`
-/// never replaces a tab's existing panes, only splits alongside them).
-pub async fn pane_close(herdr_bin: &str, pane_id: &PaneId) -> Result<()> {
-    run(herdr_bin, &["pane", "close", pane_id.as_str()])
-        .await
-        .map(|_| ())
 }
 
 /// `herdr pane run <pane_id> <command>` — types `command` into `pane_id` followed by Enter.
@@ -316,10 +310,10 @@ pub async fn pane_run(herdr_bin: &str, pane_id: &PaneId, command: &str) -> Resul
 }
 
 /// `herdr tab list` — the raw JSON text of the `result` field. Used by
-/// [`find_tab_id_by_label`] to locate an existing labeled tab (the config-editor pane's
-/// reuse-on-second-`c`-press check) — `agent focus`/`agent rename` can't do this for `nvim`,
-/// since herdr only tracks *recognized* coding-agent binaries as "agents", never a plain
-/// editor pane.
+/// this module's private `find_tab_id_by_label` to locate an existing labeled tab (the
+/// config-editor pane's reuse-on-second-`c`-press check) — `agent focus`/`agent rename` can't
+/// do this for `nvim`, since herdr only tracks *recognized* coding-agent binaries as "agents",
+/// never a plain editor pane.
 pub async fn tab_list(herdr_bin: &str) -> Result<String> {
     let result = run(herdr_bin, &["tab", "list"]).await?;
     Ok(result.to_string())
@@ -344,16 +338,16 @@ fn find_tab_id_by_label(tab_list_json: &str, label: &str) -> Option<TabId> {
     })
 }
 
-/// Convenience wrapper around [`find_tab_id_by_label`] for [`crate::open_config_in_herdr_pane`]:
-/// looks for an existing tab labeled [`crate::plugin::editor::EDITOR_AGENT_NAME`] in a `tab
-/// list` JSON result.
+/// Convenience wrapper around this module's private `find_tab_id_by_label` for `main.rs`'s
+/// `open_config_in_herdr_pane`: looks for an existing tab labeled
+/// [`crate::plugin::editor::EDITOR_AGENT_NAME`] in a `tab list` JSON result.
 pub fn find_existing_editor_tab(tab_list_json: &str) -> Option<TabId> {
     find_tab_id_by_label(tab_list_json, crate::plugin::editor::EDITOR_AGENT_NAME)
 }
 
 /// `herdr tab focus <tab_id>`. Used to switch to an already-open config-editor tab on a second
 /// `c` press, in place of the old `agent focus <name>` (impossible for `nvim` — see
-/// [`find_tab_id_by_label`]'s doc).
+/// [`tab_list`]'s doc).
 pub async fn tab_focus(herdr_bin: &str, tab_id: &TabId) -> Result<()> {
     run(herdr_bin, &["tab", "focus", tab_id.as_str()])
         .await
@@ -363,7 +357,7 @@ pub async fn tab_focus(herdr_bin: &str, tab_id: &TabId) -> Result<()> {
 /// `herdr agent rename <pane_id> <name>` — assigns a friendly display name to a pane herdr has
 /// already recognized as hosting a coding agent (requires the target to already be
 /// auto-detected; fails with `agent_not_found` otherwise — verified live against herdr 0.8.0).
-/// Used by [`crate::implement_one`] purely cosmetically, to preserve the per-issue names
+/// Used by `main.rs`'s `implement_one` purely cosmetically, to preserve the per-issue names
 /// (`hr--tf-574`-style) users already see in herdr's own pane/agent list — TF-590's original
 /// motivation (avoiding a launch-time `agent_name_taken` collision) no longer applies, since
 /// nothing about [`pane_run`] can collide on a name.
@@ -406,10 +400,11 @@ fn next_retry_budget_ms(
     Some(remaining_ms)
 }
 
-/// `herdr agent wait <pane_id> --until <status> --timeout <timeout_ms>` (herdr 0.8.0 renamed `--status` to `--until`, TF-624). Retries, within the
-/// caller's original `timeout_ms` budget, when herdr responds with the missing-`result` bug
-/// documented at the top of this module — any other error (a real timeout, no such pane, ...)
-/// returns immediately.
+/// `herdr agent wait <pane_id> --until <status> --timeout <timeout_ms>` (herdr 0.8.0 renamed
+/// this subcommand's `--status` flag to `--until`, TF-624). Retries, within the caller's
+/// original `timeout_ms` budget, when herdr responds with the missing-`result` bug documented at
+/// the top of this module — any other error (a real timeout, no such pane, ...) returns
+/// immediately.
 pub async fn agent_wait(
     herdr_bin: &str,
     pane_id: &PaneId,
@@ -645,7 +640,7 @@ mod tests {
     /// Writes an executable fake `herdr` shell script (`#!/bin/sh` — Unix only, matching the
     /// project's own `sh -i`/`/bin/bash` assumptions) into a fresh [`tempfile::TempDir`] and
     /// returns both, so the subprocess-spawning `herdr_cli` functions below (`tab_create`,
-    /// `pane_close`, ...) can be exercised end-to-end without a real `herdr` daemon. Each such
+    /// `agent_wait`, ...) can be exercised end-to-end without a real `herdr` daemon. Each such
     /// function takes `herdr_bin` directly as a parameter (see `herdr_bin()`'s
     /// `$HERDR_BIN_PATH` override, which this mirrors), so the script's path can be passed
     /// straight in — no env var indirection needed. The `TempDir` must be kept alive by the
@@ -706,49 +701,6 @@ exit 1
 
         assert!(
             err.to_string().contains("no such workspace"),
-            "unexpected message: {err}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn pane_close_invokes_the_expected_cli_command() {
-        let capture_dir = tempfile::tempdir().unwrap();
-        let args_file = capture_dir.path().join("args.txt");
-        let (_dir, script) = write_fake_herdr_script(&format!(
-            r#"
-printf '%s\n' "$@" > "{}"
-echo '{{"result":{{}}}}'
-exit 0
-"#,
-            args_file.display()
-        ));
-
-        pane_close(script.to_str().unwrap(), &PaneId("p9".to_string()))
-            .await
-            .expect("pane_close should succeed");
-
-        let captured = std::fs::read_to_string(&args_file).unwrap();
-        let args: Vec<&str> = captured.lines().collect();
-        assert_eq!(args, vec!["pane", "close", "p9"]);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn pane_close_propagates_a_herdr_error() {
-        let (_dir, script) = write_fake_herdr_script(
-            r#"
-echo '{"error":{"message":"no such pane"}}'
-exit 1
-"#,
-        );
-
-        let err = pane_close(script.to_str().unwrap(), &PaneId("p9".to_string()))
-            .await
-            .expect_err("pane_close should propagate the herdr error");
-
-        assert!(
-            err.to_string().contains("no such pane"),
             "unexpected message: {err}"
         );
     }

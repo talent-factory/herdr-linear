@@ -11,6 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `benches/` — a `criterion`-based benchmark suite (dev-dependency only) covering `get_all_issues`'s auto-pagination, `execute_batch`'s throughput at a few concurrency levels, and the rate-limit-retry wrapper's overhead on the common (no-retry) success path, all run against a mocked backend. Run with `cargo bench`; see `benches/README.md`. Not part of `cargo test`/CI — a local/manual tool for catching regressions before they ship (TF-623)
 
+### Changed
+
+- Implement-on-`<Enter>`: each issue's per-issue agent name (e.g. `hr--tf-579`) is now applied
+  by a best-effort `agent rename` call *after* the agent starts, rather than being passed at
+  launch. Nothing passes a name at launch under herdr >= 0.8.0 (see TF-624 below), so the
+  0.2.0 auto-retry on herdr's `agent_name_taken` error has been removed — there is no longer a
+  launch-time name collision for it to recover from. A failed rename is now reported as a
+  warning and the agent keeps running under herdr's own default name (TF-624)
+
 ### Fixed
 
 - `c` (open `config.toml`) and Implement-on-Enter both silently failed against herdr >= 0.8.0,

@@ -369,8 +369,8 @@ async fn send_prompt_until_visible(
 /// See [`send_prompt_until_visible`]. This resends up to `attempts` times, delegating each
 /// attempt's confirmation to [`wait_for_prompt_stable`]; a `TimedOut`/error result falls through
 /// to the next (re)send rather than trusting an early sighting. Every attempt's failure is logged
-/// via `tracing::debug!` before moving on (see `main.rs::init_tracing`, and `agent_start`'s
-/// `agent_name_taken` retry loop in `herdr_cli.rs` for the established convention this follows)
+/// via `tracing::debug!` before moving on (see `main.rs::init_tracing`, and `agent_wait`'s
+/// missing-`result` retry loop in `herdr_cli.rs` for the established convention this follows)
 /// — only the *last* attempt's error is returned to the caller, so a log-enabled session is the
 /// only way to see what the earlier, discarded attempts actually failed with.
 async fn send_prompt_until_visible_with(
@@ -517,12 +517,9 @@ async fn implement_one(
         );
     }
 
-    // TF-590: a per-issue name, not the bare `command`, so starting a second issue while the
-    // first's agent tab is still running under the same `agent_command` doesn't collide on
-    // herdr's side with `agent_name_taken` (which `agent_start` itself also retries
-    // automatically, up to `AGENT_START_NAME_TAKEN_MAX_RETRIES` times, with a different
-    // suggested name each time — this is what makes those retries something other than the
-    // exact same losing name).
+    // TF-590: a per-issue name, not the bare `command`, so two issues running under the same
+    // `agent_command` stay distinguishable in herdr's own pane/agent list. Applied cosmetically
+    // via `agent_rename` further below, once the pane is up — see that call site.
     let agent_name = plugin::implement::build_agent_name(command.as_str(), &issue.identifier);
 
     let created_tab = match plugin::herdr_cli::tab_create(herdr_bin, &cwd, &issue.identifier).await
@@ -640,9 +637,10 @@ impl std::fmt::Display for HerdrPaneError {
 /// and herdr only auto-detects/tracks recognized coding-agent binaries (verified live against
 /// herdr 0.8.0, TF-624) — so the old `agent focus`/`agent start` reuse-and-launch model is
 /// unusable for it; a tab-label lookup plus a plain `pane run` is the only mechanism that still
-/// works for an arbitrary editor command. This also means there's no separate agent pane ever
-/// split into the tab (unlike `implement_one`'s `agent_start`), so unlike the old
-/// implementation there is no redundant root pane to close afterward.
+/// works for an arbitrary editor command. The editor therefore runs directly in the tab's own
+/// root pane — exactly like `implement_one`'s agent does — so, unlike the pre-TF-624
+/// implementation, there is no separate agent pane split in alongside it and no redundant root
+/// pane to close afterward.
 ///
 /// `pane_run`'s `Err` is treated as [`HerdrPaneError::Ambiguous`], not a plain failure: per
 /// `implement_one`'s doc on the same `herdr_cli` call pattern, a timed-out `run_with_timeout` (no
@@ -692,8 +690,9 @@ async fn open_config_in_herdr_pane(
             .map_err(|err| HerdrPaneError::Unavailable(format!("failed to create a tab: {err}")))?;
 
     // A `pane_run` `Err` doesn't necessarily mean the editor never launched — the same
-    // `run_with_timeout`-without-`kill_on_drop` caveat `agent_start`'s old doc described applies
-    // here too (a client-side timeout on a `herdr` call that's still running in the background).
+    // `run_with_timeout`-without-`kill_on_drop` caveat `implement_one`'s own `pane_run` call
+    // documents applies here too (a client-side timeout on a `herdr` call that's still running
+    // in the background).
     // Report `Ambiguous`, not `Unavailable`, so the caller doesn't fall back to the OS opener and
     // risk opening the file a second time.
     plugin::herdr_cli::pane_run(herdr_bin, &created_tab.root_pane_id, &command)
@@ -863,7 +862,7 @@ fn summarize_many(
 /// Runs [`implement_one`] for every issue in `issues` under the same already-resolved `command`,
 /// concurrently, via [`herdr_linear::LinearClient::execute_batch`] (TF-622) — each issue gets its
 /// own herdr tab/pane (see [`implement_one`]'s per-issue `agent_name`), so the interactive
-/// `herdr agent wait`/`agent send`/`agent read` cycles for different issues don't target the same
+/// `herdr agent wait`/`agent prompt`/`agent read` cycles for different issues don't target the same
 /// pane and are safe to interleave. `execute_batch` is called with `None` concurrency, i.e. its
 /// own default cap (5) — deliberately not surfaced as config here; revisit only if a real need
 /// shows up. Each future owns its `issue` and carries its `identifier` through to the returned
@@ -1012,10 +1011,10 @@ fn is_buffered_quit_key(
 /// (`Action::Implement` / `Action::ImplementMany`) ran, so a buffered `<Enter>` doesn't replay
 /// as a fresh action once we're back to polling. Every step in that flow has its own bound —
 /// `agent_wait`'s own budget (up to 30s plus retry buffer), `get_workflow_states`/
-/// `update_issue`'s 30s HTTP timeout each, `tab_create`/`pane_close`/`agent_send`/`agent_list`
-/// at `DEFAULT_CLI_TIMEOUT` (15s) each, and `agent_start` at up to `DEFAULT_CLI_TIMEOUT` times
-/// `1 + AGENT_START_NAME_TAKEN_MAX_RETRIES` (TF-590's `agent_name_taken` retry loop, ~45s
-/// worst case, not a flat 15s) — but within one issue they're sequential, so the flow as a
+/// `update_issue`'s 30s HTTP timeout each, and `agent_list`/`tab_create`/`pane_run`/
+/// `agent_rename` at `DEFAULT_CLI_TIMEOUT` (15s) each, plus the prompt-send loop's own
+/// `PROMPT_SEND_ATTEMPTS` × `PROMPT_SEND_ATTEMPT_TIMEOUT` ceiling over its
+/// `agent_prompt`/`agent_read` cycles — but within one issue they're sequential, so the flow as a
 /// whole can run well past any single step's bound in the worst case. For `Action::ImplementMany`
 /// this per-issue budget no longer simply multiplies by the marked-issue count: since TF-622,
 /// [`implement_many`] runs issues concurrently through `execute_batch`, bounded to
@@ -1360,7 +1359,7 @@ esac
             captured,
             "CALL: tab list\n\
              CALL: tab create --cwd /fake/config/dir --label herdr-linear-config --focus\n\
-             CALL: pane run p9 nvim '/fake/config/dir/config.toml'\n",
+             CALL: pane run p9 'nvim' '/fake/config/dir/config.toml'\n",
             "unexpected sequence of herdr CLI calls: {captured}"
         );
     }
@@ -1554,7 +1553,7 @@ esac
         );
         assert!(
             opener_calls.into_inner().is_empty(),
-            "opener must not run on an ambiguous agent_start failure — it could open the file twice"
+            "opener must not run on an ambiguous pane_run failure — it could open the file twice"
         );
     }
 
@@ -2259,6 +2258,112 @@ esac
         assert!(
             message.contains("failed to load workflow states"),
             "unexpected message: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn implement_one_threads_the_expected_flags_into_every_herdr_cli_call() {
+        // `write_dispatching_herdr_script`'s tests above only prove the right subcommand runs in
+        // the right order — none of them inspect the argv beyond `$1 $2`. A regression that
+        // reverted `agent wait`'s `--until` back to herdr <0.8.0's `--status` (the single most
+        // load-bearing token this branch changed — TF-624), dropped the `--timeout` budget, or
+        // renamed/reordered the wrong pane would pass every one of them while silently breaking
+        // Implement-on-`<Enter>` against real herdr. This captures every call's full argv
+        // instead, exactly like `open_config_in_herdr_pane_threads_the_editor_cmd_and_cwd_into_
+        // the_cli_calls` does for the `c` keybinding.
+        //
+        // The workflow-state lookup is mocked to fail so the flow lands on
+        // `StartedWithWarnings` without a live Linear endpoint — it issues no `herdr` call
+        // either way, so it doesn't affect the captured sequence.
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({"data": null, "errors": [{"message": "workflow states unavailable"}]})
+                    .to_string(),
+            )
+            .create_async()
+            .await;
+        let client = herdr_linear::LinearClient::with_endpoint(
+            "lin_api_test",
+            format!("{}/graphql", server.url()),
+        )
+        .unwrap();
+
+        let capture_dir = tempfile::tempdir().unwrap();
+        let args_file = capture_dir.path().join("args.txt");
+        let (_dir, script) = write_fake_herdr_script(&format!(
+            r#"
+printf 'CALL: %s\n' "$*" >> "{args_file}"
+case "$1 $2" in
+  "tab create")
+    echo '{{"result":{{"tab":{{"tab_id":"t2","label":"TF-579"}},"root_pane":{{"pane_id":"p9"}}}}}}'
+    exit 0
+    ;;
+  "agent read")
+    echo '{{"result":{{"read":{{"text":"Implement Linear Issue TF-579 using a new git worktree"}}}}}}'
+    exit 0
+    ;;
+  "pane run"|"agent wait"|"agent rename"|"agent prompt")
+    echo '{{"result":{{}}}}'
+    exit 0
+    ;;
+  *)
+    echo '{{"error":{{"message":"unexpected herdr call"}}}}'
+    exit 1
+    ;;
+esac
+"#,
+            args_file = args_file.display()
+        ));
+        let issue = sample_issue("TF-579");
+        let command = plugin::implement::ValidatedAgentCommand::parse("hr".to_string()).unwrap();
+
+        let outcome = implement_one(script.to_str().unwrap(), &client, &issue, &command).await;
+
+        let ImplementOutcome::StartedWithWarnings(message) = outcome else {
+            panic!("expected StartedWithWarnings, got {outcome:?}");
+        };
+        assert!(
+            message.contains("failed to load workflow states"),
+            "the only warning should be the mocked workflow-state failure: {message}"
+        );
+
+        let captured = std::fs::read_to_string(&args_file).unwrap();
+        let calls: Vec<&str> = captured.lines().collect();
+
+        // `tab create`'s `--cwd` is whatever `plugin::host::resolve_cwd()` reports in the test
+        // process, so match it by shape rather than by an exact path.
+        let tab_create = calls.first().expect("expected at least one herdr call");
+        assert!(
+            tab_create.starts_with("CALL: tab create --cwd ")
+                && tab_create.ends_with(" --label TF-579 --focus"),
+            "unexpected `tab create` invocation: {tab_create}"
+        );
+
+        // Every remaining call, in order, with `agent read`'s repeated stability polls collapsed
+        // (how many of them a run takes depends on real subprocess timing).
+        let rest: Vec<&str> = calls[1..]
+            .iter()
+            .copied()
+            .filter(|call| !call.starts_with("CALL: agent read "))
+            .collect();
+        assert_eq!(
+            rest,
+            vec![
+                "CALL: pane run p9 hr",
+                "CALL: agent wait p9 --until idle --timeout 30000",
+                "CALL: agent rename p9 hr--tf-579",
+                "CALL: agent prompt p9 Implement Linear Issue TF-579 using a new git worktree",
+            ],
+            "unexpected sequence of herdr CLI calls: {captured}"
+        );
+        assert!(
+            calls.contains(&"CALL: agent read p9 --source visible --lines 60"),
+            "expected the prompt-stability poll to read the same pane: {captured}"
         );
     }
 

@@ -442,12 +442,13 @@ tabs with `Tab`/`←`/`→` or `1`-`4`, scroll with `j`/`k` or the arrow keys, a
 elsewhere, or closes it if it's already focused.
 
 > [!NOTE]
-> Each issue's agent tab is started under a name unique to that issue (the resolved
-> agent command plus the issue's identifier, e.g. `hr--tf-579`), not the bare agent
-> command — otherwise starting a second issue while an earlier one's tab is still
-> running would collide on herdr's side. If herdr still reports the name as taken
-> (`agent_name_taken`), `<Enter>` retries automatically with one of herdr's suggested
-> alternatives before giving up.
+> Each issue's agent pane is given a name unique to that issue (the resolved agent
+> command plus the issue's identifier, e.g. `hr--tf-579`), not the bare agent command,
+> so concurrently running issues stay distinguishable in herdr's own pane/agent list.
+> The name is applied by a `herdr agent rename` call *after* the agent has started —
+> nothing passes a name at launch — and it's best-effort: if the rename fails, the
+> agent keeps running under herdr's own default name and `<Enter>` reports it as a
+> warning rather than failing the launch.
 
 > [!NOTE]
 > `<Enter>` starts the coding agent in the directory herdr reports as your currently

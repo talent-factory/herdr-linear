@@ -2,8 +2,9 @@
 //! issue list: deriving the preferred coding agent from other open herdr tabs, resolving
 //! the final agent command, building the shell-wrapped argv to launch it, building the
 //! literal prompt injected once the agent is ready, picking the right workflow state to
-//! move the issue to, and building a per-issue `herdr agent start` name so two issues
-//! implemented under the same `agent_command` don't collide (TF-590, see [`build_agent_name`]).
+//! move the issue to, and building a per-issue display name so two issues implemented under
+//! the same `agent_command` stay distinguishable in herdr's own pane/agent list (TF-590,
+//! applied cosmetically via `herdr agent rename` since TF-624 — see [`build_agent_name`]).
 //! No process/socket access here — see [`crate::plugin::herdr_cli`] for that; this module only
 //! ever sees JSON text and in-memory values.
 
@@ -154,28 +155,34 @@ pub fn build_implement_prompt(identifier: &str) -> String {
 }
 
 /// True if `prompt` is visible anywhere in `pane_text` (a `herdr agent read` snapshot). Used by
-/// `main.rs`'s `send_prompt_until_visible` to confirm an [`crate::plugin::herdr_cli::agent_send`]
-/// actually reached the target's input box, rather than trusting `agent_wait`'s "idle" status
-/// alone — see [`crate::plugin::herdr_cli::agent_read`]'s docs for the race this guards against.
+/// `main.rs`'s `send_prompt_until_visible` to confirm an
+/// [`crate::plugin::herdr_cli::agent_prompt`] actually reached the target's input box, rather
+/// than trusting `agent_wait`'s "idle" status alone — see
+/// [`crate::plugin::herdr_cli::agent_read`]'s docs for the race this guards against.
 ///
 /// Strips *all* whitespace from both sides before comparing. The implement prompt is long
 /// enough (~55 chars) that a narrow `hr` pane — the common case, since it's usually a split
 /// column — hard-wraps it across multiple screen lines, observed live even splitting mid-word
 /// (no word-boundary wrapping) with a leading indent on continuation lines. A plain
 /// `pane_text.contains(prompt)` never matches a wrapped rendering, which was previously
-/// misread as "never landed" and triggered pointless resends (and, since `agent_send` appends
+/// misread as "never landed" and triggered pointless resends (and, since `agent_prompt` appends
 /// rather than replacing, visible duplication) even though the prompt had genuinely arrived.
 pub fn prompt_landed(pane_text: &str, prompt: &str) -> bool {
     let strip_whitespace = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
     strip_whitespace(pane_text).contains(&strip_whitespace(prompt))
 }
 
-/// Build the per-issue name passed to `herdr agent start` (see
-/// [`crate::plugin::herdr_cli::agent_start`]) so starting a second issue's agent tab while the
-/// first is still running under the same `agent_command` doesn't collide with herdr's
-/// `agent_name_taken` error (TF-590): every issue gets its own name derived from the resolved
-/// `command` plus the issue's identifier, instead of the bare `command` string being reused
-/// verbatim across every issue.
+/// Build the per-issue display name applied to an issue's agent pane after it starts, via
+/// [`crate::plugin::herdr_cli::agent_rename`] (TF-624). Every issue gets its own name derived
+/// from the resolved `command` plus the issue's identifier, instead of the bare `command` string
+/// being reused verbatim across every issue, so herdr's own pane/agent list distinguishes
+/// concurrently-running issues at a glance.
+///
+/// This is now purely cosmetic. TF-590 originally introduced it to avoid a launch-time
+/// `agent_name_taken` collision on `herdr agent start`, but herdr 0.8.0's CLI redesign
+/// removed that call from this plugin entirely — nothing passes a name at launch anymore
+/// (see [`crate::plugin::herdr_cli::pane_run`]), so there is no collision left to avoid and a
+/// rename failure is a non-fatal warning rather than a reason to retry under a different name.
 ///
 /// `command` and `issue_identifier` are sanitized *independently* (see `sanitize_agent_name`)
 /// and joined with a `--` boundary, rather than concatenated first and sanitized as one string.
@@ -197,8 +204,8 @@ pub fn build_agent_name(command: &str, issue_identifier: &str) -> String {
 
 /// Lowercases `raw` and collapses every run of one-or-more characters outside `[a-z0-9]` into
 /// a single hyphen, trimming leading/trailing hyphens — the character set herdr's own
-/// generated retry `candidates` (e.g. `"hr-2"`) follow, assumed here to be the same set herdr
-/// accepts for `agent start <name>` itself. Falls back to `"agent"` if nothing alphanumeric
+/// generated agent names (e.g. `"hr-2"`) follow, assumed here to be the same set herdr accepts
+/// for `agent rename <pane> <name>` itself. Falls back to `"agent"` if nothing alphanumeric
 /// survives, so this never returns an empty string. Never produces a `--`, which
 /// [`build_agent_name`] relies on to join two sanitized halves unambiguously.
 fn sanitize_agent_name(raw: &str) -> String {
@@ -369,7 +376,7 @@ mod tests {
     #[test]
     fn build_agent_name_is_unique_per_issue() {
         // The whole point of TF-590: two issues started under the same `agent_command` must
-        // not collide on the name passed to `herdr agent start`.
+        // not end up sharing one display name in herdr's pane/agent list.
         let a = build_agent_name("hr", "TF-579");
         let b = build_agent_name("hr", "TF-588");
 
