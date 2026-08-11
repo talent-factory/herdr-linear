@@ -585,12 +585,6 @@ pub async fn tab_list(herdr_bin: &str) -> Result<String> {
 /// all of which mean "nothing to reuse, create a fresh one" to every caller. Pure — no I/O — so
 /// the matching logic is unit-testable without spawning a process, mirroring
 /// [`crate::plugin::implement::resolve_preferred_agent`]'s same split for `agent list`.
-///
-/// `#[allow(dead_code)]`: this task (Task 1, TF-624) lands the function and its unit tests
-/// ahead of its only real caller, `find_existing_editor_tab`, which Task 5 adds — without the
-/// allow, `cargo clippy --all-features` fails this task's own commit in isolation (verified live
-/// during Task 1's review). Task 5 removes this attribute in the same edit that adds the caller.
-#[allow(dead_code)]
 fn find_tab_id_by_label(tab_list_json: &str, label: &str) -> Option<TabId> {
     let parsed: Value = serde_json::from_str(tab_list_json).ok()?;
     let tabs = parsed.get("tabs")?.as_array()?;
@@ -602,6 +596,13 @@ fn find_tab_id_by_label(tab_list_json: &str, label: &str) -> Option<TabId> {
         let tab_id = tab.get("tab_id")?.as_str()?;
         Some(TabId(tab_id.to_string()))
     })
+}
+
+/// Convenience wrapper around [`find_tab_id_by_label`] for [`crate::open_config_in_herdr_pane`]:
+/// looks for an existing tab labeled [`crate::plugin::editor::EDITOR_AGENT_NAME`] in a `tab
+/// list` JSON result.
+pub fn find_existing_editor_tab(tab_list_json: &str) -> Option<TabId> {
+    find_tab_id_by_label(tab_list_json, crate::plugin::editor::EDITOR_AGENT_NAME)
 }
 
 /// `herdr tab focus <tab_id>`. Used to switch to an already-open config-editor tab on a second

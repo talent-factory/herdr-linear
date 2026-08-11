@@ -631,15 +631,16 @@ async fn implement_one(
 /// [`open_config_editor`]: an `Unavailable` failure means nothing was created and the OS-opener
 /// fallback is safe; an `Ambiguous` failure means a tab may already exist with the editor
 /// running in it, so falling back would risk opening `config.toml` a second time — see
-/// `agent_start`'s handling below and [`implement_one`]'s identical `run_with_timeout` caveat
+/// `pane_run`'s handling above and [`implement_one`]'s identical `run_with_timeout` caveat
 /// for why a herdr-call `Err` doesn't mean the call didn't actually take effect.
 #[derive(Debug, PartialEq, Eq)]
 enum HerdrPaneError {
-    /// No tab was created — the `agent_focus` miss and `tab_create` call both failed cleanly,
-    /// so the caller's OS-opener fallback is safe.
+    /// No tab was created — either an existing tab was found but `tab_focus` failed, or no
+    /// existing tab was found and `tab_create` failed; either way the caller's OS-opener
+    /// fallback is safe.
     Unavailable(String),
-    /// A tab was created but `agent_start`'s outcome is unknown (it may have started despite
-    /// the error). The caller must not fall back to the OS opener here.
+    /// A tab was created but `pane_run`'s outcome is unknown (the editor may have started
+    /// despite the error). The caller must not fall back to the OS opener here.
     Ambiguous(String),
 }
 
@@ -654,19 +655,24 @@ impl std::fmt::Display for HerdrPaneError {
 }
 
 /// Runs `editor_cmd` on `config_path` inside a herdr pane, for the `c` keybinding: reuses an
-/// already-open editor pane if a previous `c` press created one ([`plugin::herdr_cli::agent_focus`]
-/// on [`plugin::editor::EDITOR_AGENT_NAME`]), otherwise opens a fresh tab for it
-/// ([`plugin::herdr_cli::tab_create`] + [`plugin::herdr_cli::agent_start`], closing the tab's
-/// now-redundant root pane exactly like [`implement_one`] does). The pane/tab/agent name is
-/// always [`plugin::editor::EDITOR_AGENT_NAME`] — deliberately global, not derived from repo or
-/// issue; see that constant's own doc for why a single shared pane across every herdr-linear
-/// instance is correct here, unlike `implement_one`'s per-issue names. A cleanup `pane_close`
-/// failure is logged but never turned into an `Err` — the editor itself already opened
-/// successfully in `started`'s pane by that point, and reporting failure here would make the
-/// caller fall back to the OS opener and open the file a second time.
+/// already-open editor tab from a previous `c` press if a `herdr tab list` label lookup
+/// ([`plugin::herdr_cli::find_existing_editor_tab`]) finds one, switching to it via
+/// [`plugin::herdr_cli::tab_focus`]; otherwise opens a fresh tab and types the editor command
+/// into its root pane via [`plugin::herdr_cli::tab_create`] + [`plugin::herdr_cli::pane_run`].
+/// The tab label is always [`plugin::editor::EDITOR_AGENT_NAME`] — deliberately global, not
+/// derived from repo or issue; see that constant's own doc for why a single shared tab across
+/// every herdr-linear instance is correct here, unlike `implement_one`'s per-issue names.
 ///
-/// `agent_start`'s `Err` is treated as [`HerdrPaneError::Ambiguous`], not a plain failure: per
-/// `implement_one`'s doc on the same `herdr_cli` call, a timed-out `run_with_timeout` (no
+/// `nvim` can never become a herdr-recognized "agent" — it isn't in herdr's fixed `--kind` enum,
+/// and herdr only auto-detects/tracks recognized coding-agent binaries (verified live against
+/// herdr 0.8.0, TF-624) — so the old `agent focus`/`agent start` reuse-and-launch model is
+/// unusable for it; a tab-label lookup plus a plain `pane run` is the only mechanism that still
+/// works for an arbitrary editor command. This also means there's no separate agent pane ever
+/// split into the tab (unlike `implement_one`'s `agent_start`), so unlike the old
+/// implementation there is no redundant root pane to close afterward.
+///
+/// `pane_run`'s `Err` is treated as [`HerdrPaneError::Ambiguous`], not a plain failure: per
+/// `implement_one`'s doc on the same `herdr_cli` call pattern, a timed-out `run_with_timeout` (no
 /// `kill_on_drop` on the underlying subprocess) doesn't mean the editor never started — it may
 /// well be up in the tab that was just created. Reporting this as `Unavailable` would make
 /// [`open_config_editor`] fall back to the OS opener, opening `config.toml` a second time
@@ -677,11 +683,25 @@ async fn open_config_in_herdr_pane(
     editor_cmd: &str,
     config_path: &std::path::Path,
 ) -> std::result::Result<(), HerdrPaneError> {
-    match plugin::herdr_cli::agent_focus(herdr_bin, plugin::editor::EDITOR_AGENT_NAME).await {
-        Ok(()) => return Ok(()),
+    // Reuse an already-open editor tab from a previous `c` press, if any — see this function's
+    // own doc for why a tab-label lookup is the only reuse mechanism that still works for `nvim`.
+    match plugin::herdr_cli::tab_list(herdr_bin).await {
+        Ok(json) => {
+            if let Some(tab_id) = plugin::herdr_cli::find_existing_editor_tab(&json) {
+                return plugin::herdr_cli::tab_focus(herdr_bin, &tab_id)
+                    .await
+                    .map_err(|err| {
+                        HerdrPaneError::Unavailable(format!(
+                            "found an existing '{}' tab but failed to focus it: {err}",
+                            plugin::editor::EDITOR_AGENT_NAME
+                        ))
+                    });
+            }
+        }
         Err(err) => {
             tracing::debug!(
-                "no existing '{}' pane to focus ({err}) — creating a new tab",
+                "couldn't list tabs to check for an existing '{}' pane ({err}) — creating a new \
+                 tab",
                 plugin::editor::EDITOR_AGENT_NAME
             );
         }
@@ -691,41 +711,28 @@ async fn open_config_in_herdr_pane(
         .parent()
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(plugin::host::resolve_cwd);
-    let argv = plugin::editor::build_editor_argv(editor_cmd, config_path);
+    let command = plugin::editor::build_editor_command(editor_cmd, config_path);
 
     let created_tab =
         plugin::herdr_cli::tab_create(herdr_bin, &cwd, plugin::editor::EDITOR_AGENT_NAME)
             .await
             .map_err(|err| HerdrPaneError::Unavailable(format!("failed to create a tab: {err}")))?;
 
-    let started = match plugin::herdr_cli::agent_start(
-        herdr_bin,
-        plugin::editor::EDITOR_AGENT_NAME,
-        &cwd,
-        &created_tab.tab_id,
-        &argv,
-    )
-    .await
-    {
-        Ok(started) => started,
-        Err(err) => {
-            return Err(HerdrPaneError::Ambiguous(format!(
-                "tab created but the editor-start call failed ({err}) — check the '{}' tab: it \
+    // A `pane_run` `Err` doesn't necessarily mean the editor never launched — the same
+    // `run_with_timeout`-without-`kill_on_drop` caveat `agent_start`'s old doc described applies
+    // here too (a client-side timeout on a `herdr` call that's still running in the background).
+    // Report `Ambiguous`, not `Unavailable`, so the caller doesn't fall back to the OS opener and
+    // risk opening the file a second time.
+    plugin::herdr_cli::pane_run(herdr_bin, &created_tab.root_pane_id, &command)
+        .await
+        .map_err(|err| {
+            HerdrPaneError::Ambiguous(format!(
+                "tab created but launching the editor failed ({err}) — check the '{}' tab: it \
                  may be empty (safe to close) or the editor may have started anyway despite the \
                  error, so verify before closing it",
                 plugin::editor::EDITOR_AGENT_NAME
-            )));
-        }
-    };
-
-    if started.pane_id != created_tab.root_pane_id {
-        if let Err(err) = plugin::herdr_cli::pane_close(herdr_bin, &created_tab.root_pane_id).await
-        {
-            tracing::warn!("failed to close the config tab's redundant empty pane: {err}");
-        }
-    }
-
-    Ok(())
+            ))
+        })
 }
 
 /// Resolves which editor `c` should use from the real environment: `config.toml`'s `editor`
@@ -1271,24 +1278,24 @@ mod tests {
         (dir, script)
     }
 
-    /// Fake `herdr` script dispatching `agent focus`, `tab create`, `agent start`, and
-    /// `pane close` calls to canned bodies — the four subcommands
-    /// `open_config_in_herdr_pane` can issue. A shorter, purpose-built sibling of
-    /// `write_dispatching_herdr_script` (which also covers `agent wait`, irrelevant here: the
-    /// editor flow never waits on agent status).
+    /// Fake `herdr` script dispatching `tab list`, `tab create`, and `pane run` calls to canned
+    /// bodies — the three subcommands `open_config_in_herdr_pane` can issue after TF-624's
+    /// redesign. `tab focus` is not parameterized: it always succeeds (`{"result":{}}`), since
+    /// none of this fixture's callers need to simulate a `tab focus` failure — the one test that
+    /// reaches it (`..._focuses_an_existing_tab_without_creating_a_new_one`) only needs to prove
+    /// reuse short-circuits `tab create`/`pane run`, not exercise `tab focus`'s own error path.
     fn write_editor_herdr_script(
-        agent_focus: &str,
+        tab_list: &str,
         tab_create: &str,
-        agent_start: &str,
-        pane_close: &str,
+        pane_run: &str,
     ) -> (tempfile::TempDir, std::path::PathBuf) {
         write_fake_herdr_script(&format!(
             r#"
 case "$1 $2" in
-  "agent focus") {agent_focus} ;;
+  "tab list") {tab_list} ;;
   "tab create") {tab_create} ;;
-  "agent start") {agent_start} ;;
-  "pane close") {pane_close} ;;
+  "pane run") {pane_run} ;;
+  "tab focus") echo '{{"result":{{}}}}'; exit 0 ;;
   *)
     echo '{{"error":{{"message":"unexpected herdr call: $1 $2"}}}}'
     exit 1
@@ -1300,12 +1307,11 @@ esac
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn open_config_in_herdr_pane_focuses_an_existing_pane_without_creating_a_tab() {
+    async fn open_config_in_herdr_pane_focuses_an_existing_tab_without_creating_a_new_one() {
         let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"result":{}}'; exit 0"#,
+            r#"echo '{"result":{"tabs":[{"tab_id":"w1:t2","label":"herdr-linear-config"}]}}'; exit 0"#,
             r#"echo 'tab create should not run'; exit 1"#,
-            r#"echo 'agent start should not run'; exit 1"#,
-            r#"echo 'pane close should not run'; exit 1"#,
+            r#"echo 'pane run should not run'; exit 1"#,
         );
 
         let result = open_config_in_herdr_pane(
@@ -1320,11 +1326,10 @@ esac
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn open_config_in_herdr_pane_creates_a_tab_when_no_pane_exists_yet() {
+    async fn open_config_in_herdr_pane_creates_a_tab_when_no_existing_one_is_found() {
         let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"error":{"code":"agent_not_found","message":"agent target config not found"}}'; exit 1"#,
-            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
-            r#"echo '{"result":{"agent":{"pane_id":"p1","tab_id":"t2"}}}'; exit 0"#,
+            r#"echo '{"result":{"tabs":[]}}'; exit 0"#,
+            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"herdr-linear-config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
             r#"echo '{"result":{}}'; exit 0"#,
         );
 
@@ -1340,31 +1345,26 @@ esac
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn open_config_in_herdr_pane_threads_the_agent_name_editor_cmd_and_cwd_into_the_cli_calls(
-    ) {
+    async fn open_config_in_herdr_pane_threads_the_editor_cmd_and_cwd_into_the_cli_calls() {
         // `write_editor_herdr_script`'s tests above only prove the right subcommand runs in the
         // right order — none of them inspect the argv beyond `$1 $2`. A regression that hardcoded
-        // the wrong editor, reused a stale pane name, or dropped/swapped `cwd`/`config_path`
-        // would pass every one of them. This captures every call's full argv instead.
+        // the wrong editor, dropped/swapped `cwd`/`config_path`, or built the wrong shell-quoted
+        // command would pass every one of them. This captures every call's full argv instead.
         let capture_dir = tempfile::tempdir().unwrap();
         let args_file = capture_dir.path().join("args.txt");
         let (_dir, script) = write_fake_herdr_script(&format!(
             r#"
 printf 'CALL: %s\n' "$*" >> "{args_file}"
 case "$1 $2" in
-  "agent focus")
-    echo '{{"error":{{"code":"agent_not_found","message":"agent target config not found"}}}}'
-    exit 1
+  "tab list")
+    echo '{{"result":{{"tabs":[]}}}}'
+    exit 0
     ;;
   "tab create")
     echo '{{"result":{{"tab":{{"tab_id":"t2","label":"herdr-linear-config"}},"root_pane":{{"pane_id":"p9"}}}}}}'
     exit 0
     ;;
-  "agent start")
-    echo '{{"result":{{"agent":{{"pane_id":"p1","tab_id":"t2"}}}}}}'
-    exit 0
-    ;;
-  "pane close")
+  "pane run")
     echo '{{"result":{{}}}}'
     exit 0
     ;;
@@ -1385,83 +1385,42 @@ esac
         let captured = std::fs::read_to_string(&args_file).unwrap();
         assert_eq!(
             captured,
-            "CALL: agent focus herdr-linear-config\n\
+            "CALL: tab list\n\
              CALL: tab create --cwd /fake/config/dir --label herdr-linear-config --focus\n\
-             CALL: agent start herdr-linear-config --cwd /fake/config/dir --tab t2 --focus -- nvim /fake/config/dir/config.toml\n\
-             CALL: pane close p9\n",
+             CALL: pane run p9 nvim '/fake/config/dir/config.toml'\n",
             "unexpected sequence of herdr CLI calls: {captured}"
         );
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn open_config_in_herdr_pane_succeeds_even_when_cleanup_pane_close_fails() {
-        // The editor already opened successfully in `started`'s pane by the time `pane_close`
-        // runs — a leftover empty pane is cosmetic, not a reason to report failure (which would
-        // make the caller fall back to `open::that` and open the file a second time).
+    async fn open_config_in_herdr_pane_treats_an_unlistable_tabs_call_as_no_existing_tab() {
+        // `tab list` failing outright (rather than succeeding with an empty/non-matching list)
+        // must fall through to creating a fresh tab, not bubble up as a hard failure.
         let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"error":{"message":"agent target config not found"}}'; exit 1"#,
-            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
-            r#"echo '{"result":{"agent":{"pane_id":"p1","tab_id":"t2"}}}'; exit 0"#,
-            r#"echo '{"error":{"message":"no such pane"}}'; exit 1"#,
-        );
-
-        let result = open_config_in_herdr_pane(
-            script.to_str().unwrap(),
-            "nvim",
-            std::path::Path::new("/fake/config/dir/config.toml"),
-        )
-        .await;
-
-        assert_eq!(result, Ok(()));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn open_config_in_herdr_pane_does_not_close_a_pane_when_agent_replaced_the_root_pane() {
-        // `agent_start`'s pane id equals the tab's root pane id here (herdr replaced rather
-        // than split) — `pane close` must not run at all. A marker file (rather than just a
-        // loudly-failing script) proves this: `pane_close` failures are unconditionally
-        // swallowed into `tracing::warn!` elsewhere in this function (see the sibling test
-        // `..._succeeds_even_when_cleanup_pane_close_fails`), so "the script failed" and "the
-        // script never ran" are indistinguishable from `result` alone — both yield `Ok(())`.
-        // A separate tempdir (rather than the herdr script's own) sidesteps the
-        // chicken-and-egg problem of needing the marker path before `write_editor_herdr_script`
-        // (which owns and returns the script's tempdir) has run.
-        let marker_dir = tempfile::tempdir().unwrap();
-        let marker_path = marker_dir.path().join("pane_close_was_called");
-        let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"error":{"message":"agent target config not found"}}'; exit 1"#,
-            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
-            r#"echo '{"result":{"agent":{"pane_id":"p9","tab_id":"t2"}}}'; exit 0"#,
-            &format!(
-                r#"touch "{}"; echo 'pane close should not run'; exit 1"#,
-                marker_path.to_str().unwrap()
-            ),
-        );
-
-        let result = open_config_in_herdr_pane(
-            script.to_str().unwrap(),
-            "nvim",
-            std::path::Path::new("/fake/config/dir/config.toml"),
-        )
-        .await;
-
-        assert_eq!(result, Ok(()));
-        assert!(
-            !marker_path.exists(),
-            "pane_close must not run when agent_start's pane replaced the tab's root pane"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn open_config_in_herdr_pane_fails_when_tab_create_fails_after_a_focus_miss() {
-        let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"error":{"message":"agent target config not found"}}'; exit 1"#,
             r#"echo '{"error":{"message":"no such workspace"}}'; exit 1"#,
-            r#"echo 'agent start should not run'; exit 1"#,
-            r#"echo 'pane close should not run'; exit 1"#,
+            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"herdr-linear-config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
+            r#"echo '{"result":{}}'; exit 0"#,
+        );
+
+        let result = open_config_in_herdr_pane(
+            script.to_str().unwrap(),
+            "nvim",
+            std::path::Path::new("/fake/config/dir/config.toml"),
+        )
+        .await;
+
+        assert_eq!(result, Ok(()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_config_in_herdr_pane_fails_when_tab_create_fails_after_no_existing_tab_is_found()
+    {
+        let (_dir, script) = write_editor_herdr_script(
+            r#"echo '{"result":{"tabs":[]}}'; exit 0"#,
+            r#"echo '{"error":{"message":"no such workspace"}}'; exit 1"#,
+            r#"echo 'pane run should not run'; exit 1"#,
         );
 
         let result = open_config_in_herdr_pane(
@@ -1482,17 +1441,15 @@ esac
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn open_config_in_herdr_pane_returns_ambiguous_when_agent_start_fails_after_a_focus_miss()
-    {
-        // `agent_start`'s `Err` doesn't mean the editor never started (see this function's own
-        // doc on `run_with_timeout`'s lack of `kill_on_drop`) — so this must be reported as
+    async fn open_config_in_herdr_pane_returns_ambiguous_when_pane_run_fails_after_tab_create() {
+        // `pane_run`'s `Err` doesn't mean the editor never launched (see this function's own doc
+        // on `run_with_timeout`'s lack of `kill_on_drop`) — so this must be reported as
         // `Ambiguous`, not `Unavailable`, or the caller would fall back to the OS opener and risk
         // opening the file a second time.
         let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"error":{"message":"agent target config not found"}}'; exit 1"#,
-            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
-            r#"echo '{"error":{"message":"no such tab"}}'; exit 1"#,
-            r#"echo 'pane close should not run'; exit 1"#,
+            r#"echo '{"result":{"tabs":[]}}'; exit 0"#,
+            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"herdr-linear-config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
+            r#"echo '{"error":{"message":"no such pane"}}'; exit 1"#,
         );
 
         let result = open_config_in_herdr_pane(
@@ -1506,7 +1463,7 @@ esac
             panic!("expected Err(Ambiguous), got {result:?}");
         };
         assert!(
-            message.contains("no such tab")
+            message.contains("no such pane")
                 && message.contains("check the")
                 && message.contains(plugin::editor::EDITOR_AGENT_NAME),
             "unexpected message: {message}"
@@ -1539,10 +1496,9 @@ esac
     #[tokio::test]
     async fn open_config_editor_does_not_call_the_opener_when_the_herdr_pane_succeeds() {
         let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"result":{}}'; exit 0"#,
+            r#"echo '{"result":{"tabs":[{"tab_id":"w1:t2","label":"herdr-linear-config"}]}}'; exit 0"#,
             r#"echo 'tab create should not run'; exit 1"#,
-            r#"echo 'agent start should not run'; exit 1"#,
-            r#"echo 'pane close should not run'; exit 1"#,
+            r#"echo 'pane run should not run'; exit 1"#,
         );
         let opener_calls = std::cell::RefCell::new(Vec::new());
 
@@ -1568,10 +1524,9 @@ esac
     #[tokio::test]
     async fn open_config_editor_falls_back_to_the_opener_when_the_herdr_pane_path_fails() {
         let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"error":{"message":"agent target config not found"}}'; exit 1"#,
+            r#"echo '{"result":{"tabs":[]}}'; exit 0"#,
             r#"echo '{"error":{"message":"no such workspace"}}'; exit 1"#,
-            r#"echo 'agent start should not run'; exit 1"#,
-            r#"echo 'pane close should not run'; exit 1"#,
+            r#"echo 'pane run should not run'; exit 1"#,
         );
         let opener_calls = std::cell::RefCell::new(Vec::new());
 
@@ -1595,15 +1550,14 @@ esac
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn open_config_editor_does_not_fall_back_when_agent_start_ambiguously_fails() {
+    async fn open_config_editor_does_not_fall_back_when_pane_run_ambiguously_fails() {
         // Unlike the `tab_create`-fails case above (nothing was created, safe to fall back),
-        // an `agent_start` failure after a tab was already created is ambiguous — falling back
+        // a `pane_run` failure after a tab was already created is ambiguous — falling back
         // to the opener here would risk opening the file a second time. The opener must not run.
         let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"error":{"message":"agent target config not found"}}'; exit 1"#,
-            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
-            r#"echo '{"error":{"message":"no such tab"}}'; exit 1"#,
-            r#"echo 'pane close should not run'; exit 1"#,
+            r#"echo '{"result":{"tabs":[]}}'; exit 0"#,
+            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"herdr-linear-config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
+            r#"echo '{"error":{"message":"no such pane"}}'; exit 1"#,
         );
         let opener_calls = std::cell::RefCell::new(Vec::new());
 
@@ -1635,10 +1589,9 @@ esac
     #[tokio::test]
     async fn open_config_editor_fails_when_both_the_herdr_pane_and_the_opener_fail() {
         let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"error":{"message":"agent target config not found"}}'; exit 1"#,
+            r#"echo '{"result":{"tabs":[]}}'; exit 0"#,
             r#"echo '{"error":{"message":"no such workspace"}}'; exit 1"#,
-            r#"echo 'agent start should not run'; exit 1"#,
-            r#"echo 'pane close should not run'; exit 1"#,
+            r#"echo 'pane run should not run'; exit 1"#,
         );
 
         let result = open_config_editor(
