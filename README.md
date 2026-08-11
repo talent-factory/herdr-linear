@@ -328,9 +328,8 @@ This file is shared by every repo/workspace that opens this plugin's panel (ther
 `config.toml` per plugin *installation*, not per repo), so `project_overrides` is a table
 keyed by repo name rather than a single value — an entry for one repo never affects how
 another repo resolves. You don't need to work out the repo name or project id yourself:
-pressing `c` on any Linear error screen (no project matches, multiple projects match, etc.)
-opens this file with your OS's default handler for `.toml` files (creating it if it doesn't
-exist yet), and the error text itself shows the exact snippet to paste in, with your repo
+pressing `c` (from any screen — see "Use" below) opens this file, creating it if it doesn't
+exist yet; error screens' text itself shows the exact snippet to paste in, with your repo
 name already filled in.
 
 Optionally set `agent_command` in the same `config.toml` to choose the coding agent started
@@ -345,6 +344,14 @@ was reversed: herdr's tab list can only report the underlying binary a pane runs
 `"claude"` — never the alias that launched it, so a pane started via `hr` looks identical to
 one started bare. Under the old precedence, `agent_command = "hr"` could never actually take
 effect once any other Claude Code tab was open.)
+
+`c` tries to open `config.toml` in `nvim`, inside a fresh herdr pane, so it's usable over SSH
+(e.g. herdr on an iPad) where there's no GUI to hand the file to. Set `editor` in the same
+`config.toml` to use a different command instead (a bare binary name, no flags — e.g.
+`editor = "vim"`); it's launched the same way, inside a herdr pane. If neither `nvim` nor an
+`editor` override is available, or the herdr pane couldn't be opened, `c` falls back to your
+OS's default handler for `.toml` files — today's original behavior. Repeated `c` presses reuse
+the same editor pane rather than opening a new one each time.
 
 "Team Issues" shows a Linear team's open issues. Unlike a project, a team has no
 repo-derived name to match, so it needs an explicit default: set `team_id` in the same
