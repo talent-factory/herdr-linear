@@ -827,6 +827,19 @@ fn is_buffered_quit_key(
 /// screen state they'd act on has already moved on — but the count is still noted via
 /// `tracing::debug!` (see `main.rs::init_tracing`) so a log-enabled session has a trail instead
 /// of those keypresses vanishing with zero trace anywhere.
+/// Minimum time [`ensure_loaded`] must have actually taken, in the `Action::Retry` /
+/// `Action::EnterView` arm, before a buffered key is discarded via [`flush_buffered_quit`].
+/// The common case is a plain network round-trip well under a second; a key buffered during
+/// that window is exactly the kind of fast, legitimate follow-up keypress (a quick second
+/// `Enter`/`r`) that — before the TF-610-driven flush was added — simply sat in the terminal's
+/// input queue and got picked up on the event loop's very next 200ms poll. Gating the flush on
+/// elapsed time preserves that behavior for the fast path while still catching the slow path
+/// this was added for: TF-610's rate-limit retry, which can leave `ensure_loaded` blocking for
+/// up to ~2 minutes (3 attempts × up to 60s `Retry-After` each) with the screen looking hung.
+/// 1s is comfortably above any ordinary round-trip and comfortably below the first retry wait.
+const RETRY_OR_ENTER_VIEW_STALE_LOAD_THRESHOLD: std::time::Duration =
+    std::time::Duration::from_secs(1);
+
 fn flush_buffered_quit() -> std::io::Result<bool> {
     let mut quit_requested = false;
     let mut discarded = 0u32;
@@ -908,10 +921,18 @@ async fn event_loop(
                             // buffer up in the terminal instead of being handled. Drain them
                             // the same way the Implement/ImplementMany arms below do, so a
                             // quit pressed while this was stuck actually takes effect instead
-                            // of leaving the app looking hung.
+                            // of leaving the app looking hung. But only once the load actually
+                            // took long enough to justify it (see
+                            // `RETRY_OR_ENTER_VIEW_STALE_LOAD_THRESHOLD`) — on the common fast
+                            // round-trip, draining unconditionally would silently eat a
+                            // legitimate follow-up keypress that the loop's normal poll would
+                            // otherwise have picked up next iteration.
+                            let load_started = std::time::Instant::now();
                             ensure_loaded(app, client).await;
 
-                            if flush_buffered_quit()? {
+                            if load_started.elapsed() >= RETRY_OR_ENTER_VIEW_STALE_LOAD_THRESHOLD
+                                && flush_buffered_quit()?
+                            {
                                 break;
                             }
                         }
