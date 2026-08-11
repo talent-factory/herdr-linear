@@ -1019,8 +1019,7 @@ async fn event_loop(
                                     // happen — the OS-opener-only path (`editor_cmd` is `None`)
                                     // is normally near-instant, so a "loading" status for it
                                     // would just flicker.
-                                    let showed_transient_status = editor_cmd.is_some();
-                                    if showed_transient_status {
+                                    if editor_cmd.is_some() {
                                         app.set_status(plugin::app::Status::Ok(
                                             "Opening config.toml…".to_string(),
                                         ));
@@ -1035,12 +1034,7 @@ async fn event_loop(
                                         .await;
 
                                     match result {
-                                        // Only clear status if we actually showed a transient
-                                        // one above — otherwise this would wipe an unrelated
-                                        // pre-existing status banner on the tier-3-only
-                                        // (OS-opener) path, where nothing was ever shown.
-                                        Ok(()) if showed_transient_status => app.clear_status(),
-                                        Ok(()) => {}
+                                        Ok(()) => app.clear_status(),
                                         Err(message) => {
                                             app.set_status(plugin::app::Status::Error(format!(
                                                 "{message}. Edit it manually."
