@@ -255,7 +255,7 @@ fn is_missing_result_response(error: &Error) -> bool {
 
 /// Wall-clock ceiling for `herdr` subprocess calls that don't carry their own `--timeout`
 /// argument (everything routed through [`run`]: `agent_list`, `tab_create`, `agent_start`,
-/// `agent_send`, `pane_close`). Without this, a hung `herdr` daemon blocks the single-threaded
+/// `agent_prompt`, `pane_close`). Without this, a hung `herdr` daemon blocks the single-threaded
 /// TUI's event loop indefinitely — `agent_wait` is the exception, since it computes its own
 /// call-specific bound in [`agent_wait`] instead of using this constant.
 const DEFAULT_CLI_TIMEOUT: Duration = Duration::from_secs(15);
@@ -674,7 +674,7 @@ fn next_retry_budget_ms(
     Some(remaining_ms)
 }
 
-/// `herdr agent wait <pane_id> --status <status> --timeout <timeout_ms>`. Retries, within the
+/// `herdr agent wait <pane_id> --until <status> --timeout <timeout_ms>` (herdr 0.8.0 renamed `--status` to `--until`, TF-624). Retries, within the
 /// caller's original `timeout_ms` budget, when herdr responds with the missing-`result` bug
 /// documented at the top of this module — any other error (a real timeout, no such pane, ...)
 /// returns immediately.
@@ -698,7 +698,7 @@ pub async fn agent_wait(
                 "agent",
                 "wait",
                 pane_id.as_str(),
-                "--status",
+                "--until",
                 status,
                 "--timeout",
                 &timeout_str,
@@ -724,9 +724,12 @@ pub async fn agent_wait(
     }
 }
 
-/// `herdr agent send <pane_id> <text>`.
-pub async fn agent_send(herdr_bin: &str, pane_id: &PaneId, text: &str) -> Result<()> {
-    run(herdr_bin, &["agent", "send", pane_id.as_str(), text])
+/// `herdr agent prompt <pane_id> <text>` (herdr 0.8.0 replaced the old `agent send` subcommand
+/// with `agent prompt`, which additionally supports `--wait`/`--until`/`--timeout` options this
+/// plugin doesn't need — it does its own stability polling via `agent_read` instead, see
+/// `main.rs`'s `send_prompt_until_visible`).
+pub async fn agent_prompt(herdr_bin: &str, pane_id: &PaneId, text: &str) -> Result<()> {
+    run(herdr_bin, &["agent", "prompt", pane_id.as_str(), text])
         .await
         .map(|_| ())
 }
@@ -744,7 +747,7 @@ fn parse_agent_read(result: &Value) -> Result<String> {
 }
 
 /// `herdr agent read <pane_id> --source <source> --lines <lines>` — the pane's rendered
-/// terminal text. Used by `main.rs`'s `send_prompt_until_visible` to confirm an [`agent_send`]
+/// terminal text. Used by `main.rs`'s `send_prompt_until_visible` to confirm an [`agent_prompt`]
 /// actually reached the target's input box, rather than trusting `agent_wait`'s screen-scraped
 /// "idle" status alone: that status can go true the instant the prompt box is *painted*, which
 /// can be a beat before the target's input loop has actually attached to read the pty — a
