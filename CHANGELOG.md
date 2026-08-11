@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-11
+
 ### Added
 
 - Auto-paginating `LinearClient` helpers — `get_all_issues`, `get_all_teams`, `get_all_team_issues`, `get_all_projects` — that loop through every page of a query and return the full result set, with a configurable page size and safety caps on total pages/items (TF-609)
@@ -26,11 +28,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pass both of those samples, and then still get wiped by the target's own async startup
   finishing after that 1.3s window had already elapsed, reporting success on an agent left with
   an empty prompt box (TF-619)
+- Retry/EnterView action arm: a `q`/Ctrl+C pressed while `ensure_loaded()` is blocking is
+  now drained and honored once the fetch returns, matching the Implement/ImplementMany arms
+  — but only once the fetch has actually taken long enough (past 1s) to be plausibly stuck.
+  TF-610's rate-limit retry can hold this arm for up to ~2 minutes with the screen looking
+  frozen and no visible way to quit; a normal fast round-trip still lets a buffered key fall
+  through to the loop's next poll cycle instead of being silently discarded (TF-610)
+- Herdr host context: `focused_pane_cwd`/`workspace_cwd`/`cwd` values with stray leading or
+  trailing whitespace are now trimmed before use, instead of surviving untrimmed into git's
+  `current_dir` (repo auto-detection) and the herdr CLI's `--cwd` argument
+  (implement-on-`<Enter>`), where either could break
 - Detail pane: unordered Markdown list items now render with a `•` bullet and a hanging
   indent for wrapped continuation lines, so a wrapped line starting with `--` (e.g. inline
   code like `` `cargo test --features plugin -- --ignored live_api` `` wrapping right
   before `--ignored`) can no longer be mistaken for a new bullet. Ordered (`1. `) list
   items keep their numbering but get the same hanging indent on wrap (TF-613)
+
+### Removed
+
+- Unused `graphql_client`, `async-trait`, `anyhow`, `dotenvy`, and `tokio-test` dependencies
+  — none were referenced anywhere in the crate. `reqwest` upgraded from the legacy 0.11 line
+  to 0.12, collapsing the dependency tree to a single hyper 1.x stack instead of duplicating
+  hyper 0.14/http 0.2 alongside it
 
 ## [0.1.1] - 2026-08-10
 
