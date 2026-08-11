@@ -23,7 +23,7 @@ A **pure Rust** client for [Linear.app](https://linear.app)'s GraphQL API. Desig
 
 ✅ **Error Handling**
 - Comprehensive error types with context
-- Automatic rate limit detection
+- Automatic rate-limit retry with backoff (opt-out available)
 
 ✅ **Logging**
 - Structured logging with tracing
@@ -156,6 +156,27 @@ let response = client.query::<MyType>(query_string, variables).await?;
 let response = client.mutate::<MyType>(mutation_string, variables).await?;
 ```
 
+### Rate Limiting
+
+When Linear rejects a request as rate-limited — an HTTP 400 response with a `RATELIMITED`
+GraphQL error code (Linear's [documented signal](https://linear.app/developers/rate-limiting)),
+or a plain HTTP 429 as a defense-in-depth fallback — `LinearClient` automatically waits and
+retries, up to 3 total attempts, before giving up. It waits the server's `Retry-After` value
+when present, falling back to exponential backoff (500ms, then 1s — the default 3-attempt
+budget only ever exercises these first two steps) otherwise, with either wait capped at 60s.
+If the retry budget is exhausted, the original `Error::RateLimitExceeded` is still returned,
+unchanged.
+
+This is designed to smooth over brief bursts against Linear's rate limiter, not to wait out a
+genuinely exhausted hourly quota — Linear's quotas (5,000 requests/hour for API keys) reset on
+an hourly cadence far longer than this retry budget can cover.
+
+Retry is on by default; opt out for the old fail-fast behavior:
+
+```rust
+let client = LinearClient::new(api_key)?.with_rate_limit_retry(false);
+```
+
 ## Project Structure
 
 ```
@@ -231,6 +252,8 @@ match client.get_viewer().await {
     Ok(user) => println!("User: {}", user.name),
     Err(Error::AuthenticationFailed(msg)) => eprintln!("Auth failed: {}", msg),
     Err(Error::RateLimitExceeded { retry_after_ms }) => {
+        // Only reached once the automatic retry budget is exhausted (see
+        // "Rate Limiting" above), or when retry was opted out of.
         eprintln!("Rate limited, retry after {}ms", retry_after_ms);
     }
     Err(e) => eprintln!("Error: {}", e),

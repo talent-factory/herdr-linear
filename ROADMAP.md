@@ -59,7 +59,7 @@ rather than only ever showing "my issues". Tracked as issues in the
 
 - [ ] Integration tests with Linear sandbox
 - [ ] Performance benchmarks
-- [ ] Rate limiting strategies
+- [x] Rate limiting strategies (TF-610)
 - [ ] Connection pooling for batch operations
 - [ ] Better pagination helpers
 - [ ] User feedback incorporation
