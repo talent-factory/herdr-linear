@@ -78,7 +78,29 @@ Closed out ahead of the original September estimate. Tracked as issues in the
 **Known gap**: `execute_batch` (TF-611) isn't wired into `main.rs`'s
 multi-issue implement flow yet — it's still explicitly sequential. Performance
 benchmarks and open-ended "user feedback incorporation" were dropped from this
-phase's original scope; benchmarks move to Phase 2 (Performance) below.
+phase's original scope; benchmarks move to Phase 2a below.
+
+### Phase 2a: Filtering, Batching & Performance Foundations
+
+**Target**: 2026-08-14. Tracked as issues in the
+[herdr-linear Linear project](https://linear.app/talent-factory/project/herdr-linear-10dca51ea35b/overview)
+(Phase 2a milestone). Closes out Phase 1.7's two loose ends, then delivers the
+first slice of Phase 2's "Filtering & Search".
+
+- [ ] Wire `execute_batch` (TF-611) into `main.rs`'s multi-issue implement
+      flow, replacing its still-sequential per-issue loop (TF-622)
+- [ ] Performance benchmarks (`criterion`) for pagination, batch execution,
+      and rate-limit retry (TF-623)
+- [ ] Query DSL parser: filter terms (`priority:`, `state:`, `label:`) + sort
+      keys (TF-615)
+- [ ] Wire the parsed filter terms into Linear's `IssueFilter` so filtering
+      happens server-side (TF-616) — depends on TF-615
+- [ ] `config.toml` `default_query` + a DSL-aware `/`-filter, backward
+      compatible with TF-580's plain substring match (TF-617) — depends on
+      TF-615 and TF-616
+
+TF-622/TF-623 are independent and can run in parallel with, or ahead of,
+TF-615→616→617's dependency chain.
 
 ### Phase 2: Advanced Features
 
@@ -88,26 +110,16 @@ phase's original scope; benchmarks move to Phase 2 (Performance) below.
   - Real-time issue update notifications
   - Comment subscriptions
   - Project change events
-  
+
 - [ ] **Batch Operations**
-  - `LinearClient::execute_batch`'s bounded-concurrency primitive already
-    landed in Phase 1.7 (TF-611) — remaining scope is wiring it into
-    `main.rs`'s still-sequential multi-issue implement flow
-  - Efficient multi-issue queries
+  - Efficient multi-issue queries (beyond the implement flow — see Phase 2a)
   - Transaction support
 
-- [ ] **Filtering & Search** — scoped as a 3-ticket split, all Backlog, not
-      yet in a milestone:
-  - [ ] Query DSL parser: filter terms (`priority:`, `state:`, `label:`) +
-        sort keys (TF-615)
-  - [ ] Wire the parsed filter terms into Linear's `IssueFilter` so filtering
-        happens server-side (TF-616)
-  - [ ] `config.toml` `default_query` + a DSL-aware `/`-filter, backward
-        compatible with TF-580's plain substring match (TF-617)
-  - Saved filters, full-text search integration — not yet scoped
+- [ ] **Filtering & Search** — first slice in progress, see Phase 2a above
+  - Saved filters
+  - Full-text search integration
 
 - [ ] **Performance**
-  - Performance benchmarks (moved from Phase 1.7's original scope)
   - Request caching layer
   - Connection reuse
   - Parallel query execution
@@ -218,6 +230,7 @@ Have ideas? Please:
 | Aug 2026  | Plugin v1 ("My Issues") Complete | Done      |
 | Aug 2026  | Phase 1.6 (Smart Issue Selection)| Done      |
 | Aug 2026  | Phase 1.7 (Polish & Stability)   | Done      |
+| 2026-08-14| Phase 2a (Filtering/Batching/Perf)| In Progress |
 | Oct 2026  | Phase 2 (Advanced Features)     | Planned   |
 | Nov 2026  | Phase 3 (Herdr Integration)     | Planned   |
 | Dec 2026  | Phase 4 (Production)            | Planned   |
