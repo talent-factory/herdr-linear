@@ -1430,6 +1430,52 @@ exit 1
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_focus_invokes_the_expected_cli_command() {
+        // Previously only exercised indirectly through `main.rs`'s case-dispatch fake-herdr
+        // scripts, which only assert on `$1 $2` — this pins down the actual `target` argument
+        // (e.g. `EDITOR_AGENT_NAME`) reaching the CLI call.
+        let capture_dir = tempfile::tempdir().unwrap();
+        let args_file = capture_dir.path().join("args.txt");
+        let (_dir, script) = write_fake_herdr_script(&format!(
+            r#"
+printf '%s\n' "$@" > "{}"
+echo '{{"result":{{}}}}'
+exit 0
+"#,
+            args_file.display()
+        ));
+
+        agent_focus(script.to_str().unwrap(), "herdr-linear-config")
+            .await
+            .expect("agent_focus should succeed");
+
+        let captured = std::fs::read_to_string(&args_file).unwrap();
+        let args: Vec<&str> = captured.lines().collect();
+        assert_eq!(args, vec!["agent", "focus", "herdr-linear-config"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_focus_propagates_a_herdr_error() {
+        let (_dir, script) = write_fake_herdr_script(
+            r#"
+echo '{"error":{"code":"agent_not_found","message":"agent target herdr-linear-config not found"}}'
+exit 1
+"#,
+        );
+
+        let err = agent_focus(script.to_str().unwrap(), "herdr-linear-config")
+            .await
+            .expect_err("agent_focus should propagate the herdr error");
+
+        assert!(
+            err.to_string().contains("not found"),
+            "unexpected message: {err}"
+        );
+    }
+
     #[test]
     fn parse_tab_created_extracts_the_tab_id_and_root_pane_id() {
         let result = serde_json::json!({

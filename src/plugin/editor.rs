@@ -37,17 +37,48 @@ pub fn find_on_path(path_env: Option<&str>, binary: &str) -> Option<PathBuf> {
     })
 }
 
+/// Returns whether `editor` (a `config.toml` `editor` override) can actually be launched: an
+/// absolute/relative path (contains [`std::path::MAIN_SEPARATOR`]) is checked directly via
+/// [`Path::exists`]; a bare command name is searched for on `PATH` via [`find_on_path`], the
+/// same existence-only check already applied to the `nvim` default. This doesn't guarantee the
+/// command will run (no executable-bit check, same caveat as `find_on_path`), but it does catch
+/// the common case — a typo'd or uninstalled override — before the caller spawns a command
+/// that's already known to fail.
+fn editor_override_is_usable(editor: &str, path_env: Option<&str>) -> bool {
+    if editor.contains(std::path::MAIN_SEPARATOR) {
+        Path::new(editor).exists()
+    } else {
+        find_on_path(path_env, editor).is_some()
+    }
+}
+
 /// Resolves which editor command should be used to open `config.toml`.
 ///
 /// Implements a three-tier priority:
-/// 1. If `config_editor` is set (from `config.toml`'s `editor` field), use it.
+/// 1. If `config_editor` is set (from `config.toml`'s `editor` field) *and* it resolves to a
+///    real binary (this module's private `editor_override_is_usable`), use it. An override that
+///    doesn't resolve is
+///    rejected with a `tracing::warn!` rather than used blindly — using it as-is would spawn a
+///    command already known to fail, silently strand the user in a dead pane (nothing in this
+///    module's `main.rs` callers confirm the launched process actually stays up), and, on the
+///    `c` keybinding's every-later-press `agent_focus` reuse, keep repeating that same silent
+///    no-op indefinitely.
 /// 2. Otherwise, if `nvim` is found on `PATH`, use `"nvim"`.
 /// 3. Otherwise, return `None` (caller falls back to OS default opener).
 pub fn resolve_editor_command(
     config_editor: Option<String>,
     path_env: Option<&str>,
 ) -> Option<String> {
-    config_editor.or_else(|| find_on_path(path_env, "nvim").map(|_| "nvim".to_string()))
+    if let Some(editor) = config_editor {
+        if editor_override_is_usable(&editor, path_env) {
+            return Some(editor);
+        }
+        tracing::warn!(
+            "config.toml's `editor` override ({editor:?}) was not found on PATH — falling back \
+             to nvim/the OS opener"
+        );
+    }
+    find_on_path(path_env, "nvim").map(|_| "nvim".to_string())
 }
 
 /// Constructs the argv list for launching an editor with a config file.
@@ -115,6 +146,7 @@ mod tests {
     fn resolve_editor_command_prefers_the_config_override_even_when_nvim_is_on_path() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("nvim"), "").unwrap();
+        std::fs::write(dir.path().join("emacs"), "").unwrap();
 
         let resolved = resolve_editor_command(
             Some("emacs".to_string()),
@@ -141,6 +173,61 @@ mod tests {
         let resolved = resolve_editor_command(None, Some(dir.path().to_str().unwrap()));
 
         assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn resolve_editor_command_falls_back_to_nvim_when_the_override_is_not_found_on_path() {
+        // "emacs" isn't in the fake PATH dir at all — the override must be rejected, not used
+        // blindly, and the resolver must degrade to nvim rather than returning the dead command.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("nvim"), "").unwrap();
+
+        let resolved = resolve_editor_command(
+            Some("emacs".to_string()),
+            Some(dir.path().to_str().unwrap()),
+        );
+
+        assert_eq!(resolved, Some("nvim".to_string()));
+    }
+
+    #[test]
+    fn resolve_editor_command_is_none_when_the_override_and_nvim_are_both_missing_from_path() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let resolved = resolve_editor_command(
+            Some("emacs".to_string()),
+            Some(dir.path().to_str().unwrap()),
+        );
+
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn resolve_editor_command_accepts_an_absolute_path_override_that_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let editor_path = dir.path().join("my-editor");
+        std::fs::write(&editor_path, "").unwrap();
+
+        // No PATH entry contains "my-editor" — only the absolute-path check can accept this.
+        let resolved = resolve_editor_command(
+            Some(editor_path.to_str().unwrap().to_string()),
+            Some("/this/path/does/not/exist"),
+        );
+
+        assert_eq!(resolved, Some(editor_path.to_str().unwrap().to_string()));
+    }
+
+    #[test]
+    fn resolve_editor_command_falls_back_when_the_absolute_path_override_does_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("nvim"), "").unwrap();
+
+        let resolved = resolve_editor_command(
+            Some("/this/path/does/not/exist/my-editor".to_string()),
+            Some(dir.path().to_str().unwrap()),
+        );
+
+        assert_eq!(resolved, Some("nvim".to_string()));
     }
 
     #[test]

@@ -25,10 +25,19 @@ crate for the OS-opener fallback. No new dependencies.
 - The `editor` config value is a bare binary name only — no shell-string parsing, no flags.
 - `EDITOR_AGENT_NAME` is `"config"` — a single, deliberately global (not per-repo) herdr
   tab/agent name, since `config.toml` is itself shared across every repo/workspace this plugin
-  runs in.
+  runs in. **Amended during review:** renamed to `"herdr-linear-config"` before merge, to avoid
+  colliding with a user's own pane literally named `"config"` — see `src/plugin/editor.rs` for
+  the final value; every `"config"` pane-name literal elsewhere in this plan (including embedded
+  code snippets) is stale in the same way.
 - Silent fallback: no status message is shown when *any* tier succeeds — only when the final
   (`open::that`) tier also fails, using the exact same message format as today:
-  `"Couldn't open {path}: {e}. Edit it manually."`.
+  `"Couldn't open {path}: {e}. Edit it manually."`. **Amended during review:** a transient
+  `"Opening config.toml…"` status is now shown unconditionally before the attempt, then cleared
+  on success — a bare `None` gate on `editor_cmd.is_some()` (only showing it when a herdr
+  round-trip was about to happen) turned out to make the unconditional `clear_status()` on
+  success wipe an unrelated pre-existing status banner on the OS-opener-only tier, since no
+  status had been set to clear. See `main.rs`'s `open_config_result_status` for the final
+  behavior.
 - First success wins: once a tier succeeds, later tiers (including `open::that`) must never also
   run — the file must never be opened twice.
 - Every new async orchestration function takes `herdr_bin: &str` as an explicit parameter (never

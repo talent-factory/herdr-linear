@@ -627,6 +627,32 @@ async fn implement_one(
     }
 }
 
+/// Failure modes for [`open_config_in_herdr_pane`]. The two variants matter to
+/// [`open_config_editor`]: an `Unavailable` failure means nothing was created and the OS-opener
+/// fallback is safe; an `Ambiguous` failure means a tab may already exist with the editor
+/// running in it, so falling back would risk opening `config.toml` a second time — see
+/// `agent_start`'s handling below and [`implement_one`]'s identical `run_with_timeout` caveat
+/// for why a herdr-call `Err` doesn't mean the call didn't actually take effect.
+#[derive(Debug, PartialEq, Eq)]
+enum HerdrPaneError {
+    /// No tab was created — the `agent_focus` miss and `tab_create` call both failed cleanly,
+    /// so the caller's OS-opener fallback is safe.
+    Unavailable(String),
+    /// A tab was created but `agent_start`'s outcome is unknown (it may have started despite
+    /// the error). The caller must not fall back to the OS opener here.
+    Ambiguous(String),
+}
+
+impl std::fmt::Display for HerdrPaneError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HerdrPaneError::Unavailable(message) | HerdrPaneError::Ambiguous(message) => {
+                write!(f, "{message}")
+            }
+        }
+    }
+}
+
 /// Runs `editor_cmd` on `config_path` inside a herdr pane, for the `c` keybinding: reuses an
 /// already-open editor pane if a previous `c` press created one ([`plugin::herdr_cli::agent_focus`]
 /// on [`plugin::editor::EDITOR_AGENT_NAME`]), otherwise opens a fresh tab for it
@@ -637,18 +663,28 @@ async fn implement_one(
 /// instance is correct here, unlike `implement_one`'s per-issue names. A cleanup `pane_close`
 /// failure is logged but never turned into an `Err` — the editor itself already opened
 /// successfully in `started`'s pane by that point, and reporting failure here would make the
-/// caller fall back to the OS opener and open the file a second time. See
+/// caller fall back to the OS opener and open the file a second time.
+///
+/// `agent_start`'s `Err` is treated as [`HerdrPaneError::Ambiguous`], not a plain failure: per
+/// `implement_one`'s doc on the same `herdr_cli` call, a timed-out `run_with_timeout` (no
+/// `kill_on_drop` on the underlying subprocess) doesn't mean the editor never started — it may
+/// well be up in the tab that was just created. Reporting this as `Unavailable` would make
+/// [`open_config_editor`] fall back to the OS opener, opening `config.toml` a second time
+/// whenever the herdr call actually succeeded despite the client-side timeout. See
 /// docs/superpowers/specs/2026-08-11-editor-handling-design.md.
 async fn open_config_in_herdr_pane(
     herdr_bin: &str,
     editor_cmd: &str,
     config_path: &std::path::Path,
-) -> std::result::Result<(), String> {
-    if plugin::herdr_cli::agent_focus(herdr_bin, plugin::editor::EDITOR_AGENT_NAME)
-        .await
-        .is_ok()
-    {
-        return Ok(());
+) -> std::result::Result<(), HerdrPaneError> {
+    match plugin::herdr_cli::agent_focus(herdr_bin, plugin::editor::EDITOR_AGENT_NAME).await {
+        Ok(()) => return Ok(()),
+        Err(err) => {
+            tracing::debug!(
+                "no existing '{}' pane to focus ({err}) — creating a new tab",
+                plugin::editor::EDITOR_AGENT_NAME
+            );
+        }
     }
 
     let cwd = config_path
@@ -660,9 +696,9 @@ async fn open_config_in_herdr_pane(
     let created_tab =
         plugin::herdr_cli::tab_create(herdr_bin, &cwd, plugin::editor::EDITOR_AGENT_NAME)
             .await
-            .map_err(|err| format!("failed to create a tab: {err}"))?;
+            .map_err(|err| HerdrPaneError::Unavailable(format!("failed to create a tab: {err}")))?;
 
-    let started = plugin::herdr_cli::agent_start(
+    let started = match plugin::herdr_cli::agent_start(
         herdr_bin,
         plugin::editor::EDITOR_AGENT_NAME,
         &cwd,
@@ -670,7 +706,17 @@ async fn open_config_in_herdr_pane(
         &argv,
     )
     .await
-    .map_err(|err| format!("tab created but the editor failed to start: {err}"))?;
+    {
+        Ok(started) => started,
+        Err(err) => {
+            return Err(HerdrPaneError::Ambiguous(format!(
+                "tab created but the editor-start call failed ({err}) — check the '{}' tab: it \
+                 may be empty (safe to close) or the editor may have started anyway despite the \
+                 error, so verify before closing it",
+                plugin::editor::EDITOR_AGENT_NAME
+            )));
+        }
+    };
 
     if started.pane_id != created_tab.root_pane_id {
         if let Err(err) = plugin::herdr_cli::pane_close(herdr_bin, &created_tab.root_pane_id).await
@@ -718,7 +764,11 @@ async fn open_config_editor(
     if let Some(cmd) = &editor_cmd {
         match open_config_in_herdr_pane(herdr_bin, cmd, path).await {
             Ok(()) => return Ok(()),
-            Err(err) => {
+            // The tab may already exist with the editor running in it — falling back to the
+            // OS opener here would risk opening the file a second time, so this is reported
+            // straight to the caller instead of being retried. See `HerdrPaneError`'s doc.
+            Err(HerdrPaneError::Ambiguous(message)) => return Err(message),
+            Err(HerdrPaneError::Unavailable(err)) => {
                 tracing::warn!(
                     "herdr editor pane unavailable, falling back to the OS opener: {err}"
                 );
@@ -899,6 +949,31 @@ fn status_with_warnings(message: String, warnings: &[String]) -> String {
     }
 }
 
+/// Computes the status to show once [`open_config_editor`] finishes, for the `Action::OpenConfig`
+/// handler in [`event_loop`]. Success always clears status, failure always sets an error one —
+/// pulled out into a pure function (rather than the inline `match` `event_loop` used to have)
+/// specifically because this exact piece of logic churned twice across TF-614's own review
+/// (commit `60228f8` gated the transient "Opening config.toml…" status on `editor_cmd.is_some()`,
+/// which left a *stale* error banner on screen after a later successful `c` press; `1d9ce17`
+/// reverted that gate, fixing the stale banner but reintroducing the asymmetry it was meant to
+/// avoid — an unconditional `clear_status()` on success with no matching unconditional `set` can
+/// wipe an unrelated pre-existing banner, e.g. an "N/M started" summary from `ImplementMany`, on
+/// the OS-opener-only tier where no transient status used to be shown at all). The fix that
+/// actually holds both invariants is for `event_loop` to show the transient status
+/// unconditionally too (not gated on `editor_cmd.is_some()`), so every `Action::OpenConfig` press
+/// deliberately supersedes whatever was on screen and then either clears its own message (success)
+/// or replaces it with an error (failure) — never a bare clear with no matching set.
+fn open_config_result_status(
+    result: &std::result::Result<(), String>,
+) -> Option<plugin::app::Status> {
+    match result {
+        Ok(()) => None,
+        Err(message) => Some(plugin::app::Status::Error(format!(
+            "{message}. Edit it manually."
+        ))),
+    }
+}
+
 /// Returns true for a key/modifiers combination that should be honored as a quit request when
 /// it turns up in [`flush_buffered_quit`]'s drain — bare `q`, or Ctrl+C (which crossterm reports
 /// as `KeyCode::Char('c')` plus `KeyModifiers::CONTROL`, not a dedicated key code, so it's
@@ -984,14 +1059,12 @@ async fn event_loop(
                             // Unlike `OpenInBrowser` above, this chains filesystem writes and
                             // (possibly) a herdr round-trip in front of the final "open it"
                             // step — each with real, user-hittable failure modes (permission
-                            // denied, disk full, herdr unreachable) — and it's the sole recovery
-                            // action offered on the error screen. Silently doing nothing here
-                            // would leave the user stuck with no indication that pressing `c`
-                            // didn't work, so unlike `OpenInBrowser` this surfaces a failure via
-                            // `set_status` rather than discarding it. On success, no status is
-                            // shown at all regardless of which tier provided it (deliberate —
-                            // see docs/superpowers/specs/2026-08-11-editor-handling-design.md's
-                            // "silent fallback").
+                            // denied, disk full, herdr unreachable) — and it's one of the
+                            // recovery actions offered on the error screen. Silently doing
+                            // nothing here would leave the user stuck with no indication that
+                            // pressing `c` didn't work, so unlike `OpenInBrowser` this surfaces a
+                            // failure via `set_status` rather than discarding it. See
+                            // docs/superpowers/specs/2026-08-11-editor-handling-design.md.
                             let ensure_result: Result<(), String> = (|| {
                                 if let Some(parent) = path.parent() {
                                     std::fs::create_dir_all(parent).map_err(|e| {
@@ -1015,16 +1088,14 @@ async fn event_loop(
                                 }
                                 Ok(()) => {
                                     let editor_cmd = resolve_editor_command_from_env();
-                                    // Only shown when a herdr round-trip is actually about to
-                                    // happen — the OS-opener-only path (`editor_cmd` is `None`)
-                                    // is normally near-instant, so a "loading" status for it
-                                    // would just flicker.
-                                    if editor_cmd.is_some() {
-                                        app.set_status(plugin::app::Status::Ok(
-                                            "Opening config.toml…".to_string(),
-                                        ));
-                                        terminal.draw(|frame| plugin::ui::draw(frame, app))?;
-                                    }
+                                    // Shown unconditionally, not gated on `editor_cmd.is_some()`
+                                    // — see `open_config_result_status`'s doc for why: it keeps
+                                    // this set symmetric with the unconditional `clear`/`set`
+                                    // below on every tier, including the OS-opener-only one.
+                                    app.set_status(plugin::app::Status::Ok(
+                                        "Opening config.toml…".to_string(),
+                                    ));
+                                    terminal.draw(|frame| plugin::ui::draw(frame, app))?;
 
                                     let herdr_bin = plugin::herdr_cli::herdr_bin();
                                     let result =
@@ -1033,15 +1104,15 @@ async fn event_loop(
                                         })
                                         .await;
 
-                                    match result {
-                                        Ok(()) => app.clear_status(),
-                                        Err(message) => {
-                                            app.set_status(plugin::app::Status::Error(format!(
-                                                "{message}. Edit it manually."
-                                            )));
-                                        }
+                                    match open_config_result_status(&result) {
+                                        Some(status) => app.set_status(status),
+                                        None => app.clear_status(),
                                     }
                                 }
+                            }
+
+                            if flush_buffered_quit()? {
+                                break;
                             }
                         }
                         plugin::app::Action::Retry | plugin::app::Action::EnterView => {
@@ -1225,6 +1296,61 @@ esac
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn open_config_in_herdr_pane_threads_the_agent_name_editor_cmd_and_cwd_into_the_cli_calls(
+    ) {
+        // `write_editor_herdr_script`'s tests above only prove the right subcommand runs in the
+        // right order — none of them inspect the argv beyond `$1 $2`. A regression that hardcoded
+        // the wrong editor, reused a stale pane name, or dropped/swapped `cwd`/`config_path`
+        // would pass every one of them. This captures every call's full argv instead.
+        let capture_dir = tempfile::tempdir().unwrap();
+        let args_file = capture_dir.path().join("args.txt");
+        let (_dir, script) = write_fake_herdr_script(&format!(
+            r#"
+printf 'CALL: %s\n' "$*" >> "{args_file}"
+case "$1 $2" in
+  "agent focus")
+    echo '{{"error":{{"code":"agent_not_found","message":"agent target config not found"}}}}'
+    exit 1
+    ;;
+  "tab create")
+    echo '{{"result":{{"tab":{{"tab_id":"t2","label":"herdr-linear-config"}},"root_pane":{{"pane_id":"p9"}}}}}}'
+    exit 0
+    ;;
+  "agent start")
+    echo '{{"result":{{"agent":{{"pane_id":"p1","tab_id":"t2"}}}}}}'
+    exit 0
+    ;;
+  "pane close")
+    echo '{{"result":{{}}}}'
+    exit 0
+    ;;
+esac
+"#,
+            args_file = args_file.display()
+        ));
+
+        let result = open_config_in_herdr_pane(
+            script.to_str().unwrap(),
+            "nvim",
+            std::path::Path::new("/fake/config/dir/config.toml"),
+        )
+        .await;
+
+        assert_eq!(result, Ok(()));
+
+        let captured = std::fs::read_to_string(&args_file).unwrap();
+        assert_eq!(
+            captured,
+            "CALL: agent focus herdr-linear-config\n\
+             CALL: tab create --cwd /fake/config/dir --label herdr-linear-config --focus\n\
+             CALL: agent start herdr-linear-config --cwd /fake/config/dir --tab t2 --focus -- nvim /fake/config/dir/config.toml\n\
+             CALL: pane close p9\n",
+            "unexpected sequence of herdr CLI calls: {captured}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn open_config_in_herdr_pane_succeeds_even_when_cleanup_pane_close_fails() {
         // The editor already opened successfully in `started`'s pane by the time `pane_close`
         // runs — a leftover empty pane is cosmetic, not a reason to report failure (which would
@@ -1301,8 +1427,8 @@ esac
         )
         .await;
 
-        let Err(message) = result else {
-            panic!("expected Err, got {result:?}");
+        let Err(HerdrPaneError::Unavailable(message)) = result else {
+            panic!("expected Err(Unavailable), got {result:?}");
         };
         assert!(
             message.contains("failed to create a tab") && message.contains("no such workspace"),
@@ -1312,7 +1438,12 @@ esac
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn open_config_in_herdr_pane_fails_when_agent_start_fails_after_a_focus_miss() {
+    async fn open_config_in_herdr_pane_returns_ambiguous_when_agent_start_fails_after_a_focus_miss()
+    {
+        // `agent_start`'s `Err` doesn't mean the editor never started (see this function's own
+        // doc on `run_with_timeout`'s lack of `kill_on_drop`) — so this must be reported as
+        // `Ambiguous`, not `Unavailable`, or the caller would fall back to the OS opener and risk
+        // opening the file a second time.
         let (_dir, script) = write_editor_herdr_script(
             r#"echo '{"error":{"message":"agent target config not found"}}'; exit 1"#,
             r#"echo '{"result":{"tab":{"tab_id":"t2","label":"config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
@@ -1327,11 +1458,13 @@ esac
         )
         .await;
 
-        let Err(message) = result else {
-            panic!("expected Err, got {result:?}");
+        let Err(HerdrPaneError::Ambiguous(message)) = result else {
+            panic!("expected Err(Ambiguous), got {result:?}");
         };
         assert!(
-            message.contains("failed to start") && message.contains("no such tab"),
+            message.contains("no such tab")
+                && message.contains("check the")
+                && message.contains(plugin::editor::EDITOR_AGENT_NAME),
             "unexpected message: {message}"
         );
     }
@@ -1413,6 +1546,44 @@ esac
         assert_eq!(
             opener_calls.into_inner(),
             vec![std::path::PathBuf::from("/fake/config/dir/config.toml")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_config_editor_does_not_fall_back_when_agent_start_ambiguously_fails() {
+        // Unlike the `tab_create`-fails case above (nothing was created, safe to fall back),
+        // an `agent_start` failure after a tab was already created is ambiguous — falling back
+        // to the opener here would risk opening the file a second time. The opener must not run.
+        let (_dir, script) = write_editor_herdr_script(
+            r#"echo '{"error":{"message":"agent target config not found"}}'; exit 1"#,
+            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
+            r#"echo '{"error":{"message":"no such tab"}}'; exit 1"#,
+            r#"echo 'pane close should not run'; exit 1"#,
+        );
+        let opener_calls = std::cell::RefCell::new(Vec::new());
+
+        let result = open_config_editor(
+            std::path::Path::new("/fake/config/dir/config.toml"),
+            Some("nvim".to_string()),
+            script.to_str().unwrap(),
+            |p| {
+                opener_calls.borrow_mut().push(p.to_path_buf());
+                Ok(())
+            },
+        )
+        .await;
+
+        let Err(message) = result else {
+            panic!("expected Err, got {result:?}");
+        };
+        assert!(
+            message.contains("check the") && message.contains(plugin::editor::EDITOR_AGENT_NAME),
+            "unexpected message: {message}"
+        );
+        assert!(
+            opener_calls.into_inner().is_empty(),
+            "opener must not run on an ambiguous agent_start failure — it could open the file twice"
         );
     }
 
@@ -1573,6 +1744,21 @@ exit 1
         assert_eq!(
             status_with_warnings("agent didn't become ready".to_string(), &warnings),
             "agent didn't become ready (also: failed to close the tab's now-redundant empty pane: boom; failed to set state to In Progress: boom)"
+        );
+    }
+
+    #[test]
+    fn open_config_result_status_clears_status_on_success() {
+        assert_eq!(open_config_result_status(&Ok(())), None);
+    }
+
+    #[test]
+    fn open_config_result_status_sets_an_error_on_failure() {
+        assert_eq!(
+            open_config_result_status(&Err("herdr unreachable".to_string())),
+            Some(plugin::app::Status::Error(
+                "herdr unreachable. Edit it manually.".to_string()
+            ))
         );
     }
 

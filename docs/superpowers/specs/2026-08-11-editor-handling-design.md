@@ -53,7 +53,7 @@ handle_key('c') → Action::OpenConfig(path)                          [unchanged
                │     config.toml `editor` ──override──▶ "nvim" if on PATH ──none──▶ None
                │
                ├─ Some(cmd) → open_config_in_herdr_pane(herdr_bin, cmd, path).await
-               │     ├─ herdr_cli::agent_focus(herdr_bin, "config")  → Ok ⇒ done
+               │     ├─ herdr_cli::agent_focus(herdr_bin, "herdr-linear-config")  → Ok ⇒ done
                │     └─ Err → tab_create + agent_start(argv=[cmd, path]) + pane_close cleanup
                │
                └─ any failure above (incl. `None`) → open::that(path)  [unchanged fallback]
@@ -81,7 +81,10 @@ Pure decision logic only — no process/socket access, same charter as `implemen
   resolved inputs (mirrors the `resolve_*` functions in `config.rs`), so it stays a pure function.
 - `const EDITOR_AGENT_NAME: &str = "config"` — deliberately global, not derived from repo/issue;
   documented inline with the reasoning above (shared `config.toml` ⇒ shared pane is correct, not
-  an accidental collision).
+  an accidental collision). **Amended during review:** renamed to `"herdr-linear-config"` before
+  merge, to avoid colliding with a user's own pane literally named `"config"` — see
+  `src/plugin/editor.rs`'s `EDITOR_AGENT_NAME` for the final value; every other `"config"`
+  pane-name reference in this doc is stale in the same way.
 - `build_editor_argv(editor_cmd: &str, config_path: &Path) -> Vec<String>` →
   `[editor_cmd, config_path.display().to_string()]`.
 
@@ -134,17 +137,34 @@ Execution, staged with silent fallthrough (no status message unless the final st
 
 | Stage | Action | On failure |
 |---|---|---|
-| 1/2 | `agent_focus("config")` | → next |
-| 1b  | `tab_create` + `agent_start` | → next |
+| 1/2 | `agent_focus("herdr-linear-config")` | → next |
+| 1b  | `tab_create` | → next (nothing was created — safe to fall through) |
+| 1c  | `agent_start` | → **not** "next": reported straight to the user instead (see below) |
 | 3   | `open::that(path)` | → `Status::Error("Couldn't open {path}: {e}. Edit it manually.")` — unchanged from today |
 
 The chain is "first success wins", not "try all" — once a stage succeeds, later stages are
 skipped entirely, so the file is never opened twice.
 
+**Amended during review:** stage 1c (`agent_start`) doesn't fall through to stage 3 like stages
+1/2 and 1b do. `agent_start`'s `Err` doesn't reliably mean the editor never started — the
+underlying `run_with_timeout` call has no `kill_on_drop`, so a client-side timeout can still
+leave the process running server-side (the same caveat `implement_one` already documents for
+this identical call). Falling through to `open::that` in that case risked opening the file a
+second time. Instead, `open_config_in_herdr_pane` reports this stage's failure as
+`HerdrPaneError::Ambiguous` (distinct from `HerdrPaneError::Unavailable` for stages 1/2 and 1b,
+where nothing was created and falling through is safe), and `open_config_editor` propagates an
+`Ambiguous` failure straight to the caller instead of retrying via `open::that` — see
+`src/main.rs`'s `HerdrPaneError` and `open_config_in_herdr_pane` for the final behavior. This
+also means the "silent fallthrough" framing above is no longer literally true: a transient
+`"Opening config.toml…"` status is now shown unconditionally before every attempt (not gated on
+whether a herdr round-trip is happening) and cleared on success, so `event_loop`'s `set`/`clear`
+stay symmetric on every tier — see `open_config_result_status`.
+
 **Known, accepted race:** two `c` presses in quick succession (before the first `agent_start`
 round-trip completes) could both see `agent_focus` fail and both attempt to create a tab, briefly
-producing two "config" panes. Not guarded against — self-heals on the next `c` press (one of the
-two is then found via `agent_focus`), and is harmless (two nvim instances on the same file; nvim's
+producing two "herdr-linear-config" panes. Not guarded against — self-heals on the next `c` press
+(one of the two is then found via `agent_focus`), and is harmless (two nvim instances on the same
+file; nvim's
 own swap-file warning covers it). Same risk class already accepted by `agent_start`'s existing
 `agent_name_taken` retry logic for the AI-agent flow.
 

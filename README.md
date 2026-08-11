@@ -345,8 +345,8 @@ was reversed: herdr's tab list can only report the underlying binary a pane runs
 one started bare. Under the old precedence, `agent_command = "hr"` could never actually take
 effect once any other Claude Code tab was open.)
 
-`c` tries to open `config.toml` in `nvim`, inside a fresh herdr pane, so it's usable over SSH
-(e.g. herdr on an iPad) where there's no GUI to hand the file to. Set `editor` in the same
+`c` tries to open `config.toml` in `nvim`, inside a herdr pane, so it's usable over SSH (e.g.
+herdr on an iPad) where there's no GUI to hand the file to. Set `editor` in the same
 `config.toml` to use a different command instead (a bare binary name, no flags — e.g.
 `editor = "vim"`); it's launched the same way, inside a herdr pane. If neither `nvim` nor an
 `editor` override is available, or the herdr pane couldn't be opened, `c` falls back to your
