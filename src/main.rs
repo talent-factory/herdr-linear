@@ -901,7 +901,19 @@ async fn event_loop(
                             // one; draw that before the fetch's own round-trip so
                             // it's visible instead of leaving the stale previous frame.
                             terminal.draw(|frame| plugin::ui::draw(frame, app))?;
+                            // `ensure_loaded` can block for up to ~2 minutes riding out
+                            // TF-610's rate-limit retry (up to 3 attempts, each waiting up
+                            // to 60s on the server's Retry-After) with no visible progress —
+                            // during that window keys the user presses, including quit, just
+                            // buffer up in the terminal instead of being handled. Drain them
+                            // the same way the Implement/ImplementMany arms below do, so a
+                            // quit pressed while this was stuck actually takes effect instead
+                            // of leaving the app looking hung.
                             ensure_loaded(app, client).await;
+
+                            if flush_buffered_quit()? {
+                                break;
+                            }
                         }
                         plugin::app::Action::Implement(issue) => {
                             app.set_status(plugin::app::Status::Ok(format!(
