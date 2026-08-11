@@ -81,15 +81,23 @@ pub fn resolve_editor_command(
     find_on_path(path_env, "nvim").map(|_| "nvim".to_string())
 }
 
-/// Constructs the argv list for launching an editor with a config file.
-///
-/// Given an editor command and the path to the config file, returns a vector with the command
-/// and the path as its argument.
-pub fn build_editor_argv(editor_cmd: &str, config_path: &Path) -> Vec<String> {
-    vec![
-        editor_cmd.to_string(),
-        config_path.to_string_lossy().into_owned(),
-    ]
+/// Shell-quotes `s` for safe interpolation into a command typed via `pane_run`: wraps it in
+/// single quotes, escaping any embedded single quote as `'\''` (the standard POSIX-shell
+/// technique — close the quote, emit an escaped literal quote, reopen the quote).
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// Builds the shell command line to type into a fresh pane (via
+/// `crate::plugin::herdr_cli::pane_run`) to launch `editor_cmd` on `config_path`. Unlike the old
+/// `build_editor_argv` (removed, TF-624) this returns one shell-quoted string, not an argv
+/// vector — `pane_run` types text into an already-interactive shell rather than exec'ing argv
+/// directly.
+pub fn build_editor_command(editor_cmd: &str, config_path: &Path) -> String {
+    format!(
+        "{editor_cmd} {}",
+        shell_quote(&config_path.to_string_lossy())
+    )
 }
 
 #[cfg(test)]
@@ -231,18 +239,16 @@ mod tests {
     }
 
     #[test]
-    fn build_editor_argv_pairs_the_command_with_the_config_path() {
-        let argv = build_editor_argv(
-            "nvim",
-            Path::new("/home/user/.config/herdr-linear/config.toml"),
-        );
+    fn build_editor_command_joins_the_editor_and_shell_quoted_config_path() {
+        let command = build_editor_command("nvim", Path::new("/fake/config/dir/config.toml"));
 
-        assert_eq!(
-            argv,
-            vec![
-                "nvim".to_string(),
-                "/home/user/.config/herdr-linear/config.toml".to_string()
-            ]
-        );
+        assert_eq!(command, "nvim '/fake/config/dir/config.toml'");
+    }
+
+    #[test]
+    fn build_editor_command_escapes_an_embedded_single_quote_in_the_path() {
+        let command = build_editor_command("nvim", Path::new("/fake/o'brien/config.toml"));
+
+        assert_eq!(command, r"nvim '/fake/o'\''brien/config.toml'");
     }
 }
