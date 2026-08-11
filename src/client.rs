@@ -3,6 +3,7 @@
 use crate::error::{api_error, graphql_error, Error, Result};
 use crate::models::*;
 use crate::queries::*;
+use futures_util::stream::{self, StreamExt};
 use reqwest::{Client as HttpClient, StatusCode};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -11,11 +12,105 @@ use tracing::{debug, error, warn};
 const LINEAR_API_ENDPOINT: &str = "https://api.linear.app/graphql";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Number of attempts made for a single GraphQL operation before a
+/// persistent `Error::RateLimitExceeded` is surfaced to the caller. Counts
+/// the initial request, so `3` means up to 2 automatic retries. Not
+/// currently overridable (unlike this file's `DEFAULT_*` constants, which
+/// all have an options-struct override path), hence no `DEFAULT_` prefix.
+const RATE_LIMIT_MAX_ATTEMPTS: u32 = 3;
+
+/// Base delay for the exponential-backoff fallback used when a rate-limited
+/// response doesn't carry a usable `retry_after_ms` (i.e. it's `0`).
+/// Attempt `n` (1-indexed) waits `RATE_LIMIT_BACKOFF_BASE * 2^(n-1)`, capped
+/// at `RATE_LIMIT_MAX_WAIT`.
+const RATE_LIMIT_BACKOFF_BASE: Duration = Duration::from_millis(500);
+
+/// Upper bound on any single rate-limit wait, whether sourced from the
+/// server's `Retry-After` value or the exponential-backoff fallback. Guards
+/// against a hostile/misconfigured `Retry-After` value — or a future,
+/// larger `RATE_LIMIT_MAX_ATTEMPTS` — blocking the caller for an
+/// unreasonable amount of time.
+const RATE_LIMIT_MAX_WAIT: Duration = Duration::from_secs(60);
+
+/// Default number of items requested per page by `get_all_*` calls that don't
+/// override it — matches the default used by the single-page methods.
+const DEFAULT_PAGE_SIZE: i32 = 50;
+
+/// Default safety cap on the number of pages a `get_all_*` call will fetch
+/// before aborting with `Error::InvalidRequest`, in case a misbehaving API
+/// never reports `hasNextPage: false`.
+const DEFAULT_MAX_PAGES: usize = 100;
+
+/// Default safety cap on the total number of items a `get_all_*` call will
+/// accumulate before aborting with `Error::InvalidRequest`. Checked only when
+/// more pages remain, so a call that finishes exactly on (or slightly past,
+/// by up to one page's worth of items) this cap on its final page still
+/// succeeds — the cap guards against runaway pagination, not result size.
+const DEFAULT_MAX_ITEMS: usize = 10_000;
+
+/// Default number of requests `execute_batch` runs concurrently when the
+/// caller doesn't override it.
+const DEFAULT_BATCH_CONCURRENCY: usize = 5;
+
+/// Options controlling an auto-paginating `get_all_*` call.
+///
+/// All fields are optional; unset fields fall back to this crate's default
+/// page size (50), max page count (100), and max item count (10,000)
+/// respectively. The caps exist so a `get_all_*` call can't loop forever (or
+/// exhaust memory) against an API that keeps reporting more pages than
+/// expected.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PaginationOptions {
+    /// Number of items requested per page.
+    pub page_size: Option<i32>,
+    /// Maximum number of pages to fetch before aborting.
+    pub max_pages: Option<usize>,
+    /// Maximum number of items to accumulate before aborting.
+    pub max_items: Option<usize>,
+}
+
+impl PaginationOptions {
+    /// Override the page size requested per call. Must be positive (a
+    /// non-positive value is rejected before any request is sent). Linear's
+    /// API caps `first` at 250 regardless of what's requested here.
+    pub fn with_page_size(mut self, page_size: i32) -> Self {
+        self.page_size = Some(page_size);
+        self
+    }
+
+    /// Override the max-pages safety cap.
+    pub fn with_max_pages(mut self, max_pages: usize) -> Self {
+        self.max_pages = Some(max_pages);
+        self
+    }
+
+    /// Override the max-items safety cap.
+    pub fn with_max_items(mut self, max_items: usize) -> Self {
+        self.max_items = Some(max_items);
+        self
+    }
+}
+
+/// Build a filter matching issues belonging to `team_id`.
+///
+/// Shared by [`LinearClient::get_team_issues`] and
+/// [`LinearClient::get_all_team_issues`] so the two stay in sync.
+fn team_filter(team_id: &str) -> Value {
+    json!({
+        "team": {
+            "id": {
+                "eq": team_id
+            }
+        }
+    })
+}
+
 /// Linear GraphQL API client
 pub struct LinearClient {
     http_client: HttpClient,
     api_key: String,
     endpoint: String,
+    rate_limit_retry: bool,
 }
 
 impl LinearClient {
@@ -42,6 +137,7 @@ impl LinearClient {
             http_client,
             api_key,
             endpoint: LINEAR_API_ENDPOINT.to_string(),
+            rate_limit_retry: true,
         })
     }
 
@@ -57,6 +153,18 @@ impl LinearClient {
         Ok(client)
     }
 
+    /// Enables or disables automatic retry-with-backoff on
+    /// `Error::RateLimitExceeded`. When disabled, a rate-limited response is
+    /// surfaced to the caller immediately (fail-fast) instead of being
+    /// retried.
+    ///
+    /// Retry is enabled by default; call `with_rate_limit_retry(false)` when
+    /// the caller wants to own its own wait-and-retry (or backoff) strategy.
+    pub fn with_rate_limit_retry(mut self, enabled: bool) -> Self {
+        self.rate_limit_retry = enabled;
+        self
+    }
+
     /// Get the authenticated user (viewer)
     pub async fn get_viewer(&self) -> Result<User> {
         debug!("Fetching viewer");
@@ -70,7 +178,7 @@ impl LinearClient {
             .ok_or_else(|| graphql_error("Failed to parse viewer data"))
     }
 
-    /// Get all teams
+    /// Get one page of teams
     pub async fn get_teams(
         &self,
         limit: Option<i32>,
@@ -78,7 +186,7 @@ impl LinearClient {
     ) -> Result<Connection<Team>> {
         debug!("Fetching teams");
         let variables = json!({
-            "first": limit.unwrap_or(50),
+            "first": limit.unwrap_or(DEFAULT_PAGE_SIZE),
             "after": after
         });
 
@@ -90,6 +198,17 @@ impl LinearClient {
             .get("teams")
             .and_then(|t| serde_json::from_value(t.clone()).ok())
             .ok_or_else(|| graphql_error("Failed to parse teams data"))
+    }
+
+    /// Fetch every team by transparently paging through [`Self::get_teams`]
+    /// until `hasNextPage` is `false`.
+    ///
+    /// See [`PaginationOptions`] for page-size and safety-cap configuration.
+    pub async fn get_all_teams(&self, options: PaginationOptions) -> Result<Vec<Team>> {
+        self.paginate_all(options, move |page_size, after| {
+            self.get_teams(Some(page_size), after)
+        })
+        .await
     }
 
     /// Get a team by ID
@@ -120,7 +239,7 @@ impl LinearClient {
     ) -> Result<Connection<Issue>> {
         debug!("Fetching issues with filter: {:?}", filter);
         let variables = json!({
-            "first": limit.unwrap_or(50),
+            "first": limit.unwrap_or(DEFAULT_PAGE_SIZE),
             "after": after,
             "filter": filter.unwrap_or(Value::Null)
         });
@@ -133,6 +252,21 @@ impl LinearClient {
             .get("issues")
             .and_then(|i| serde_json::from_value(i.clone()).ok())
             .ok_or_else(|| graphql_error("Failed to parse issues data"))
+    }
+
+    /// Fetch every issue matching `filter` by transparently paging through
+    /// [`Self::get_issues`] until `hasNextPage` is `false`.
+    ///
+    /// See [`PaginationOptions`] for page-size and safety-cap configuration.
+    pub async fn get_all_issues(
+        &self,
+        filter: Option<Value>,
+        options: PaginationOptions,
+    ) -> Result<Vec<Issue>> {
+        self.paginate_all(options, move |page_size, after| {
+            self.get_issues(filter.clone(), Some(page_size), after)
+        })
+        .await
     }
 
     /// Get a single issue by ID
@@ -156,15 +290,22 @@ impl LinearClient {
         limit: Option<i32>,
     ) -> Result<Connection<Issue>> {
         debug!("Fetching issues for team: {}", team_id);
-        let filter = json!({
-            "team": {
-                "id": {
-                    "eq": team_id
-                }
-            }
-        });
+        self.get_issues(Some(team_filter(team_id)), limit, None)
+            .await
+    }
 
-        self.get_issues(Some(filter), limit, None).await
+    /// Fetch every issue for a specific team by transparently paging through
+    /// [`Self::get_all_issues`] with a team filter applied, until
+    /// `hasNextPage` is `false`.
+    ///
+    /// See [`PaginationOptions`] for page-size and safety-cap configuration.
+    pub async fn get_all_team_issues(
+        &self,
+        team_id: &str,
+        options: PaginationOptions,
+    ) -> Result<Vec<Issue>> {
+        self.get_all_issues(Some(team_filter(team_id)), options)
+            .await
     }
 
     /// Create a new issue
@@ -248,7 +389,7 @@ impl LinearClient {
             .ok_or_else(|| graphql_error("Failed to add comment"))
     }
 
-    /// Get all projects
+    /// Get one page of projects
     ///
     /// # Arguments
     /// * `filter` - Optional filter criteria (JSON value)
@@ -262,7 +403,7 @@ impl LinearClient {
     ) -> Result<Connection<Project>> {
         debug!("Fetching projects");
         let variables = json!({
-            "first": limit.unwrap_or(50),
+            "first": limit.unwrap_or(DEFAULT_PAGE_SIZE),
             "after": after,
             "filter": filter.unwrap_or(Value::Null)
         });
@@ -277,12 +418,27 @@ impl LinearClient {
             .ok_or_else(|| graphql_error("Failed to parse projects data"))
     }
 
+    /// Fetch every project matching `filter` by transparently paging through
+    /// [`Self::get_projects`] until `hasNextPage` is `false`.
+    ///
+    /// See [`PaginationOptions`] for page-size and safety-cap configuration.
+    pub async fn get_all_projects(
+        &self,
+        filter: Option<Value>,
+        options: PaginationOptions,
+    ) -> Result<Vec<Project>> {
+        self.paginate_all(options, move |page_size, after| {
+            self.get_projects(filter.clone(), Some(page_size), after)
+        })
+        .await
+    }
+
     /// Get cycles for a team
     pub async fn get_cycles(&self, team_id: &str, limit: Option<i32>) -> Result<Connection<Cycle>> {
         debug!("Fetching cycles for team: {}", team_id);
         let variables = json!({
             "filter": {"team": {"id": {"eq": team_id}}},
-            "first": limit.unwrap_or(50)
+            "first": limit.unwrap_or(DEFAULT_PAGE_SIZE)
         });
 
         let response = self
@@ -328,7 +484,24 @@ impl LinearClient {
         self.execute_graphql(mutation, variables, true).await
     }
 
-    /// Internal method to execute GraphQL operations
+    /// Internal method to execute GraphQL operations, transparently retrying
+    /// on `Error::RateLimitExceeded` (unless disabled via
+    /// [`with_rate_limit_retry`](Self::with_rate_limit_retry)).
+    ///
+    /// Waits the server-provided `retry_after_ms` between attempts, falling
+    /// back to exponential backoff when that value is `0` (not usable), and
+    /// clamping either source to [`RATE_LIMIT_MAX_WAIT`]. Gives up after
+    /// [`RATE_LIMIT_MAX_ATTEMPTS`] attempts and returns the last
+    /// `Error::RateLimitExceeded` unchanged.
+    ///
+    /// Retrying is safe even for mutations: `Error::RateLimitExceeded` is
+    /// only ever produced by [`execute_graphql_once`](Self::execute_graphql_once)
+    /// when the *rate limiter itself* rejected the request (HTTP 429, or
+    /// HTTP 400 with a `RATELIMITED` GraphQL error code) — both signal that
+    /// Linear never reached the resolver, so no mutation side effect can
+    /// exist to duplicate. This assumption would need re-checking before
+    /// ever retrying on other error kinds (5xx, network timeouts), where a
+    /// mutation may already have been applied server-side.
     async fn execute_graphql<T: serde::de::DeserializeOwned>(
         &self,
         operation: &str,
@@ -339,19 +512,108 @@ impl LinearClient {
             "query": operation,
             "variables": variables
         });
+        let kind = if is_mutation { "mutation" } else { "query" };
 
-        debug!(
-            "Executing {} with payload: {}",
-            if is_mutation { "mutation" } else { "query" },
-            payload
-        );
+        debug!("Executing {kind} with payload: {payload}");
 
+        let mut attempt: u32 = 1;
+
+        loop {
+            let result = self.execute_graphql_once(&payload).await;
+
+            if let Err(Error::RateLimitExceeded { retry_after_ms }) = &result {
+                if self.rate_limit_retry && attempt < RATE_LIMIT_MAX_ATTEMPTS {
+                    let wait = Self::rate_limit_backoff(attempt, *retry_after_ms);
+                    warn!(
+                        "Rate limited by Linear API ({kind}, attempt {attempt}/{RATE_LIMIT_MAX_ATTEMPTS}), retrying in {}ms",
+                        wait.as_millis()
+                    );
+                    tokio::time::sleep(wait).await;
+                    attempt += 1;
+                    continue;
+                } else if self.rate_limit_retry {
+                    warn!(
+                        "Rate limited by Linear API ({kind}): retry budget exhausted after {attempt} attempt(s), surfacing error"
+                    );
+                } else {
+                    warn!(
+                        "Rate limited by Linear API ({kind}, retry_after_ms={retry_after_ms}): automatic retry disabled, surfacing error"
+                    );
+                }
+            }
+
+            return result;
+        }
+    }
+
+    /// Computes the wait before a rate-limit retry attempt (1-indexed).
+    /// Uses `retry_after_ms` when it's usable (non-zero); otherwise falls
+    /// back to exponential backoff seeded from `RATE_LIMIT_BACKOFF_BASE`.
+    /// Either source is clamped to `RATE_LIMIT_MAX_WAIT`, and the fallback
+    /// uses `saturating_mul` with a capped exponent so this never panics,
+    /// regardless of how large `attempt` gets.
+    fn rate_limit_backoff(attempt: u32, retry_after_ms: u64) -> Duration {
+        let wait = if retry_after_ms > 0 {
+            Duration::from_millis(retry_after_ms)
+        } else {
+            let exponent = attempt.saturating_sub(1).min(16);
+            RATE_LIMIT_BACKOFF_BASE.saturating_mul(2u32.pow(exponent))
+        };
+        wait.min(RATE_LIMIT_MAX_WAIT)
+    }
+
+    /// Parses a `Retry-After` response header in `delay-seconds` form (RFC
+    /// 9110 §10.2.3) into milliseconds. Returns `0` — "not usable, fall
+    /// back to exponential backoff" — when the header is absent, not valid
+    /// ASCII, or doesn't parse as a non-negative integer number of seconds.
+    ///
+    /// This intentionally does not parse the RFC-legal HTTP-date form of
+    /// `Retry-After` (e.g. `Fri, 31 Dec 1999 23:59:59 GMT`): Linear's own
+    /// rate-limiting docs don't document sending this header at all, so
+    /// `delay-seconds` support here is best-effort rather than a documented
+    /// contract worth a date-parsing dependency.
+    fn parse_retry_after_ms(headers: &reqwest::header::HeaderMap) -> u64 {
+        headers
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(|secs| secs.saturating_mul(1000))
+            .unwrap_or(0)
+    }
+
+    /// Returns `true` if `body` is a GraphQL error response containing at
+    /// least one error whose `extensions.code` is `"RATELIMITED"` — the
+    /// code Linear's GraphQL API uses (via an HTTP 400 response) to signal
+    /// that a request was rejected by its rate limiter. Any other shape (a
+    /// different `extensions.code`, no `extensions` at all, or a body that
+    /// doesn't even parse as a GraphQL response) returns `false`, so
+    /// ordinary HTTP 400s fall through to `Error::ApiError` unchanged.
+    fn is_rate_limited_error_body(body: &str) -> bool {
+        let Ok(parsed) = serde_json::from_str::<GraphQLResponse<Value>>(body) else {
+            return false;
+        };
+        parsed.errors.is_some_and(|errors| {
+            errors.iter().any(|e| {
+                e.extensions
+                    .as_ref()
+                    .and_then(|ext| ext.get("code"))
+                    .and_then(|code| code.as_str())
+                    == Some("RATELIMITED")
+            })
+        })
+    }
+
+    /// Performs a single GraphQL request/response round-trip with no retry.
+    async fn execute_graphql_once<T: serde::de::DeserializeOwned>(
+        &self,
+        payload: &Value,
+    ) -> Result<T> {
         let response = self
             .http_client
             .post(&self.endpoint)
             .header("Authorization", &self.api_key)
             .header("Content-Type", "application/json")
-            .json(&payload)
+            .json(payload)
             .send()
             .await?;
 
@@ -382,10 +644,32 @@ impl LinearClient {
                 ))
             }
             StatusCode::TOO_MANY_REQUESTS => {
-                warn!("Rate limited by Linear API");
-                Err(Error::RateLimitExceeded {
-                    retry_after_ms: 60000,
-                })
+                // Linear's documented rate-limit signal is the HTTP 400 +
+                // `RATELIMITED` case below, but some deployments may front
+                // the GraphQL API with an edge/CDN layer that uses the
+                // standard HTTP 429 status — this branch is kept as a
+                // defense-in-depth fallback for that case.
+                let retry_after_ms = Self::parse_retry_after_ms(response.headers());
+                debug!("Rate limited by Linear API via HTTP 429 (retry_after_ms={retry_after_ms})");
+                Err(Error::RateLimitExceeded { retry_after_ms })
+            }
+            StatusCode::BAD_REQUEST => {
+                // Linear's actual rate-limit signal: HTTP 400 with a
+                // GraphQL error whose `extensions.code` is `RATELIMITED`.
+                // See https://linear.app/developers/rate-limiting — other
+                // causes of 400 fall through to the generic ApiError below.
+                let retry_after_ms = Self::parse_retry_after_ms(response.headers());
+                let body = response.text().await.unwrap_or_default();
+
+                if Self::is_rate_limited_error_body(&body) {
+                    debug!(
+                        "Rate limited by Linear API via HTTP 400 + RATELIMITED (retry_after_ms={retry_after_ms})"
+                    );
+                    return Err(Error::RateLimitExceeded { retry_after_ms });
+                }
+
+                error!("HTTP error {}: {}", status, body);
+                Err(api_error(format!("HTTP {}: {}", status, body)))
             }
             _ => {
                 let body = response.text().await.unwrap_or_default();
@@ -394,11 +678,186 @@ impl LinearClient {
             }
         }
     }
+
+    /// Repeatedly calls `fetch_page` with an advancing `after` cursor,
+    /// accumulating `nodes` from each [`Connection<T>`] until
+    /// `page_info.has_next_page` is `false`.
+    ///
+    /// This is a client-side loop built on top of the existing single-page
+    /// methods; it does not change their behavior. See [`PaginationOptions`]
+    /// for the page-size and safety-cap knobs.
+    ///
+    /// # Errors
+    /// Returns `Error::InvalidRequest` if:
+    /// - `options` resolves to a non-positive `page_size`, or a zero
+    ///   `max_pages`/`max_items` — these can never yield a usable result, so
+    ///   they're rejected before any request is sent.
+    /// - `max_pages` is exceeded while more pages remain.
+    /// - `max_items` is exceeded while more pages remain (a final page that
+    ///   completes the result is still returned even if it pushes the total
+    ///   past `max_items` — the cap guards against runaway pagination, not
+    ///   result size).
+    /// - the API reports `hasNextPage: true` without an `end_cursor` to
+    ///   continue from — an API contract violation that would otherwise be
+    ///   indistinguishable from a legitimately complete (but silently
+    ///   truncated) result.
+    async fn paginate_all<T, F, Fut>(
+        &self,
+        options: PaginationOptions,
+        mut fetch_page: F,
+    ) -> Result<Vec<T>>
+    where
+        F: FnMut(i32, Option<String>) -> Fut,
+        Fut: std::future::Future<Output = Result<Connection<T>>>,
+    {
+        let page_size = options.page_size.unwrap_or(DEFAULT_PAGE_SIZE);
+        let max_pages = options.max_pages.unwrap_or(DEFAULT_MAX_PAGES);
+        let max_items = options.max_items.unwrap_or(DEFAULT_MAX_ITEMS);
+
+        if page_size <= 0 {
+            return Err(Error::InvalidRequest(format!(
+                "auto-pagination rejected: page_size must be positive, got {page_size}"
+            )));
+        }
+        if max_pages == 0 {
+            return Err(Error::InvalidRequest(
+                "auto-pagination rejected: max_pages must be at least 1".to_string(),
+            ));
+        }
+        if max_items == 0 {
+            return Err(Error::InvalidRequest(
+                "auto-pagination rejected: max_items must be at least 1".to_string(),
+            ));
+        }
+
+        let mut items: Vec<T> = Vec::new();
+        let mut after: Option<String> = None;
+        let mut pages_fetched = 0usize;
+
+        loop {
+            if pages_fetched >= max_pages {
+                return Err(Error::InvalidRequest(format!(
+                    "auto-pagination aborted: exceeded max_pages ({max_pages}) with more pages remaining ({} item(s) fetched so far)",
+                    items.len()
+                )));
+            }
+
+            let connection = fetch_page(page_size, after).await?;
+            pages_fetched += 1;
+            items.extend(connection.nodes);
+
+            if !connection.page_info.has_next_page {
+                // Complete: return everything gathered, even if the final
+                // page happened to push the total past `max_items` — the cap
+                // exists to bound an unbounded/misbehaving loop, not to
+                // reject an otherwise-correct, already-finished result.
+                return Ok(items);
+            }
+
+            if items.len() > max_items {
+                return Err(Error::InvalidRequest(format!(
+                    "auto-pagination aborted: exceeded max_items ({max_items}) after {pages_fetched} page(s), with more pages remaining"
+                )));
+            }
+
+            after = match connection.page_info.end_cursor {
+                Some(cursor) => Some(cursor),
+                // A well-behaved API always pairs `hasNextPage: true` with a
+                // cursor to continue from. Treat the absence of one as a
+                // detected API contract violation and fail loudly, rather
+                // than silently returning a truncated result as `Ok`.
+                None => {
+                    return Err(Error::InvalidRequest(format!(
+                        "auto-pagination aborted: API reported hasNextPage=true with no end_cursor after {pages_fetched} page(s) ({} item(s) fetched, result may be incomplete)",
+                        items.len()
+                    )));
+                }
+            };
+        }
+    }
+
+    /// Run a batch of independent Linear requests concurrently, capped at
+    /// `concurrency` in-flight requests at a time (defaults to 5 when
+    /// `None`).
+    ///
+    /// `concurrency` is clamped to `[1, requests.len()]`: `Some(0)` (or a
+    /// smaller value than `1`) would leave no in-flight slots at all, which
+    /// would make every request wait forever rather than run "unbounded" or
+    /// fail loudly, so it's raised to `1` (run one at a time) instead. A
+    /// value larger than `requests.len()` is similarly capped down, since
+    /// more in-flight slots than requests can never be used.
+    ///
+    /// Each element of `requests` is the future for one request — typically
+    /// produced by calling an existing method on this same client (`query`,
+    /// `mutate`, `get_issue`, `update_issue`, ...), so callers reuse this
+    /// client's single pooled `reqwest::Client` rather than `execute_batch`
+    /// needing to know what kind of request it is or creating one of its
+    /// own. Concurrency is bounded with [`StreamExt::buffered`] rather than
+    /// spawning tasks, so `requests` can freely borrow from `self` (or
+    /// anything else in scope) without needing to be `'static` or `Send`.
+    ///
+    /// Unlike a `?`-propagating loop that aborts on the first error,
+    /// `execute_batch` always runs every item to completion and returns one
+    /// [`Result`] per input, in the same order as `requests`, so callers can
+    /// tell exactly which of N items succeeded and which failed. (That
+    /// guarantee covers `Err` results only — a caller-supplied future that
+    /// panics mid-poll unwinds through the whole batch, same as with any
+    /// other `join`-style combinator.)
+    ///
+    /// **The returned `Vec` must be inspected.** Per-item errors aren't
+    /// logged or surfaced anywhere else — dropping the result without
+    /// checking it silently discards every failure in the batch.
+    ///
+    /// # Examples
+    ///
+    /// Bulk-update a list of issues to a new workflow state, five at a
+    /// time, logging any that failed:
+    ///
+    /// ```no_run
+    /// # use herdr_linear::LinearClient;
+    /// # use serde_json::json;
+    /// # async fn example(client: &LinearClient, issue_ids: Vec<String>, state_id: String) {
+    /// let requests = issue_ids
+    ///     .iter()
+    ///     .map(|id| client.update_issue(id, json!({ "stateId": &state_id })))
+    ///     .collect();
+    ///
+    /// let results = client.execute_batch(requests, None).await;
+    /// for (id, result) in issue_ids.iter().zip(&results) {
+    ///     if let Err(e) = result {
+    ///         eprintln!("update failed for {id}: {e}");
+    ///     }
+    /// }
+    /// # }
+    /// ```
+    #[must_use = "each element is a Result; ignoring the Vec discards every per-item error"]
+    pub async fn execute_batch<T, Fut>(
+        &self,
+        requests: Vec<Fut>,
+        concurrency: Option<usize>,
+    ) -> Vec<Result<T>>
+    where
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let concurrency = concurrency
+            .unwrap_or(DEFAULT_BATCH_CONCURRENCY)
+            .clamp(1, requests.len().max(1));
+
+        stream::iter(requests).buffered(concurrency).collect().await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::time::timeout;
+
+    /// Upper bound on how long any single `execute_batch` call is allowed to
+    /// take in these tests. A regression that leaks a `buffered()` slot (or
+    /// otherwise stops making progress) would hang forever rather than
+    /// fail — wrapping the call turns that into a fast, clearly-labeled
+    /// test failure instead of a multi-hour CI timeout.
+    const EXECUTE_BATCH_TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
     #[test]
     fn test_client_creation() {
@@ -414,6 +873,10 @@ mod tests {
 
     #[tokio::test]
     async fn get_viewer_parses_successful_response() {
+        // Also covers "a request that succeeds on the first try incurs no
+        // retry overhead/delay": `mock.assert_async()` below requires
+        // exactly 1 hit (mockito's default), so a spurious retry would fail
+        // this test.
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("POST", "/graphql")
@@ -490,11 +953,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rate_limited_response_maps_to_rate_limit_exceeded() {
+    async fn rate_limited_request_succeeds_after_one_retry() {
+        // Registered first: mockito prefers a still-"missing-hits" mock in
+        // registration order, so the first request hits this 429 mock and
+        // the second (retried) request falls through to `ok` below.
+        // `Retry-After: 1` keeps the real wait the retry performs short
+        // enough for a unit test. (`#[tokio::test(start_paused = true)]`
+        // was tried to make this instant, but it produced spurious
+        // `NetworkError`s against mockito's real I/O, so this test still
+        // pays a real ~1s sleep.)
         let mut server = mockito::Server::new_async().await;
-        server
+        let rate_limited = server
             .mock("POST", "/graphql")
             .with_status(429)
+            .with_header("retry-after", "1")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let ok = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "data": {
+                        "viewer": {
+                            "id": "user-1",
+                            "email": "alice@example.com",
+                            "name": "Alice",
+                            "avatarUrl": null,
+                            "createdAt": "2026-01-01T00:00:00Z",
+                            "updatedAt": "2026-01-01T00:00:00Z"
+                        }
+                    },
+                    "errors": null
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let viewer = client.get_viewer().await.unwrap();
+
+        assert_eq!(viewer.name, "Alice");
+        rate_limited.assert_async().await;
+        ok.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn repeated_rate_limiting_exhausts_the_retry_budget_and_surfaces_the_error() {
+        // No `Retry-After` header, so each wait also exercises the
+        // exponential-backoff fallback (500ms, 1000ms — short enough for a
+        // unit test).
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(429)
+            .expect(RATE_LIMIT_MAX_ATTEMPTS as usize)
             .create_async()
             .await;
 
@@ -505,6 +1026,317 @@ mod tests {
         let err = client.get_viewer().await.unwrap_err();
 
         assert!(matches!(err, Error::RateLimitExceeded { .. }));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn rate_limit_retry_can_be_opted_out() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(429)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap()
+                .with_rate_limit_retry(false);
+
+        let err = client.get_viewer().await.unwrap_err();
+
+        assert!(matches!(err, Error::RateLimitExceeded { .. }));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn rate_limited_mutation_succeeds_after_retry() {
+        // Proves retry isn't silently skipped for mutations: `is_mutation`
+        // is passed into `execute_graphql` (it only affects the log line's
+        // "query"/"mutation" label) but, by design — see `execute_graphql`'s
+        // doc comment — never gates the retry decision.
+        let mut server = mockito::Server::new_async().await;
+        let rate_limited = server
+            .mock("POST", "/graphql")
+            .with_status(429)
+            .with_header("retry-after", "1")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let ok = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "data": {
+                        "commentCreate": {
+                            "comment": {
+                                "id": "comment-1",
+                                "body": "hello",
+                                "user": {
+                                    "id": "user-1",
+                                    "email": "alice@example.com",
+                                    "name": "Alice",
+                                    "avatarUrl": null,
+                                    "createdAt": "2026-01-01T00:00:00Z",
+                                    "updatedAt": "2026-01-01T00:00:00Z"
+                                },
+                                "createdAt": "2026-01-01T00:00:00Z",
+                                "updatedAt": "2026-01-01T00:00:00Z"
+                            }
+                        }
+                    },
+                    "errors": null
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let comment = client.add_comment("issue-1", "hello").await.unwrap();
+
+        assert_eq!(comment.body, "hello");
+        rate_limited.assert_async().await;
+        ok.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn rate_limited_via_http_400_with_ratelimited_code_retries_and_succeeds() {
+        // Linear's actual, documented rate-limit signal:
+        // https://linear.app/developers/rate-limiting
+        let mut server = mockito::Server::new_async().await;
+        let rate_limited = server
+            .mock("POST", "/graphql")
+            .with_status(400)
+            .with_header("content-type", "application/json")
+            .with_header("retry-after", "0")
+            .with_body(
+                json!({
+                    "data": null,
+                    "errors": [{
+                        "message": "Rate limit exceeded",
+                        "extensions": { "code": "RATELIMITED" }
+                    }]
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let ok = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "data": {
+                        "viewer": {
+                            "id": "user-1",
+                            "email": "alice@example.com",
+                            "name": "Alice",
+                            "avatarUrl": null,
+                            "createdAt": "2026-01-01T00:00:00Z",
+                            "updatedAt": "2026-01-01T00:00:00Z"
+                        }
+                    },
+                    "errors": null
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let viewer = client.get_viewer().await.unwrap();
+
+        assert_eq!(viewer.name, "Alice");
+        rate_limited.assert_async().await;
+        ok.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn http_400_without_ratelimited_code_maps_to_api_error_not_rate_limited() {
+        // An ordinary HTTP 400 (bad request shape, validation error, etc.)
+        // must NOT be misclassified as a rate limit — no retry, no
+        // RateLimitExceeded.
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(400)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "data": null,
+                    "errors": [{
+                        "message": "Cannot query field \"bogus\"",
+                        "extensions": { "code": "GRAPHQL_VALIDATION_FAILED" }
+                    }]
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let err = client.get_viewer().await.unwrap_err();
+
+        assert!(matches!(err, Error::ApiError { .. }));
+        mock.assert_async().await;
+    }
+
+    #[test]
+    fn rate_limit_backoff_uses_the_servers_retry_after_when_usable() {
+        assert_eq!(
+            LinearClient::rate_limit_backoff(1, 250),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            LinearClient::rate_limit_backoff(2, 250),
+            Duration::from_millis(250)
+        );
+    }
+
+    #[test]
+    fn rate_limit_backoff_falls_back_to_exponential_backoff_when_retry_after_is_unusable() {
+        assert_eq!(
+            LinearClient::rate_limit_backoff(1, 0),
+            RATE_LIMIT_BACKOFF_BASE
+        );
+        assert_eq!(
+            LinearClient::rate_limit_backoff(2, 0),
+            RATE_LIMIT_BACKOFF_BASE * 2
+        );
+        assert_eq!(
+            LinearClient::rate_limit_backoff(3, 0),
+            RATE_LIMIT_BACKOFF_BASE * 4
+        );
+    }
+
+    #[test]
+    fn rate_limit_backoff_treats_attempt_zero_like_attempt_one() {
+        // Not reachable via the real retry loop (which always starts at
+        // `attempt = 1`), but `rate_limit_backoff` is a free function with
+        // no enforced precondition — document the boundary explicitly.
+        assert_eq!(
+            LinearClient::rate_limit_backoff(0, 0),
+            RATE_LIMIT_BACKOFF_BASE
+        );
+    }
+
+    #[test]
+    fn rate_limit_backoff_clamps_both_sources_to_the_max_wait_cap() {
+        // A huge server-provided `Retry-After` is clamped...
+        assert_eq!(
+            LinearClient::rate_limit_backoff(1, u64::MAX),
+            RATE_LIMIT_MAX_WAIT
+        );
+        // ...and so is a huge exponential-backoff fallback — and neither
+        // panics, however large `attempt` gets.
+        assert_eq!(
+            LinearClient::rate_limit_backoff(u32::MAX, 0),
+            RATE_LIMIT_MAX_WAIT
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_ms_uses_a_valid_delay_seconds_value() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "5".parse().unwrap());
+        assert_eq!(LinearClient::parse_retry_after_ms(&headers), 5000);
+    }
+
+    #[test]
+    fn parse_retry_after_ms_trims_surrounding_whitespace() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, " 5 ".parse().unwrap());
+        assert_eq!(LinearClient::parse_retry_after_ms(&headers), 5000);
+    }
+
+    #[test]
+    fn parse_retry_after_ms_is_zero_when_header_is_missing() {
+        let headers = reqwest::header::HeaderMap::new();
+        assert_eq!(LinearClient::parse_retry_after_ms(&headers), 0);
+    }
+
+    #[test]
+    fn parse_retry_after_ms_is_zero_for_non_numeric_values() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "soon".parse().unwrap());
+        assert_eq!(LinearClient::parse_retry_after_ms(&headers), 0);
+    }
+
+    #[test]
+    fn parse_retry_after_ms_is_zero_for_decimal_values() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "1.5".parse().unwrap());
+        assert_eq!(LinearClient::parse_retry_after_ms(&headers), 0);
+    }
+
+    #[test]
+    fn parse_retry_after_ms_is_zero_for_negative_values() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "-5".parse().unwrap());
+        assert_eq!(LinearClient::parse_retry_after_ms(&headers), 0);
+    }
+
+    #[test]
+    fn parse_retry_after_ms_is_zero_for_an_empty_value() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "".parse().unwrap());
+        assert_eq!(LinearClient::parse_retry_after_ms(&headers), 0);
+    }
+
+    #[test]
+    fn parse_retry_after_ms_saturates_instead_of_overflowing_on_a_huge_value() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            u64::MAX.to_string().parse().unwrap(),
+        );
+        assert_eq!(LinearClient::parse_retry_after_ms(&headers), u64::MAX);
+    }
+
+    #[test]
+    fn is_rate_limited_error_body_detects_the_ratelimited_extension_code() {
+        let body = json!({
+            "data": null,
+            "errors": [{"message": "Rate limit exceeded", "extensions": {"code": "RATELIMITED"}}]
+        })
+        .to_string();
+        assert!(LinearClient::is_rate_limited_error_body(&body));
+    }
+
+    #[test]
+    fn is_rate_limited_error_body_is_false_for_other_error_codes() {
+        let body = json!({
+            "data": null,
+            "errors": [{"message": "nope", "extensions": {"code": "SOMETHING_ELSE"}}]
+        })
+        .to_string();
+        assert!(!LinearClient::is_rate_limited_error_body(&body));
+    }
+
+    #[test]
+    fn is_rate_limited_error_body_is_false_for_unparseable_bodies() {
+        assert!(!LinearClient::is_rate_limited_error_body("not json"));
+        assert!(!LinearClient::is_rate_limited_error_body(""));
     }
 
     #[tokio::test]
@@ -662,6 +1494,896 @@ mod tests {
                 .map(|c| c.team.key.as_str()),
             Some("ENG")
         );
+        mock.assert_async().await;
+    }
+
+    // --- get_all_* auto-pagination helpers -------------------------------
+
+    /// Minimal but schema-complete `Issue` JSON matching everything
+    /// `QUERY_ISSUES` selects, so it deserializes into `Issue` successfully.
+    fn sample_issue_json(id: &str, identifier: &str) -> Value {
+        json!({
+            "id": id,
+            "identifier": identifier,
+            "title": "Test issue",
+            "description": null,
+            "priority": 0,
+            "estimate": null,
+            "url": format!("https://linear.app/team/issue/{identifier}"),
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:00:00Z",
+            "startedAt": null,
+            "completedAt": null,
+            "state": { "id": "state-1", "name": "Todo", "type": "unstarted" },
+            "team": {
+                "id": "team-1", "key": "ENG", "name": "Engineering",
+                "description": null,
+                "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z"
+            },
+            "assignee": null,
+            "creator": null,
+            "cycle": null,
+            "project": null,
+            "labels": { "nodes": [] }
+        })
+    }
+
+    /// Minimal `Team` JSON matching `QUERY_TEAMS`'s selection.
+    fn sample_team_json(id: &str, key: &str) -> Value {
+        json!({
+            "id": id,
+            "key": key,
+            "name": key,
+            "description": null,
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:00:00Z"
+        })
+    }
+
+    fn issues_page(nodes: Value, has_next_page: bool, end_cursor: Option<&str>) -> String {
+        json!({
+            "data": {
+                "issues": {
+                    "nodes": nodes,
+                    "pageInfo": {
+                        "hasNextPage": has_next_page,
+                        "hasPreviousPage": false,
+                        "startCursor": null,
+                        "endCursor": end_cursor
+                    }
+                }
+            },
+            "errors": null
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn get_all_issues_returns_empty_vec_for_an_empty_result() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(issues_page(json!([]), false, None))
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let issues = client
+            .get_all_issues(None, PaginationOptions::default())
+            .await
+            .unwrap();
+
+        assert!(issues.is_empty());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn get_all_issues_follows_the_cursor_across_multiple_pages() {
+        let mut server = mockito::Server::new_async().await;
+
+        let page1 = server
+            .mock("POST", "/graphql")
+            .match_body(mockito::Matcher::Regex(r#""after":null"#.to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(issues_page(
+                json!([sample_issue_json("issue-1", "ENG-1")]),
+                true,
+                Some("cursor-1"),
+            ))
+            .create_async()
+            .await;
+
+        let page2 = server
+            .mock("POST", "/graphql")
+            .match_body(mockito::Matcher::Regex(r#""after":"cursor-1""#.to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(issues_page(
+                json!([sample_issue_json("issue-2", "ENG-2")]),
+                false,
+                None,
+            ))
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let issues = client
+            .get_all_issues(None, PaginationOptions::default())
+            .await
+            .unwrap();
+
+        let identifiers: Vec<&str> = issues.iter().map(|i| i.identifier.as_str()).collect();
+        assert_eq!(identifiers, vec!["ENG-1", "ENG-2"]);
+        page1.assert_async().await;
+        page2.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn get_all_issues_aborts_when_the_page_cap_is_hit() {
+        let mut server = mockito::Server::new_async().await;
+        // Always reports another page — mimics a misbehaving API that never
+        // reports `hasNextPage: false`.
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(issues_page(
+                json!([sample_issue_json("issue-1", "ENG-1")]),
+                true,
+                Some("cursor-1"),
+            ))
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let err = client
+            .get_all_issues(None, PaginationOptions::default().with_max_pages(1))
+            .await
+            .unwrap_err();
+
+        match err {
+            Error::InvalidRequest(msg) => assert!(msg.contains("max_pages")),
+            other => panic!("expected Error::InvalidRequest, got {other:?}"),
+        }
+        // Aborts before issuing a second request, past the one-page cap.
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn get_all_issues_aborts_when_the_item_cap_is_hit() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(issues_page(
+                json!([
+                    sample_issue_json("issue-1", "ENG-1"),
+                    sample_issue_json("issue-2", "ENG-2")
+                ]),
+                true,
+                Some("cursor-1"),
+            ))
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let err = client
+            .get_all_issues(None, PaginationOptions::default().with_max_items(1))
+            .await
+            .unwrap_err();
+
+        match err {
+            Error::InvalidRequest(msg) => assert!(msg.contains("max_items")),
+            other => panic!("expected Error::InvalidRequest, got {other:?}"),
+        }
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn get_all_teams_honors_a_custom_page_size_and_stops_on_a_single_page() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            // PartialJson matches on structure/value regardless of key order,
+            // unlike a literal-position regex — robust even if serde_json's
+            // key ordering ever changes (e.g. the `preserve_order` feature).
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "variables": { "first": 7 }
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "data": {
+                        "teams": {
+                            "nodes": [sample_team_json("team-1", "ENG")],
+                            "pageInfo": {
+                                "hasNextPage": false,
+                                "hasPreviousPage": false,
+                                "startCursor": null,
+                                "endCursor": null
+                            }
+                        }
+                    },
+                    "errors": null
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let teams = client
+            .get_all_teams(PaginationOptions::default().with_page_size(7))
+            .await
+            .unwrap();
+
+        assert_eq!(teams.len(), 1);
+        assert_eq!(teams[0].key, "ENG");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn get_all_team_issues_scopes_the_request_to_the_team() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .match_body(mockito::Matcher::Regex(
+                r#""filter":\{"team":\{"id":\{"eq":"team-1"\}\}\}"#.to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(issues_page(
+                json!([sample_issue_json("issue-1", "ENG-1")]),
+                false,
+                None,
+            ))
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let issues = client
+            .get_all_team_issues("team-1", PaginationOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(issues.len(), 1);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn get_all_projects_paginates_through_get_projects() {
+        let mut server = mockito::Server::new_async().await;
+
+        fn projects_page(node_id: &str, has_next_page: bool, end_cursor: Option<&str>) -> String {
+            json!({
+                "data": {
+                    "projects": {
+                        "nodes": [{
+                            "id": node_id,
+                            "name": "herdr-linear",
+                            "description": null,
+                            "url": "https://linear.app/talent-factory/project/herdr-linear",
+                            "leadId": null,
+                            "lead": null,
+                            "status": {
+                                "id": "status-1",
+                                "name": "Backlog",
+                                "type": "backlog"
+                            },
+                            "createdAt": "2026-01-01T00:00:00Z",
+                            "updatedAt": "2026-01-01T00:00:00Z",
+                            "startDate": null,
+                            "targetDate": null
+                        }],
+                        "pageInfo": {
+                            "hasNextPage": has_next_page,
+                            "hasPreviousPage": false,
+                            "startCursor": null,
+                            "endCursor": end_cursor
+                        }
+                    }
+                },
+                "errors": null
+            })
+            .to_string()
+        }
+
+        let page1 = server
+            .mock("POST", "/graphql")
+            .match_body(mockito::Matcher::Regex(r#""after":null"#.to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(projects_page("project-1", true, Some("cursor-1")))
+            .create_async()
+            .await;
+
+        let page2 = server
+            .mock("POST", "/graphql")
+            .match_body(mockito::Matcher::Regex(r#""after":"cursor-1""#.to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(projects_page("project-2", false, None))
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let projects = client
+            .get_all_projects(None, PaginationOptions::default())
+            .await
+            .unwrap();
+
+        let ids: Vec<&str> = projects.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, vec!["project-1", "project-2"]);
+        page1.assert_async().await;
+        page2.assert_async().await;
+    }
+
+    // --- get_all_* auto-pagination: edge cases added on review -----------
+
+    #[tokio::test]
+    async fn get_all_issues_errors_when_has_next_page_is_true_but_end_cursor_is_missing() {
+        // API contract violation: `hasNextPage: true` must always be paired
+        // with an `endCursor` to continue from. Regression test for the fix
+        // that turned this from a silent `Ok(items)` truncation into a loud
+        // `Err` — see `paginate_all`'s final `match` arm.
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(issues_page(
+                json!([sample_issue_json("issue-1", "ENG-1")]),
+                true,
+                None,
+            ))
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let err = client
+            .get_all_issues(None, PaginationOptions::default())
+            .await
+            .unwrap_err();
+
+        match err {
+            Error::InvalidRequest(msg) => {
+                assert!(msg.contains("end_cursor"), "unexpected message: {msg}")
+            }
+            other => panic!("expected Error::InvalidRequest, got {other:?}"),
+        }
+        // Aborts rather than issuing a second, cursor-less request.
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn get_all_issues_requests_the_default_page_size_on_the_wire() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "variables": { "first": DEFAULT_PAGE_SIZE }
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(issues_page(json!([]), false, None))
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        client
+            .get_all_issues(None, PaginationOptions::default())
+            .await
+            .unwrap();
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn get_all_issues_succeeds_when_the_final_page_lands_exactly_on_max_items() {
+        // The final, completing page pushes `items.len()` to exactly
+        // `max_items` — this must succeed, not abort: the cap guards against
+        // runaway pagination, not against a correctly-sized finished result.
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(issues_page(
+                json!([
+                    sample_issue_json("issue-1", "ENG-1"),
+                    sample_issue_json("issue-2", "ENG-2")
+                ]),
+                false,
+                None,
+            ))
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let issues = client
+            .get_all_issues(None, PaginationOptions::default().with_max_items(2))
+            .await
+            .unwrap();
+
+        assert_eq!(issues.len(), 2);
+        mock.assert_async().await;
+    }
+
+    // Note: `get_all_issues_aborts_when_the_item_cap_is_hit` (above) already
+    // covers "still aborts when max_items is exceeded and more pages
+    // remain" — that's the strictly-over-cap counterpart to the
+    // exactly-on-cap success case just above.
+
+    #[tokio::test]
+    async fn get_all_issues_succeeds_when_the_last_page_lands_exactly_on_max_pages() {
+        let mut server = mockito::Server::new_async().await;
+
+        let page1 = server
+            .mock("POST", "/graphql")
+            .match_body(mockito::Matcher::Regex(r#""after":null"#.to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(issues_page(
+                json!([sample_issue_json("issue-1", "ENG-1")]),
+                true,
+                Some("cursor-1"),
+            ))
+            .create_async()
+            .await;
+
+        let page2 = server
+            .mock("POST", "/graphql")
+            .match_body(mockito::Matcher::Regex(r#""after":"cursor-1""#.to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(issues_page(
+                json!([sample_issue_json("issue-2", "ENG-2")]),
+                false,
+                None,
+            ))
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let issues = client
+            .get_all_issues(None, PaginationOptions::default().with_max_pages(2))
+            .await
+            .unwrap();
+
+        assert_eq!(issues.len(), 2);
+        page1.assert_async().await;
+        page2.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn get_all_issues_rejects_a_zero_max_pages_without_making_any_request() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(issues_page(json!([]), false, None))
+            .expect(0)
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let err = client
+            .get_all_issues(None, PaginationOptions::default().with_max_pages(0))
+            .await
+            .unwrap_err();
+
+        match err {
+            Error::InvalidRequest(msg) => assert!(msg.contains("max_pages")),
+            other => panic!("expected Error::InvalidRequest, got {other:?}"),
+        }
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn get_all_issues_rejects_a_zero_max_items_without_making_any_request() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(issues_page(json!([]), false, None))
+            .expect(0)
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let err = client
+            .get_all_issues(None, PaginationOptions::default().with_max_items(0))
+            .await
+            .unwrap_err();
+
+        match err {
+            Error::InvalidRequest(msg) => assert!(msg.contains("max_items")),
+            other => panic!("expected Error::InvalidRequest, got {other:?}"),
+        }
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn get_all_issues_rejects_a_non_positive_page_size_without_making_any_request() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(issues_page(json!([]), false, None))
+            .expect(0)
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let err = client
+            .get_all_issues(None, PaginationOptions::default().with_page_size(0))
+            .await
+            .unwrap_err();
+
+        match err {
+            Error::InvalidRequest(msg) => assert!(msg.contains("page_size")),
+            other => panic!("expected Error::InvalidRequest, got {other:?}"),
+        }
+        mock.assert_async().await;
+    }
+
+    /// JSON body for a successful `viewer` query, matching the shape used by
+    /// `get_viewer_parses_successful_response` above.
+    fn viewer_response_body() -> String {
+        json!({
+            "data": {
+                "viewer": {
+                    "id": "user-1",
+                    "email": "alice@example.com",
+                    "name": "Alice",
+                    "createdAt": "2026-01-01T00:00:00Z",
+                    "updatedAt": "2026-01-01T00:00:00Z"
+                }
+            },
+            "errors": null
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn execute_batch_runs_every_request_and_reports_success() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(viewer_response_body())
+            .expect(4)
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let requests: Vec<_> = (0..4).map(|_| client.get_viewer()).collect();
+
+        let results = timeout(
+            EXECUTE_BATCH_TEST_TIMEOUT,
+            client.execute_batch(requests, None),
+        )
+        .await
+        .expect("execute_batch hung — a buffered() slot was likely never released");
+
+        assert_eq!(results.len(), 4);
+        assert!(
+            results.iter().all(|r| r.is_ok()),
+            "expected every item to succeed: {results:?}"
+        );
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn execute_batch_returns_empty_vec_for_empty_input() {
+        let client = LinearClient::new("lin_api_test").unwrap();
+
+        let requests: Vec<std::future::Ready<Result<()>>> = Vec::new();
+
+        let results = timeout(
+            EXECUTE_BATCH_TEST_TIMEOUT,
+            client.execute_batch(requests, None),
+        )
+        .await
+        .expect("execute_batch hung on an empty batch");
+
+        assert!(results.is_empty(), "{results:?}");
+    }
+
+    #[tokio::test]
+    async fn execute_batch_runs_a_single_item_batch() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(viewer_response_body())
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        let requests = vec![client.get_viewer()];
+
+        let results = timeout(
+            EXECUTE_BATCH_TEST_TIMEOUT,
+            client.execute_batch(requests, None),
+        )
+        .await
+        .expect("execute_batch hung on a single-item batch");
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_ok(), "{:?}", results[0]);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn execute_batch_returns_a_result_per_item_on_partial_failure() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(viewer_response_body())
+            .expect(2)
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        // Item 1 fails without touching the network at all — execute_batch
+        // doesn't care what produces a request's `Result`, only that it
+        // collects one per item, in order, without letting a single failure
+        // abort the rest of the batch.
+        let client_ref = &client;
+        let requests: Vec<_> = (0..3)
+            .map(|i| async move {
+                if i == 1 {
+                    Err(Error::NotFound(format!("synthetic failure for item {i}")))
+                } else {
+                    client_ref.get_viewer().await
+                }
+            })
+            .collect();
+
+        let results = timeout(
+            EXECUTE_BATCH_TEST_TIMEOUT,
+            client.execute_batch(requests, Some(2)),
+        )
+        .await
+        .expect("execute_batch hung — a buffered() slot was likely never released");
+
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_ok(), "{:?}", results[0]);
+        assert!(results[1].is_err(), "{:?}", results[1]);
+        assert!(results[2].is_ok(), "{:?}", results[2]);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn execute_batch_reports_every_item_as_failed_when_all_fail() {
+        let client = LinearClient::new("lin_api_test").unwrap();
+
+        // All three items fail synthetically (no network involved) — unlike
+        // the partial-failure test above, this proves a failure doesn't
+        // need a surviving success anywhere in the batch to be reported
+        // correctly: `execute_batch` isn't secretly short-circuiting once
+        // every remaining item is also going to fail.
+        let requests: Vec<_> = (0..3)
+            .map(|i| async move { Err::<(), _>(Error::NotFound(format!("failure {i}"))) })
+            .collect();
+
+        let results = timeout(
+            EXECUTE_BATCH_TEST_TIMEOUT,
+            client.execute_batch(requests, Some(2)),
+        )
+        .await
+        .expect("execute_batch hung — a buffered() slot was likely never released");
+
+        assert_eq!(results.len(), 3);
+        assert!(
+            results.iter().all(|r| r.is_err()),
+            "expected every item to fail: {results:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_batch_clamps_zero_concurrency_to_one_instead_of_hanging() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(viewer_response_body())
+            .expect(2)
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        // `Some(0)` in-flight slots would never poll anything if it weren't
+        // clamped up to 1 — this must complete (not hang) and behave like
+        // "run one at a time".
+        let requests: Vec<_> = (0..2).map(|_| client.get_viewer()).collect();
+
+        let results = timeout(
+            EXECUTE_BATCH_TEST_TIMEOUT,
+            client.execute_batch(requests, Some(0)),
+        )
+        .await
+        .expect(
+            "execute_batch hung on Some(0) concurrency — the 1-permit floor \
+             was likely lost",
+        );
+
+        assert_eq!(results.len(), 2);
+        assert!(
+            results.iter().all(|r| r.is_ok()),
+            "expected every item to succeed: {results:?}"
+        );
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn execute_batch_clamps_oversized_concurrency_without_panicking() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(viewer_response_body())
+            .expect(2)
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        // `usize::MAX` is exactly what a caller reaches for to mean
+        // "don't bound me" — this must be capped down to `requests.len()`
+        // rather than handed straight to an internal primitive with its own
+        // (much lower) maximum permit count.
+        let requests: Vec<_> = (0..2).map(|_| client.get_viewer()).collect();
+
+        let results = timeout(
+            EXECUTE_BATCH_TEST_TIMEOUT,
+            client.execute_batch(requests, Some(usize::MAX)),
+        )
+        .await
+        .expect("execute_batch hung on an oversized concurrency value");
+
+        assert_eq!(results.len(), 2);
+        assert!(
+            results.iter().all(|r| r.is_ok()),
+            "expected every item to succeed: {results:?}"
+        );
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn execute_batch_bounds_concurrency_to_the_configured_limit() {
+        // Item count and concurrency are named (rather than inlined at each
+        // call site) so this test's timing math stays anchored to the
+        // actual values if either one changes.
+        const CONCURRENCY: usize = 2;
+        const REQUEST_COUNT: usize = 2 * CONCURRENCY;
+        let delay = Duration::from_millis(200);
+
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_chunked_body(move |w| {
+                // mockito's callback is a plain `Write`, not async — sleep the
+                // underlying (blocking-friendly) thread to simulate network
+                // latency for this response.
+                std::thread::sleep(delay);
+                w.write_all(viewer_response_body().as_bytes())
+            })
+            .expect(REQUEST_COUNT)
+            .create_async()
+            .await;
+
+        let client =
+            LinearClient::with_endpoint("lin_api_test", format!("{}/graphql", server.url()))
+                .unwrap();
+
+        // REQUEST_COUNT (2 * CONCURRENCY) requests with concurrency capped
+        // at CONCURRENCY should complete in ~2 waves of `delay` — clearly
+        // more than one wave (fully unbounded, ~1 * delay) and clearly less
+        // than fully sequential (REQUEST_COUNT * delay). The window is kept
+        // wide relative to `delay` so ordinary CI scheduler jitter on a
+        // shared runner doesn't make this flaky in either direction.
+        let requests: Vec<_> = (0..REQUEST_COUNT).map(|_| client.get_viewer()).collect();
+
+        let start = std::time::Instant::now();
+        let results = timeout(
+            EXECUTE_BATCH_TEST_TIMEOUT,
+            client.execute_batch(requests, Some(CONCURRENCY)),
+        )
+        .await
+        .expect("execute_batch hung — a buffered() slot was likely never released");
+        let elapsed = start.elapsed();
+
+        assert_eq!(results.len(), REQUEST_COUNT);
+        assert!(
+            results.iter().all(|r| r.is_ok()),
+            "expected every item to succeed: {results:?}"
+        );
+        assert!(
+            elapsed >= delay + delay / 2,
+            "expected at least ~2 waves of {delay:?}, completed in {elapsed:?} \
+             (too fast — concurrency isn't bounded)"
+        );
+        assert!(
+            elapsed < delay * (REQUEST_COUNT as u32) - delay / 2,
+            "expected ~2 waves of {delay:?}, completed in {elapsed:?} \
+             (too slow — requests are running sequentially)"
+        );
+
         mock.assert_async().await;
     }
 }

@@ -53,13 +53,13 @@ rather than only ever showing "my issues". Tracked as issues in the
       repo → Linear project mapping) and show its open issues (TF-577, TF-578)
 - [x] Issue search/filter within the panel (fzf-style) (TF-580)
 
-### Phase 1.5: Polish & Stability
+### Phase 1.7: Polish & Stability
 
 **Estimated**: September 2026
 
 - [ ] Integration tests with Linear sandbox
 - [ ] Performance benchmarks
-- [ ] Rate limiting strategies
+- [x] Rate limiting strategies (TF-610)
 - [ ] Connection pooling for batch operations
 - [ ] Better pagination helpers
 - [ ] User feedback incorporation
@@ -191,7 +191,7 @@ Have ideas? Please:
 | Aug 2026  | Phase 1 Complete                | Done      |
 | Aug 2026  | Plugin v1 ("My Issues") Complete | Done      |
 | Aug 2026  | Phase 1.6 (Smart Issue Selection)| Done      |
-| Sep 2026  | Phase 1.5 (Stability)            | Planned   |
+| Sep 2026  | Phase 1.7 (Stability)            | Planned   |
 | Oct 2026  | Phase 2 (Advanced Features)     | Planned   |
 | Nov 2026  | Phase 3 (Herdr Integration)     | Planned   |
 | Dec 2026  | Phase 4 (Production)            | Planned   |

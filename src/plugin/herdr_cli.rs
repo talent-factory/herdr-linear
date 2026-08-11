@@ -523,6 +523,21 @@ pub async fn pane_close(herdr_bin: &str, pane_id: &PaneId) -> Result<()> {
         .map(|_| ())
 }
 
+/// `herdr agent focus <target>`. Used by `main.rs`'s `open_config_in_herdr_pane` to reuse an
+/// already-open editor pane instead of creating a duplicate: `target` accepts a unique agent
+/// name (per herdr's own target resolution), so passing [`crate::plugin::editor::EDITOR_AGENT_NAME`]
+/// here finds the pane a previous `c` press already created via [`agent_start`], if any. Any
+/// error — most commonly `agent_not_found` (verified live against herdr 0.7.3: fails
+/// immediately with `{"error":{"code":"agent_not_found",...}}`, no timeout wait) — is treated
+/// identically by the caller: "not there, create it". Unlike [`agent_start`], there is no
+/// special-casing of any particular error code here, since there's only one thing to do next
+/// regardless of *why* focus failed.
+pub async fn agent_focus(herdr_bin: &str, target: &str) -> Result<()> {
+    run(herdr_bin, &["agent", "focus", target])
+        .await
+        .map(|_| ())
+}
+
 /// Extra attempts `agent_wait` makes when herdr responds with the missing-`result` bug (see the
 /// module docs) before giving up and returning that error to the caller.
 const AGENT_WAIT_MAX_RETRIES: u32 = 2;
@@ -1411,6 +1426,52 @@ exit 1
 
         assert!(
             err.to_string().contains("no such pane"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_focus_invokes_the_expected_cli_command() {
+        // Previously only exercised indirectly through `main.rs`'s case-dispatch fake-herdr
+        // scripts, which only assert on `$1 $2` — this pins down the actual `target` argument
+        // (e.g. `EDITOR_AGENT_NAME`) reaching the CLI call.
+        let capture_dir = tempfile::tempdir().unwrap();
+        let args_file = capture_dir.path().join("args.txt");
+        let (_dir, script) = write_fake_herdr_script(&format!(
+            r#"
+printf '%s\n' "$@" > "{}"
+echo '{{"result":{{}}}}'
+exit 0
+"#,
+            args_file.display()
+        ));
+
+        agent_focus(script.to_str().unwrap(), "herdr-linear-config")
+            .await
+            .expect("agent_focus should succeed");
+
+        let captured = std::fs::read_to_string(&args_file).unwrap();
+        let args: Vec<&str> = captured.lines().collect();
+        assert_eq!(args, vec!["agent", "focus", "herdr-linear-config"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_focus_propagates_a_herdr_error() {
+        let (_dir, script) = write_fake_herdr_script(
+            r#"
+echo '{"error":{"code":"agent_not_found","message":"agent target herdr-linear-config not found"}}'
+exit 1
+"#,
+        );
+
+        let err = agent_focus(script.to_str().unwrap(), "herdr-linear-config")
+            .await
+            .expect_err("agent_focus should propagate the herdr error");
+
+        assert!(
+            err.to_string().contains("not found"),
             "unexpected message: {err}"
         );
     }

@@ -136,13 +136,13 @@ pub static KEYBINDINGS: &[KeyBinding] = &[
         context: BindingContext::ErrorScreen,
     },
     KeyBinding {
-        keys: "c",
-        action: "Open config.toml",
-        context: BindingContext::ErrorScreen,
-    },
-    KeyBinding {
         keys: "?",
         action: "Toggle this help overlay",
+        context: BindingContext::Global,
+    },
+    KeyBinding {
+        keys: "c",
+        action: "Open config.toml",
         context: BindingContext::Global,
     },
     KeyBinding {

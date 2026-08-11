@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-11
+
+### Added
+
+- Auto-paginating `LinearClient` helpers — `get_all_issues`, `get_all_teams`, `get_all_team_issues`, `get_all_projects` — that loop through every page of a query and return the full result set, with a configurable page size and safety caps on total pages/items (TF-609)
+- `LinearClient` now automatically retries requests that fail with `Error::RateLimitExceeded`: it waits the server's `Retry-After` value (falling back to exponential backoff, capped at 60s, when Linear doesn't send a usable one), retries up to 3 total attempts, and still surfaces the original `RateLimitExceeded` error unchanged if the budget is exhausted. Rate limiting is detected both via Linear's documented HTTP 400 + `RATELIMITED` GraphQL error code and via a plain HTTP 429 (kept as a defense-in-depth fallback). Opt out via `LinearClient::with_rate_limit_retry(false)` to keep the old fail-fast behavior (TF-610)
+- `c` (open `config.toml`) now opens `nvim` inside a herdr pane by default — usable over SSH, where the previous OS-default-opener behavior wasn't. Set `editor` in `config.toml` to use a different editor instead; if neither resolves or the herdr pane can't be opened, `c` falls back to the OS's default opener as before. Repeated `c` presses reuse the same editor pane (TF-614)
+
+### Fixed
+
+- `c` (open `config.toml`) now works from any screen and view state — Menu, a view still
+  loading, a loaded view, and the Error screen alike — instead of only firing after actually
+  hitting an error. The Keybindings help overlay's `c` entry moved from "Error screen" to
+  "Global" to match (TF-614)
+- Implement flow: the prompt-landed confirmation now polls the pane continuously until the
+  sent prompt has been visible, with no gaps, for a documented stability window — instead of
+  checking at exactly two fixed offsets (500ms, then 800ms later) and declaring success from
+  those two samples alone. A live repro against a slow-starting target showed the prompt land,
+  pass both of those samples, and then still get wiped by the target's own async startup
+  finishing after that 1.3s window had already elapsed, reporting success on an agent left with
+  an empty prompt box (TF-619)
+- Retry/EnterView action arm: a `q`/Ctrl+C pressed while `ensure_loaded()` is blocking is
+  now drained and honored once the fetch returns, matching the Implement/ImplementMany arms
+  — but only once the fetch has actually taken long enough (past 1s) to be plausibly stuck.
+  TF-610's rate-limit retry can hold this arm for up to ~2 minutes with the screen looking
+  frozen and no visible way to quit; a normal fast round-trip still lets a buffered key fall
+  through to the loop's next poll cycle instead of being silently discarded (TF-610)
+- Herdr host context: `focused_pane_cwd`/`workspace_cwd`/`cwd` values with stray leading or
+  trailing whitespace are now trimmed before use, instead of surviving untrimmed into git's
+  `current_dir` (repo auto-detection) and the herdr CLI's `--cwd` argument
+  (implement-on-`<Enter>`), where either could break
+- Detail pane: unordered Markdown list items now render with a `•` bullet and a hanging
+  indent for wrapped continuation lines, so a wrapped line starting with `--` (e.g. inline
+  code like `` `cargo test --features plugin -- --ignored live_api` `` wrapping right
+  before `--ignored`) can no longer be mistaken for a new bullet. Ordered (`1. `) list
+  items keep their numbering but get the same hanging indent on wrap (TF-613)
+
+### Removed
+
+- Unused `graphql_client`, `async-trait`, `anyhow`, `dotenvy`, and `tokio-test` dependencies
+  — none were referenced anywhere in the crate. `reqwest` upgraded from the legacy 0.11 line
+  to 0.12, collapsing the dependency tree to a single hyper 1.x stack instead of duplicating
+  hyper 0.14/http 0.2 alongside it
+
 ## [0.1.1] - 2026-08-10
 
 ### Added
@@ -185,7 +229,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 See [ROADMAP.md](ROADMAP.md) for planned features and timeline.
 
-### Phase 1.5 - Stability
+### Phase 1.7 - Stability
 - [ ] Improved test coverage
 - [ ] Integration tests
 - [ ] Performance benchmarks
@@ -211,6 +255,6 @@ See [ROADMAP.md](ROADMAP.md) for planned features and timeline.
 ## Support
 
 For issues or questions about versions:
-- Report bugs in Linear: https://linear.app/talent-factory/project/herdr-linear-10dca51ea35b
-- Ask on GitHub: https://github.com/talent-factory/herdr-linear/discussions
+- Report bugs / request features: https://github.com/talent-factory/herdr-linear/issues
+- Ask questions: https://github.com/talent-factory/herdr-linear/discussions
 - Check documentation: https://github.com/talent-factory/herdr-linear#readme

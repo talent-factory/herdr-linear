@@ -1,0 +1,47 @@
+name: Live API Tests
+
+# Runs the `#[ignore]`-gated suite in `tests/live_api.rs` against the real
+# Linear GraphQL API. Deliberately kept out of ci.yml's push/pull_request
+# triggers so a flaky or rate-limited upstream API never blocks a PR — this
+# is a canary, not a gate.
+on:
+  workflow_dispatch:
+  schedule:
+    # 03:17 UTC nightly — off the hour, to avoid the GitHub Actions
+    # scheduling stampede at :00.
+    - cron: "17 3 * * *"
+
+env:
+  RUST_BACKTRACE: 1
+
+jobs:
+  live-api:
+    name: Live API (Linear sandbox)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Verify LINEAR_API_KEY secret is configured
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+        run: |
+          # tests/live_api.rs skips (rather than fails) when LINEAR_API_KEY is
+          # unset, so it stays safe to run without credentials locally. But an
+          # unconfigured secret expands to an empty string here, not an error —
+          # without this guard a missing/rotated-out secret would make every
+          # test skip silently and the job would report green having made zero
+          # real requests, defeating the point of a canary.
+          if [ -z "$LINEAR_API_KEY" ]; then
+            echo "::error::LINEAR_API_KEY secret is not configured — the live API suite would skip every test silently."
+            exit 1
+          fi
+
+      - name: Run live API tests
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+        run: cargo test --test live_api -- --ignored --nocapture

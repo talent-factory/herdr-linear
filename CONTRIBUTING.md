@@ -35,7 +35,8 @@ cargo run --example tracing_demo
 
 ### 1. Create an Issue (or pick an existing one)
 
-Check [Linear Issues](https://linear.app/talent-factory/project/herdr-linear-10dca51ea35b/overview) for tasks.
+Check [GitHub Issues](https://github.com/talent-factory/herdr-linear/issues) for tasks. (Linear is used
+for internal planning only and isn't publicly accessible.)
 
 ### 2. Create a Feature Branch
 
@@ -98,6 +99,29 @@ cargo test -- --nocapture
 # Run with logging
 RUST_LOG=debug cargo test -- --nocapture
 ```
+
+### Live API Tests
+
+Every test above that exercises `LinearClient`'s HTTP layer runs against a mocked Linear API
+(`mockito::Server::new_async()` in `src/client.rs`) and never touches the network.
+`tests/live_api.rs` is a separate, `#[ignore]`-gated suite that hits the real Linear GraphQL API
+instead — it exists to catch schema drift, auth changes, or unexpected real-world response
+shapes that a mock can't. `cargo test` never runs it.
+
+To run it locally against your own Linear workspace:
+
+```bash
+export LINEAR_API_KEY=lin_api_your_key_here
+cargo test --test live_api -- --ignored
+```
+
+Most tests in the suite print a skip notice and pass trivially when `LINEAR_API_KEY` is unset,
+so it's safe to run even without credentials — the exception is
+`live_api_invalid_key_maps_to_authentication_failed`, which deliberately uses a bad key and
+doesn't need a real one. A scheduled nightly job (`.github/workflows/live-api-tests.yml`) also
+runs this suite in CI against a `LINEAR_API_KEY` repo secret, failing fast if the secret is
+missing rather than skipping silently; trigger it manually from the Actions tab
+(`workflow_dispatch`) for an out-of-band run.
 
 ## Code Quality
 
@@ -171,7 +195,7 @@ If adding fields to existing types:
 3. Run linter: `cargo clippy`
 4. Update documentation
 5. Keep PR focused and reasonably sized
-6. Reference related Linear issues in PR description
+6. Reference related GitHub issues in PR description
 
 ## Reporting Issues
 
@@ -184,7 +208,6 @@ If adding fields to existing types:
 
 - Open a discussion on GitHub
 - Comment on related issues
-- Post in Linear workspace
 
 ## License
 
