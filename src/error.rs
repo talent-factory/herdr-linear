@@ -50,30 +50,6 @@ pub enum Error {
     /// retry decision.
     #[error("{0}")]
     MissingResultField(String),
-
-    /// A `herdr agent start <name> ...` call rejected because `name` collides with an
-    /// already-running agent tab (`error.code == "agent_name_taken"`, TF-590). Carries herdr's
-    /// own `message` (so a caller that gives up still has herdr's original explanation to show,
-    /// not just a generic collision notice) and its suggested `candidates` (may be empty if
-    /// herdr's response didn't include any) so [`crate::plugin::herdr_cli::agent_start`]'s retry
-    /// logic can pick one automatically instead of surfacing this raw collision to the user.
-    /// Kept distinct from [`Error::Internal`] for the same reason as
-    /// [`Error::MissingResultField`]: the retry decision matches on the variant, not a substring
-    /// of the formatted message. Only `agent_start` ever sees this variant — see
-    /// `crate::plugin::herdr_cli::interpret_output`'s docs for why the mapping is scoped to
-    /// that one call path rather than applied to every `herdr` subcommand.
-    #[error(
-        "{message}{}",
-        if candidates.is_empty() {
-            String::new()
-        } else {
-            format!("; candidates: {}", candidates.join(", "))
-        }
-    )]
-    AgentNameTaken {
-        message: String,
-        candidates: Vec<String>,
-    },
 }
 
 /// Helper function to create GraphQL error responses
@@ -110,26 +86,5 @@ mod tests {
             retry_after_ms: 5000,
         };
         assert_eq!(err.to_string(), "Rate limit exceeded: 5000ms");
-    }
-
-    #[test]
-    fn agent_name_taken_display_omits_candidates_suffix_when_empty() {
-        let err = Error::AgentNameTaken {
-            message: "agent name hr is already used".to_string(),
-            candidates: vec![],
-        };
-        assert_eq!(err.to_string(), "agent name hr is already used");
-    }
-
-    #[test]
-    fn agent_name_taken_display_appends_candidates_when_present() {
-        let err = Error::AgentNameTaken {
-            message: "agent name hr is already used".to_string(),
-            candidates: vec!["hr-2".to_string(), "hr-3".to_string()],
-        };
-        assert_eq!(
-            err.to_string(),
-            "agent name hr is already used; candidates: hr-2, hr-3"
-        );
     }
 }

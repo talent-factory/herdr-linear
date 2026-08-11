@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 /// every repo/workspace this plugin runs in (see `config.rs`'s module doc and README.md's
 /// "Configure" section), so every `c` press across every herdr-linear instance should reuse the
 /// *same* pane rather than each spawning its own — that's the whole point of
-/// `main.rs::open_config_in_herdr_pane` trying `agent_focus` before creating a new tab.
+/// `main.rs::open_config_in_herdr_pane` checking `herdr_cli::find_existing_editor_tab` before
+/// creating a new tab.
 pub const EDITOR_AGENT_NAME: &str = "herdr-linear-config";
 
 /// Locates a binary on the system by searching through `PATH` entries.
@@ -61,7 +62,7 @@ fn editor_override_is_usable(editor: &str, path_env: Option<&str>) -> bool {
 ///    rejected with a `tracing::warn!` rather than used blindly — using it as-is would spawn a
 ///    command already known to fail, silently strand the user in a dead pane (nothing in this
 ///    module's `main.rs` callers confirm the launched process actually stays up), and, on the
-///    `c` keybinding's every-later-press `agent_focus` reuse, keep repeating that same silent
+///    `c` keybinding's every-later-press tab-reuse check, keep repeating that same silent
 ///    no-op indefinitely.
 /// 2. Otherwise, if `nvim` is found on `PATH`, use `"nvim"`.
 /// 3. Otherwise, return `None` (caller falls back to OS default opener).
