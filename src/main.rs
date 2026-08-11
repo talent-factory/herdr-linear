@@ -1977,21 +1977,30 @@ exit 1
     }
 
     /// A `herdr` fake script that dispatches on `$1 $2` so [`implement_one`]'s whole
-    /// `tab_create` → `agent_start` → `pane_close` → `agent_wait` sequence can be driven from a
-    /// single process, each branch supplying its own canned `echo '{...}'; exit N`.
+    /// `tab_create` → `pane_run` → `agent_wait` → `agent_rename` → `agent_prompt` sequence can be
+    /// driven from a single process, each branch supplying its own canned `echo '{...}'; exit N`.
+    /// `agent prompt` always succeeds and `agent read` always reports the implement prompt for
+    /// `TF-579` (every caller's `sample_issue` identifier) as already landed — not the empty text
+    /// a genuinely-idle pane would start with — so a test whose script lets the flow run past
+    /// `agent_rename` (i.e. `agent_wait` succeeds) reaches [`send_prompt_until_visible`]'s real
+    /// stability poll and completes in just over its 2s stability window instead of burning
+    /// through all [`PROMPT_SEND_ATTEMPTS`] × [`PROMPT_SEND_ATTEMPT_TIMEOUT`] waiting for text
+    /// that would never arrive.
     fn write_dispatching_herdr_script(
         tab_create: &str,
-        agent_start: &str,
-        pane_close: &str,
+        pane_run: &str,
         agent_wait: &str,
+        agent_rename: &str,
     ) -> (tempfile::TempDir, std::path::PathBuf) {
         write_fake_herdr_script(&format!(
             r#"
 case "$1 $2" in
   "tab create") {tab_create} ;;
-  "agent start") {agent_start} ;;
-  "pane close") {pane_close} ;;
+  "pane run") {pane_run} ;;
   "agent wait") {agent_wait} ;;
+  "agent rename") {agent_rename} ;;
+  "agent prompt") echo '{{"result":{{}}}}'; exit 0 ;;
+  "agent read") echo '{{"result":{{"read":{{"text":"Implement Linear Issue TF-579 using a new git worktree"}}}}}}'; exit 0 ;;
   *)
     echo '{{"error":{{"message":"unexpected herdr call: $1 $2"}}}}'
     exit 1
@@ -2003,9 +2012,9 @@ esac
 
     /// A sibling of [`write_dispatching_herdr_script`] (TF-619) exposing `tab create` (so a real
     /// [`plugin::herdr_cli::PaneId`] can be minted the same way production code always does — the
-    /// type has no public constructor of its own) plus `agent send`/`agent read`, so
+    /// type has no public constructor of its own) plus `agent prompt`/`agent read`, so
     /// [`send_prompt_until_visible`]/[`wait_for_prompt_stable`] can be driven directly without
-    /// also having to script `agent_start`/`pane_close`/`agent_wait`. `agent send` always
+    /// also having to script `pane_run`/`agent_wait`/`agent_rename`. `agent prompt` always
     /// succeeds (its own failure path is exercised elsewhere); each `agent read` call returns the
     /// next entry from `read_responses` in order, then sticks on the last entry once exhausted —
     /// so a short list can script "landed, landed, reverted-to-empty, landed-and-stays-that-way"
@@ -2023,7 +2032,7 @@ case "$1 $2" in
     echo '{{"result":{{"tab":{{"tab_id":"t1","label":"TF-579"}},"root_pane":{{"pane_id":"p1"}}}}}}'
     exit 0
     ;;
-  "agent send") echo '{{"result":{{}}}}'; exit 0 ;;
+  "agent prompt") echo '{{"result":{{}}}}'; exit 0 ;;
   "agent read")
     script_dir=$(dirname "$0")
     count_file="$script_dir/read_count"
@@ -2066,7 +2075,7 @@ esac
     /// [`write_prompt_send_read_sequence_script`]'s per-*read* counter would be flaky: how many
     /// `agent read` polls a given attempt takes before timing out varies with real subprocess
     /// spawn latency, so there's no reliable read-count boundary to plant a landed/empty switch
-    /// on. This script instead switches on how many `agent send` calls have happened — i.e. which
+    /// on. This script instead switches on how many `agent prompt` calls have happened — i.e. which
     /// *attempt* is in flight — so every read within an attempt gets the same answer regardless
     /// of how many polls that attempt actually takes: attempts before `lands_on_attempt` always
     /// read `empty_text`, and attempt `lands_on_attempt` onward always reads `landed_text`.
@@ -2082,7 +2091,7 @@ case "$1 $2" in
     echo '{{"result":{{"tab":{{"tab_id":"t1","label":"TF-579"}},"root_pane":{{"pane_id":"p1"}}}}}}'
     exit 0
     ;;
-  "agent send")
+  "agent prompt")
     script_dir=$(dirname "$0")
     count_file="$script_dir/send_count"
     n=0
@@ -2138,7 +2147,7 @@ case "$1 $2" in
     echo '{{"result":{{"tab":{{"tab_id":"t1","label":"TF-579"}},"root_pane":{{"pane_id":"p1"}}}}}}'
     exit 0
     ;;
-  "agent send") echo '{{"result":{{}}}}'; exit 0 ;;
+  "agent prompt") echo '{{"result":{{}}}}'; exit 0 ;;
   "agent read") {read_response} ;;
   *)
     echo '{{"error":{{"message":"unexpected herdr call: $1 $2"}}}}'
@@ -2154,9 +2163,9 @@ esac
     async fn implement_one_fails_immediately_when_tab_create_fails() {
         let (_dir, script) = write_dispatching_herdr_script(
             r#"echo '{"error":{"message":"no such workspace"}}'; exit 1"#,
-            r#"echo '{"error":{"message":"agent start should not run"}}'; exit 1"#,
-            r#"echo '{"error":{"message":"pane close should not run"}}'; exit 1"#,
+            r#"echo '{"error":{"message":"pane run should not run"}}'; exit 1"#,
             r#"echo '{"error":{"message":"agent wait should not run"}}'; exit 1"#,
+            r#"echo '{"error":{"message":"agent rename should not run"}}'; exit 1"#,
         );
         let client = herdr_linear::LinearClient::new("lin_api_test_key").unwrap();
         let issue = sample_issue("TF-579");
@@ -2175,16 +2184,16 @@ esac
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn implement_one_reports_a_possibly_orphaned_tab_when_agent_start_fails() {
-        // tab_create succeeds (so a tab now exists), then agent_start fails — the flow must not
-        // claim the tab is definitely empty (agent_start's own failure could be a client-side
-        // timeout with the agent actually running), and it must not attempt pane_close or
-        // agent_wait afterwards.
+    async fn implement_one_reports_a_possibly_orphaned_tab_when_pane_run_fails() {
+        // tab_create succeeds (so a tab now exists), then pane_run fails — the flow must not
+        // claim the tab is definitely empty (pane_run's own failure could be a client-side
+        // timeout with the agent actually running), and it must not attempt agent_wait or
+        // agent_rename afterwards.
         let (_dir, script) = write_dispatching_herdr_script(
             r#"echo '{"result":{"tab":{"tab_id":"t2","label":"TF-579"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
             r#"echo '{"error":{"message":"no such pane"}}'; exit 1"#,
-            r#"echo '{"error":{"message":"pane close should not run"}}'; exit 1"#,
             r#"echo '{"error":{"message":"agent wait should not run"}}'; exit 1"#,
+            r#"echo '{"error":{"message":"agent rename should not run"}}'; exit 1"#,
         );
         let client = herdr_linear::LinearClient::new("lin_api_test_key").unwrap();
         let issue = sample_issue("TF-579");
@@ -2207,12 +2216,11 @@ esac
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn implement_one_records_a_pane_close_failure_as_a_warning_but_continues() {
-        // tab_create and agent_start both succeed with distinct pane ids (root_pane_id != the
-        // agent's own pane_id, i.e. herdr split rather than replaced), so pane_close actually
-        // runs and its failure must be recorded as a warning, not abort the flow — the
-        // subsequent workflow-state lookup and agent_wait calls must still happen and their own
-        // failures must still surface alongside the pane_close warning in one terminal outcome.
+    async fn implement_one_records_an_agent_rename_failure_as_a_warning_but_continues() {
+        // tab_create and pane_run both succeed, and agent_wait succeeds too, so agent_rename
+        // actually runs — its failure must be recorded as a warning, not abort the flow, since
+        // it's best-effort. The workflow-state lookup's own failure must still surface alongside
+        // the agent_rename warning in one terminal outcome.
         let mut server = mockito::Server::new_async().await;
         server
             .mock("POST", "/graphql")
@@ -2231,69 +2239,22 @@ esac
         .unwrap();
         let (_dir, script) = write_dispatching_herdr_script(
             r#"echo '{"result":{"tab":{"tab_id":"t2","label":"TF-579"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
-            r#"echo '{"result":{"agent":{"pane_id":"p1","tab_id":"t2"}}}'; exit 0"#,
-            r#"echo '{"error":{"message":"no such pane"}}'; exit 1"#,
-            r#"echo '{"error":{"message":"agent never went idle"}}'; exit 1"#,
-        );
-        let issue = sample_issue("TF-579");
-        let command = plugin::implement::ValidatedAgentCommand::parse("hr".to_string()).unwrap();
-
-        let outcome = implement_one(script.to_str().unwrap(), &client, &issue, &command).await;
-
-        let ImplementOutcome::Failed(message) = outcome else {
-            panic!("expected Failed, got {outcome:?}");
-        };
-        assert!(
-            message.contains("failed to close the tab's now-redundant empty pane:")
-                && message.contains("no such pane"),
-            "pane_close failure warning missing: {message}"
-        );
-        assert!(
-            message.contains("failed to load workflow states"),
-            "workflow-state warning missing (proves the flow continued past pane_close): {message}"
-        );
-        assert!(
-            message.contains("agent didn't become ready"),
-            "unexpected message: {message}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn implement_one_adds_no_warning_when_pane_close_succeeds() {
-        let mut server = mockito::Server::new_async().await;
-        server
-            .mock("POST", "/graphql")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(
-                json!({"data": null, "errors": [{"message": "workflow states unavailable"}]})
-                    .to_string(),
-            )
-            .create_async()
-            .await;
-        let client = herdr_linear::LinearClient::with_endpoint(
-            "lin_api_test",
-            format!("{}/graphql", server.url()),
-        )
-        .unwrap();
-        let (_dir, script) = write_dispatching_herdr_script(
-            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"TF-579"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
-            r#"echo '{"result":{"agent":{"pane_id":"p1","tab_id":"t2"}}}'; exit 0"#,
             r#"echo '{"result":{}}'; exit 0"#,
-            r#"echo '{"error":{"message":"agent never went idle"}}'; exit 1"#,
+            r#"echo '{"result":{}}'; exit 0"#,
+            r#"echo '{"error":{"message":"agent_not_found"}}'; exit 1"#,
         );
         let issue = sample_issue("TF-579");
         let command = plugin::implement::ValidatedAgentCommand::parse("hr".to_string()).unwrap();
 
         let outcome = implement_one(script.to_str().unwrap(), &client, &issue, &command).await;
 
-        let ImplementOutcome::Failed(message) = outcome else {
-            panic!("expected Failed, got {outcome:?}");
+        let ImplementOutcome::StartedWithWarnings(message) = outcome else {
+            panic!("expected StartedWithWarnings, got {outcome:?}");
         };
         assert!(
-            !message.contains("redundant empty pane"),
-            "a successful pane_close must not produce a warning: {message}"
+            message.contains("failed to rename the agent pane")
+                && message.contains("agent_not_found"),
+            "agent_rename failure warning missing: {message}"
         );
         assert!(
             message.contains("failed to load workflow states"),
@@ -2308,19 +2269,19 @@ esac
     /// drives `implement_many` directly with an already-built `command`, bypassing
     /// `resolve_validated_agent_command` (the only caller that would issue `agent list`); the
     /// branch is kept here only so this fake `herdr` would also serve a test that went through
-    /// that path instead. `tab create` sleeps `delay` before succeeding — recording, in
+    /// that path instead. `tab create` sleeps `delay` before failing — recording, in
     /// `<dir>/peaks/<pid>`, how many `tab create` calls were in flight at once when it started —
-    /// and `agent start` then fails immediately, echoing the requested agent name (`$3`) back in
-    /// its error message so a caller can verify each `ImplementOutcome::Failed` stayed paired with
-    /// the issue it actually belongs to, not just any issue sharing the same generic failure text.
-    /// This makes `implement_one` return `Failed` right after `tab create` without ever reaching
-    /// `get_workflow_states`/`update_issue`/`agent_wait`/the prompt-stability poll (TF-579's ~2s
-    /// floor — see `PROMPT_SEND_STABILITY_DURATION`), keeping the probe fast and its timing signal
-    /// attributable to `tab create`'s concurrency alone. The "in flight" count comes from each
-    /// invocation creating a uniquely-named file (`$$`, its own PID) under `<dir>/inflight` before
-    /// sleeping and removing it after — no cross-process locking needed, since every writer only
-    /// ever touches its own file; `peak_concurrency` below then takes the max over every recorded
-    /// snapshot once the whole batch has finished.
+    /// echoing the requested tab label (`$6`, i.e. `--label`'s value) back in its error message so
+    /// a caller can verify each `ImplementOutcome::Failed` stayed paired with the issue it
+    /// actually belongs to, not just any issue sharing the same generic failure text. This makes
+    /// `implement_one` return `Failed` right at `tab create` without ever reaching `pane_run`/
+    /// `get_workflow_states`/`update_issue`/`agent_wait`/`agent_rename`/the prompt-stability poll
+    /// (TF-579's ~2s floor — see `PROMPT_SEND_STABILITY_DURATION`), keeping the probe fast and its
+    /// timing signal attributable to `tab create`'s concurrency alone. The "in flight" count comes
+    /// from each invocation creating a uniquely-named file (`$$`, its own PID) under
+    /// `<dir>/inflight` before sleeping and removing it after — no cross-process locking needed,
+    /// since every writer only ever touches its own file; `peak_concurrency` below then takes the
+    /// max over every recorded snapshot once the whole batch has finished.
     #[cfg(unix)]
     fn write_batch_concurrency_probe_script(
         delay: std::time::Duration,
@@ -2339,11 +2300,7 @@ esac
     echo "$count" > "$script_dir/peaks/$$"
     sleep {delay_secs}
     rm -f "$script_dir/inflight/$$"
-    echo '{{"result":{{"tab":{{"tab_id":"t1","label":"batch"}},"root_pane":{{"pane_id":"p1"}}}}}}'
-    exit 0
-    ;;
-  "agent start")
-    echo "{{\"error\":{{\"message\":\"agent start intentionally fails for the concurrency probe (name: $3)\"}}}}"
+    echo "{{\"error\":{{\"message\":\"tab create intentionally fails for the concurrency probe (label: $6)\"}}}}"
     exit 1
     ;;
   *)
@@ -2390,12 +2347,12 @@ esac
     /// under load (observed once across a full `cargo test --all-features` run, where real
     /// subprocess-spawn overhead across ~500 tests pushed a run past the window) without ever
     /// catching a real regression — see PR #37 review discussion. Also verifies each returned
-    /// `(identifier, outcome)` pair stayed correctly matched: the fake `agent start` above echoes
-    /// the agent name it was invoked with back into its failure message, and
-    /// [`plugin::implement::build_agent_name`] derives that name from `command` plus the issue's
-    /// own identifier, so a pairing bug (e.g. a future refactor that zips `issues` against
-    /// `execute_batch`'s output by position after either side got reordered) would surface here as
-    /// a mismatched name rather than being masked by every issue sharing one generic message.
+    /// `(identifier, outcome)` pair stayed correctly matched: the fake `tab create` above echoes
+    /// its own `--label` argument (which `implement_one` builds directly from the issue's
+    /// identifier) back into its failure message, so a pairing bug (e.g. a future refactor that
+    /// zips `issues` against `execute_batch`'s output by position after either side got reordered)
+    /// would surface here as a mismatched identifier rather than being masked by every issue
+    /// sharing one generic message.
     #[cfg(unix)]
     #[tokio::test]
     async fn implement_many_runs_issues_concurrently_up_to_the_default_batch_limit() {
@@ -2422,21 +2379,20 @@ esac
         assert_eq!(results.len(), ISSUE_COUNT);
         for (identifier, outcome) in &results {
             let ImplementOutcome::Failed(message) = outcome else {
-                panic!("expected every issue to fail (agent start always fails): {identifier} -> {outcome:?}");
+                panic!("expected every issue to fail (tab create always fails): {identifier} -> {outcome:?}");
             };
             assert!(
-                message.contains("agent start intentionally fails"),
+                message.contains("tab create intentionally fails"),
                 "unexpected failure for {identifier}: {message}"
             );
-            // Pairing check: the fake `agent start` echoed back the name it was actually invoked
-            // with, which is derived from this same `identifier` — if a future change shuffled
-            // identifiers against the wrong outcome, this issue's expected name wouldn't appear
-            // in its own message.
-            let expected_name = plugin::implement::build_agent_name(command.as_str(), identifier);
+            // Pairing check: the fake `tab create` echoed back its own `--label` value, which
+            // `implement_one` sets directly to this same `identifier` — if a future change
+            // shuffled identifiers against the wrong outcome, this issue's own identifier
+            // wouldn't appear in its own message.
             assert!(
-                message.contains(&expected_name),
-                "outcome for {identifier} doesn't carry its own agent name {expected_name:?} — \
-                 got: {message} (identifier/outcome pairing may be broken)"
+                message.contains(identifier),
+                "outcome for {identifier} doesn't carry its own identifier — got: {message} \
+                 (identifier/outcome pairing may be broken)"
             );
         }
 
@@ -2637,7 +2593,7 @@ esac
     async fn send_prompt_until_visible_resends_after_an_attempt_times_out() {
         // Review gap: send_prompt_until_visible's cross-attempt retry logic (does a timed-out
         // attempt actually trigger a resend, and can a later attempt succeed?) had no test at
-        // all. `write_prompt_send_lands_on_attempt_script` switches on the `agent send` count
+        // all. `write_prompt_send_lands_on_attempt_script` switches on the `agent prompt` count
         // rather than the `agent read` count so this isn't sensitive to how many polls either
         // attempt actually takes.
         let prompt = plugin::implement::build_implement_prompt("TF-579");
