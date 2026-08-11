@@ -29,6 +29,7 @@ unicode-width = { version = "0.2", optional = true }
 [dev-dependencies]
 mockito = "1.2"
 tempfile = "3"
+criterion = { version = "0.7", features = ["async_tokio"] }
 
 [features]
 default = []
@@ -38,6 +39,31 @@ plugin = ["ratatui", "crossterm", "toml", "open", "tui-markdown", "unicode-width
 name = "herdr-linear"
 path = "src/main.rs"
 required-features = ["plugin"]
+
+# `harness = false` swaps out libtest for criterion's own runner. Without
+# it, cargo falls back to the default libtest harness, which generates its
+# own `main` for the bench target — but each `benches/*.rs` file's
+# `criterion_main!()` macro already defines `fn main()` itself, so leaving
+# the default harness in place produces a "duplicate `main`"/conflicting
+# symbol compile error, not a silent fallback to running as `#[test]`s
+# (there are no `#[test]` functions in these files for that to apply to
+# anyway). This is also what keeps them out of the normal `cargo test`/CI
+# loop: `cargo test` never builds or runs `[[bench]]` targets unless
+# invoked with `--benches`/
+# `--all-targets`, and `just test`/CI's `cargo test --all-features` don't
+# pass those flags. Run them explicitly with `cargo bench` — see
+# `benches/README.md`.
+[[bench]]
+name = "pagination"
+harness = false
+
+[[bench]]
+name = "batch_execution"
+harness = false
+
+[[bench]]
+name = "rate_limit_retry"
+harness = false
 
 [profile.release]
 opt-level = 3
