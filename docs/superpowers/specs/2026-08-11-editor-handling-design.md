@@ -95,10 +95,13 @@ Pure decision logic only — no process/socket access, same charter as `implemen
 
 - `async fn open_config_in_herdr_pane(herdr_bin: &str, editor_cmd: &str, config_path: &Path) -> Result<(), String>`:
   1. `agent_focus(herdr_bin, EDITOR_AGENT_NAME)` → `Ok(())` on success.
-  2. Otherwise `tab_create(herdr_bin, config_path.parent(), "config")` +
+  2. Otherwise `tab_create(herdr_bin, cwd, "config")` +
      `agent_start(herdr_bin, EDITOR_AGENT_NAME, cwd, tab_id, argv)`, then close the redundant root
      pane exactly like `implement_one` does (`started.pane_id != created_tab.root_pane_id` guard).
-     Any failure in this chain → `Err(message)`.
+     `cwd` is `config_path.parent()` when present, else `plugin::host::resolve_cwd()` (same
+     fallback `implement_one` already uses) — `config_path` is always `dir.join("config.toml")` in
+     practice, so `parent()` is `None` only in a contrived/malformed-path edge case, not a real
+     runtime path. Any failure in this chain → `Err(message)`.
 - `async fn open_config_editor(path: &Path) -> Result<(), String>`:
   1. Resolve the editor command (`config::load_editor_override()` + `PATH` env +
      `editor::resolve_editor_command`).
@@ -107,9 +110,13 @@ Pure decision logic only — no process/socket access, same charter as `implemen
   3. Any other outcome (`None`, or the herdr-pane attempt failed) → `open::that(path)`, same error
      message format as today (`"Couldn't open {path}: {e}. Edit it manually."`).
 - `OpenConfig` handler: unchanged fs-existence step, then `open_config_editor(&path).await` in
-  place of today's direct `open::that(&path)` call. A transient `Status::Ok("Opening
-  config.toml…")` + redraw is shown *before* the `.await`, mirroring `Action::Implement`'s
-  pattern, so a herdr round-trip doesn't read as a hang.
+  place of today's direct `open::that(&path)` call. The transient `Status::Ok("Opening
+  config.toml…")` + redraw (mirroring `Action::Implement`'s pattern, so a herdr round-trip doesn't
+  read as a hang) is shown only when editor resolution actually yielded `Some(cmd)` — i.e. only
+  right before the herdr-pane attempt, not unconditionally before resolution. When no editor
+  resolves at all (tier 3 only), `open::that` runs directly with no transient status, since that
+  path is normally near-instant and showing a "loading" message for it would flicker for no
+  reason.
 
 ## Data flow / error handling
 
