@@ -13,7 +13,7 @@
 - Every fact this plan relies on about herdr's current CLI shape was verified live against the installed herdr 0.8.0 binary during investigation (not read from herdr's own source, which isn't available locally) — see TF-624's description for the verified command transcripts.
 - `min_herdr_version` in `herdr-plugin.toml` (mirrored by `MIN_HERDR_VERSION` in `herdr_cli.rs`) is raised from `"0.7.0"` to `"0.8.0"` by Task 8 — the new `pane_run`/`tab_list`/`tab_focus`/`agent_rename`/`agent_prompt`/`agent_wait --until` calls this plan introduces have only ever been verified against 0.8.0, so publishing the old floor would be inaccurate. `tab_create`'s `--cwd`/`--label`/`--focus` flags themselves are unchanged by this plan and still work exactly as before.
 - No placeholder/TODO code. Every step below is the literal diff to make.
-- Run `cargo test`, `cargo clippy --all-targets -- -D warnings`, and `cargo fmt --check` after every task; do not move to the next task with a red build.
+- This crate gates all of `src/plugin/*` (including `herdr_cli.rs`) and the binary itself behind the `plugin` Cargo feature (`default = []` in `Cargo.toml`) — every build/test/lint command in this plan must include `--all-features` (or use the project's own `justfile` recipes, which already do: `just fmt`, `just lint` = `cargo clippy --all-targets --all-features -- -D warnings`, `just test` = `cargo test --all-features -- --nocapture`, `just check` = all three). A bare `cargo test`/`cargo clippy --all-targets -- -D warnings` without `--all-features` silently skips this code entirely — discovered live during Task 1's review (TF-624), when it let a genuine `dead_code` clippy failure through undetected. Individual task steps below that say plain `cargo test`/`cargo clippy`/`cargo build` mean the `--all-features`/`just`-recipe form; run `just check` after every task and do not move to the next task with a red build.
 - Reference ticket: TF-624.
 
 ---
@@ -60,6 +60,12 @@ pub async fn tab_list(herdr_bin: &str) -> Result<String> {
 /// all of which mean "nothing to reuse, create a fresh one" to every caller. Pure — no I/O — so
 /// the matching logic is unit-testable without spawning a process, mirroring
 /// [`crate::plugin::implement::resolve_preferred_agent`]'s same split for `agent list`.
+///
+/// `#[allow(dead_code)]`: this task (Task 1, TF-624) lands the function and its unit tests
+/// ahead of its only real caller, [`find_existing_editor_tab`], which Task 5 adds — without the
+/// allow, `cargo clippy --all-features` fails this task's own commit in isolation (verified live
+/// during Task 1's review). Task 5 removes this attribute in the same edit that adds the caller.
+#[allow(dead_code)]
 fn find_tab_id_by_label(tab_list_json: &str, label: &str) -> Option<TabId> {
     let parsed: Value = serde_json::from_str(tab_list_json).ok()?;
     let tabs = parsed.get("tabs")?.as_array()?;
@@ -128,7 +134,7 @@ fn find_tab_id_by_label_returns_none_when_tabs_array_is_missing() {
 
 - [ ] **Step 3: Run tests to verify they pass**
 
-Run: `cargo test find_tab_id_by_label -- --nocapture`
+Run: `cargo test --all-features find_tab_id_by_label -- --nocapture` (must include `--all-features` — this module only compiles under the `plugin` feature, see Global Constraints), then `just check` to confirm the whole task's diff is clean (fmt + `clippy --all-targets --all-features -- -D warnings` + full test suite).
 Expected: 4 passed.
 
 - [ ] **Step 4: Commit**
@@ -485,7 +491,7 @@ async fn open_config_in_herdr_pane(
 
 Note this drops the old `agent_focus` reuse-check, the `AgentStarted`/`started.pane_id != created_tab.root_pane_id` redundant-pane-close dance entirely — the editor now always runs directly in `tab_create`'s own root pane via `pane_run` (no split is ever created, since nothing calls `agent_start` anymore), so there is no redundant pane to close.
 
-- [ ] **Step 2: Add `find_existing_editor_tab` to `herdr_cli.rs`** (thin wrapper around Task 1's `find_tab_id_by_label`, made `pub` since `main.rs` needs it and `find_tab_id_by_label` itself stays private/pure for unit testing):
+- [ ] **Step 2: Add `find_existing_editor_tab` to `herdr_cli.rs`** (thin wrapper around Task 1's `find_tab_id_by_label`, made `pub` since `main.rs` needs it and `find_tab_id_by_label` itself stays private/pure for unit testing). This is `find_tab_id_by_label`'s first real caller — **remove the `#[allow(dead_code)]` attribute Task 1 put directly above `fn find_tab_id_by_label`** in the same edit (its explanatory comment says exactly this; delete both the comment and the attribute line, leaving the function's original doc comment intact):
 
 ```rust
 /// Convenience wrapper around [`find_tab_id_by_label`] for [`crate::open_config_in_herdr_pane`]:
