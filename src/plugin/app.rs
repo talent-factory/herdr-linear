@@ -867,7 +867,7 @@ fn handle_help_overlay_key(app: &mut App, key: crossterm::event::KeyCode) {
     }
 }
 
-/// Pure half of the `c`-in-error-state key handling, split out from [`handle_key`] purely
+/// Pure half of the `c` key handling, split out from [`handle_key`] purely
 /// so it's unit-testable without mutating the real process environment (no `App` field
 /// caches the config dir — every `load_*`/`resolve_*` function in `config.rs` re-reads
 /// `HERDR_PLUGIN_CONFIG_DIR` fresh on each call rather than caching it — see e.g.

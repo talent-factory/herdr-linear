@@ -716,11 +716,13 @@ async fn open_config_editor(
     opener: impl Fn(&std::path::Path) -> std::io::Result<()>,
 ) -> std::result::Result<(), String> {
     if let Some(cmd) = &editor_cmd {
-        if open_config_in_herdr_pane(herdr_bin, cmd, path)
-            .await
-            .is_ok()
-        {
-            return Ok(());
+        match open_config_in_herdr_pane(herdr_bin, cmd, path).await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                tracing::warn!(
+                    "herdr editor pane unavailable, falling back to the OS opener: {err}"
+                );
+            }
         }
     }
 
@@ -1017,7 +1019,8 @@ async fn event_loop(
                                     // happen — the OS-opener-only path (`editor_cmd` is `None`)
                                     // is normally near-instant, so a "loading" status for it
                                     // would just flicker.
-                                    if editor_cmd.is_some() {
+                                    let showed_transient_status = editor_cmd.is_some();
+                                    if showed_transient_status {
                                         app.set_status(plugin::app::Status::Ok(
                                             "Opening config.toml…".to_string(),
                                         ));
@@ -1032,7 +1035,12 @@ async fn event_loop(
                                         .await;
 
                                     match result {
-                                        Ok(()) => app.clear_status(),
+                                        // Only clear status if we actually showed a transient
+                                        // one above — otherwise this would wipe an unrelated
+                                        // pre-existing status banner on the tier-3-only
+                                        // (OS-opener) path, where nothing was ever shown.
+                                        Ok(()) if showed_transient_status => app.clear_status(),
+                                        Ok(()) => {}
                                         Err(message) => {
                                             app.set_status(plugin::app::Status::Error(format!(
                                                 "{message}. Edit it manually."

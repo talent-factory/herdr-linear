@@ -14,13 +14,14 @@ use std::path::{Path, PathBuf};
 /// "Configure" section), so every `c` press across every herdr-linear instance should reuse the
 /// *same* pane rather than each spawning its own — that's the whole point of
 /// `main.rs::open_config_in_herdr_pane` trying `agent_focus` before creating a new tab.
-pub const EDITOR_AGENT_NAME: &str = "config";
+pub const EDITOR_AGENT_NAME: &str = "herdr-linear-config";
 
 /// Locates a binary on the system by searching through `PATH` entries.
 ///
-/// Given a `PATH`-like environment variable (colon-separated directories), scans each until
-/// `binary` is found as an executable file. Returns `None` if the binary is not found in any
-/// directory or if `path_env` is `None`.
+/// Scans `path_env` (a `PATH`-style, platform-separated list of directories, parsed via
+/// `std::env::split_paths`) until `binary` is found in one of them. This is an existence-only
+/// check (`Path::exists`), not an executable-bit check. Returns `None` if the binary is not
+/// found in any directory or if `path_env` is `None`.
 ///
 /// On Windows, also checks for `binary.exe` as a fallback since Windows executables typically
 /// have an `.exe` extension.

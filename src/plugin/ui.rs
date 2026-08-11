@@ -871,7 +871,7 @@ fn settings_lines_from(
     let editor_display = summary
         .editor
         .as_deref()
-        .unwrap_or("(default: nvim if PATH)");
+        .unwrap_or("(default: nvim if on PATH)");
     lines.push(format!("editor           = {editor_display}"));
 
     let team_id_display = summary.team_id.as_deref().unwrap_or("Not set");
@@ -2245,7 +2245,7 @@ mod tests {
         assert!(lines.contains("✓ Set"));
         assert!(!lines.contains("lin_api_"));
         assert!(lines.contains("my-agent"));
-        assert!(lines.contains("vim"));
+        assert!(lines.contains("editor           = vim"));
         assert!(lines.contains("team-123"));
         assert!(lines.contains("herdr-linear"));
         assert!(lines.contains("proj-1"));
