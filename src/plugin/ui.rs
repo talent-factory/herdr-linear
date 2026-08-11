@@ -868,7 +868,10 @@ fn settings_lines_from(
     let agent_command_display = summary.agent_command.as_deref().unwrap_or("(default)");
     lines.push(format!("agent_command    = {agent_command_display}"));
 
-    let editor_display = summary.editor.as_deref().unwrap_or("(default: nvim if PATH)");
+    let editor_display = summary
+        .editor
+        .as_deref()
+        .unwrap_or("(default: nvim if PATH)");
     lines.push(format!("editor           = {editor_display}"));
 
     let team_id_display = summary.team_id.as_deref().unwrap_or("Not set");

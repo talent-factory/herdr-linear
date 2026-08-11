@@ -434,8 +434,7 @@ mod tests {
     use super::{
         api_key_value_line_range, config_path_hint, redact_api_key_value_lines,
         resolve_agent_command_override, resolve_api_key, resolve_editor_override,
-        resolve_project_id_override, resolve_team_id_override, resolved_summary,
-        ConfigFileStatus,
+        resolve_project_id_override, resolve_team_id_override, resolved_summary, ConfigFileStatus,
     };
     use std::fs;
 
@@ -870,11 +869,7 @@ mod tests {
     #[test]
     fn reads_editor_from_config_file() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join("config.toml"),
-            "editor = \"vim\"\n",
-        )
-        .unwrap();
+        fs::write(dir.path().join("config.toml"), "editor = \"vim\"\n").unwrap();
 
         let editor = resolve_editor_override(Some(dir.path())).unwrap();
 
