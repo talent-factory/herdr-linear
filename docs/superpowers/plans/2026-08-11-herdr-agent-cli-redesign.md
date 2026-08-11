@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make herdr-linear's `c` keybinding (open config.toml) and Implement-on-Enter work again against herdr >= 0.8.0, whose `agent start`/`agent wait`/`agent send` CLI surface changed shape out from under this plugin.
+**Goal:** Make herdr-linear's `c` keybinding (open config.toml) and Implement-on-Enter work again against herdr >= 0.8.0, whose `agent start`/`agent wait`/`agent send` CLI surface changed shape out from under this plugin — and document the verified-compatible herdr version in `CHANGELOG.md`/`README.md`/`herdr-plugin.toml` once it does.
 
 **Architecture:** Replace the "one call spawns a named agent with arbitrary argv in a fresh tab" model (`herdr agent start <name> --cwd --tab --focus -- <argv>`, now rejected with `unknown option: --cwd`) with the primitives the new herdr actually exposes: `tab create` (unchanged) to get a pane at a shell prompt, a new `pane run <pane> <command>` wrapper to type the launch command into it (works for arbitrary commands — wrapper aliases, `nvim` — none of which fit the new `agent start --kind <fixed-enum>` model), then herdr's own passive auto-detection plus the existing (flag-fixed) `agent_wait`/renamed `agent_prompt` to know when a *recognized* coding agent is ready. The config-editor reuse-on-second-press check moves from `agent focus <name>` (impossible for `nvim`, which can never become a recognized "agent") to a `tab list` + label match + `tab focus`, mirroring the pattern `scripts/open-tab.sh` already uses for panel reuse. This also deletes now-unreachable complexity: TF-590's `agent_name_taken` retry loop and the TF-579 redundant-root-pane-close dance, neither of which apply once the process runs directly in `tab_create`'s root pane instead of a `agent_start`-created split.
 
@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Every fact this plan relies on about herdr's current CLI shape was verified live against the installed herdr 0.8.0 binary during investigation (not read from herdr's own source, which isn't available locally) — see TF-624's description for the verified command transcripts.
-- `min_herdr_version = "0.7.0"` in `herdr-plugin.toml` is unchanged by this plan — `tab_create`'s `--cwd`/`--label`/`--focus` flags still work exactly as before and are still the oldest-supported shape this plugin requires.
+- `min_herdr_version` in `herdr-plugin.toml` (mirrored by `MIN_HERDR_VERSION` in `herdr_cli.rs`) is raised from `"0.7.0"` to `"0.8.0"` by Task 8 — the new `pane_run`/`tab_list`/`tab_focus`/`agent_rename`/`agent_prompt`/`agent_wait --until` calls this plan introduces have only ever been verified against 0.8.0, so publishing the old floor would be inaccurate. `tab_create`'s `--cwd`/`--label`/`--focus` flags themselves are unchanged by this plan and still work exactly as before.
 - No placeholder/TODO code. Every step below is the literal diff to make.
 - Run `cargo test`, `cargo clippy --all-targets -- -D warnings`, and `cargo fmt --check` after every task; do not move to the next task with a red build.
 - Reference ticket: TF-624.
@@ -1135,14 +1135,68 @@ git commit -m "test: rewrite implement_one/implement_many/prompt fixtures for he
 
 ---
 
-### Task 8: CHANGELOG and TF-604 correction
+### Task 8: CHANGELOG, README, and `min_herdr_version` compatibility update
+
+**Why this task exists:** once the plugin works again, the *actual* herdr version it now requires must be written down somewhere a user hits before they hit the failure — not just fixed in code. This plugin has only ever been verified against herdr 0.8.0 (the version installed during TF-624's investigation); nothing lower than that has been tested against the new `pane_run`/`tab_list`/`tab_focus`/`agent_rename`/`agent_prompt`/`agent_wait --until` calls this plan introduces, so the honest floor to publish is `0.8.0`, not a guessed-at earlier version.
 
 **Files:**
 - Modify: `CHANGELOG.md`
+- Modify: `herdr-plugin.toml`
+- Modify: `src/plugin/herdr_cli.rs`
+- Modify: `README.md`
 
-**Interfaces:** none — documentation only.
+**Interfaces:** none — documentation and a version-constant bump only.
 
-- [ ] **Step 1: Add a `### Fixed` entry under `[Unreleased]`** in `CHANGELOG.md` (above the existing TF-623 benchmark-suite entry, keeping newest-first order):
+- [ ] **Step 1: Bump `min_herdr_version` in `herdr-plugin.toml`** from `"0.7.0"` to `"0.8.0"`:
+
+```toml
+min_herdr_version = "0.8.0"
+```
+
+- [ ] **Step 2: Bump `MIN_HERDR_VERSION` in `src/plugin/herdr_cli.rs`** to match — find:
+
+```rust
+const MIN_HERDR_VERSION: &str = "0.7.0";
+```
+
+and change to:
+
+```rust
+const MIN_HERDR_VERSION: &str = "0.8.0";
+```
+
+The doc comment directly above it already says "mirroring `min_herdr_version` in `herdr-plugin.toml`" — leave that wording as-is, it's still accurate. The existing test `interpret_output_hints_at_upgrading_herdr_when_cwd_flag_is_unsupported` (Task 3) asserts against the `MIN_HERDR_VERSION` constant symbolically (`err.contains(MIN_HERDR_VERSION)`), not a literal `"0.7.0"` string, so it needs no separate edit here.
+
+- [ ] **Step 3: Update the one literal version-floor mention in `README.md`** (around line 449, inside the `<Enter>`-launch-context `[!NOTE]` block) — change:
+
+```markdown
+> the **split** action (`herdr-linear.open-split`) or the **tab** one
+> (`herdr-linear.open-tab`). This requires herdr ≥ 0.7.0 (see `min_herdr_version` in
+> `herdr-plugin.toml`); on an older/misbehaving herdr that omits the launch context,
+```
+
+to:
+
+```markdown
+> the **split** action (`herdr-linear.open-split`) or the **tab** one
+> (`herdr-linear.open-tab`). This requires herdr ≥ 0.8.0 (see `min_herdr_version` in
+> `herdr-plugin.toml`); on an older/misbehaving herdr that omits the launch context,
+```
+
+- [ ] **Step 4: Add a `### Requirements` subsection to `README.md`**, immediately after the `## Herdr Plugin` section's opening paragraph and before the screenshot `<table>` (i.e. right after the line ending "...pressing `<Enter>` on a selected issue is not — see \"Use\" below." and before `<table>`):
+
+```markdown
+### Requirements
+
+Requires **herdr >= 0.8.0** (see `min_herdr_version` in `herdr-plugin.toml`). herdr's own
+`agent`/`pane`/`tab` CLI surface has changed shape between releases before (TF-604, TF-624) —
+this plugin has only ever been verified against 0.8.0; an older installed herdr will fail with
+`herdr config check`-style "unknown option"/"unknown subcommand" errors rather than a plugin bug.
+Run `herdr --version` to check yours, and `herdr update` to upgrade.
+
+```
+
+- [ ] **Step 5: Add a `### Fixed` entry under `[Unreleased]`** in `CHANGELOG.md` (above the existing TF-623 benchmark-suite entry, keeping newest-first order):
 
 ```markdown
 - `c` (open `config.toml`) and Implement-on-Enter both silently failed against herdr >= 0.8.0,
@@ -1161,19 +1215,30 @@ git commit -m "test: rewrite implement_one/implement_many/prompt fixtures for he
   for `agent start`: herdr >= 0.8.0 (well above the floor) rejects it too, having redesigned the
   subcommand's flags entirely (see TF-624) — the hint's wording is now only accurate for
   `tab_create`, the one remaining `--cwd`-accepting call (TF-624)
+
+- `min_herdr_version` (in `herdr-plugin.toml`, mirrored by `MIN_HERDR_VERSION` in
+  `herdr_cli.rs`) raised `0.7.0` → `0.8.0`: the new `pane_run`/`tab_list`/`tab_focus`/
+  `agent_rename`/`agent_prompt`/`agent_wait --until` calls this fix introduces have only ever
+  been verified against herdr 0.8.0 — publishing the old, now-inaccurate `0.7.0` floor would
+  send users on an older herdr into the exact silent-failure this ticket exists to fix. See the
+  new "Requirements" section in `README.md` (TF-624)
 ```
 
-- [ ] **Step 2: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add CHANGELOG.md
-git commit -m "docs: changelog entry for the herdr 0.8.0 agent-CLI redesign (TF-624)"
+git add CHANGELOG.md herdr-plugin.toml src/plugin/herdr_cli.rs README.md
+git commit -m "docs: changelog + README compatibility note for the herdr 0.8.0 agent-CLI redesign (TF-624)
+
+Also raises min_herdr_version 0.7.0 -> 0.8.0 (herdr_cli.rs's MIN_HERDR_VERSION mirrors it) —
+the new pane_run/tab_list/tab_focus/agent_rename/agent_prompt/agent_wait --until calls this
+fix introduces have only ever been verified against 0.8.0."
 ```
 
 ---
 
 ## Self-Review
 
-- **Spec coverage:** `c` keybinding (Task 5), Implement-on-Enter (Task 6-7), `agent_wait`/`agent_prompt` flag fixes (Task 2), dead-code removal (Task 3), CHANGELOG correction (Task 8) — all of TF-624's "Fix direction" bullets are covered.
+- **Spec coverage:** `c` keybinding (Task 5), Implement-on-Enter (Task 6-7), `agent_wait`/`agent_prompt` flag fixes (Task 2), dead-code removal (Task 3), CHANGELOG/README/`min_herdr_version` compatibility documentation (Task 8) — all of TF-624's "Fix direction" bullets, plus the follow-up requirement to document the verified-compatible herdr version once the fix lands, are covered.
 - **Placeholder scan:** every step carries literal code, literal test bodies, or an exact line-range/grep target — no "similar to above" or "add appropriate handling" language.
 - **Type consistency:** `pane_run`/`tab_list`/`tab_focus`/`agent_rename`/`agent_prompt` signatures introduced in Tasks 1-2 are used identically (same names, same argument order) in Tasks 5-7.
