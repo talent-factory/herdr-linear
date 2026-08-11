@@ -53,16 +53,54 @@ rather than only ever showing "my issues". Tracked as issues in the
       repo → Linear project mapping) and show its open issues (TF-577, TF-578)
 - [x] Issue search/filter within the panel (fzf-style) (TF-580)
 
-### Phase 1.7: Polish & Stability
+### Phase 1.7: Polish & Stability ✅ Complete
 
-**Estimated**: September 2026
+Closed out ahead of the original September estimate. Tracked as issues in the
+[herdr-linear Linear project](https://linear.app/talent-factory/project/herdr-linear-10dca51ea35b/overview)
+(Phase 1.7 milestone, 100% — TF-609 through TF-614, TF-619).
 
-- [ ] Integration tests with Linear sandbox
-- [ ] Performance benchmarks
-- [x] Rate limiting strategies (TF-610)
-- [ ] Connection pooling for batch operations
-- [ ] Better pagination helpers
-- [ ] User feedback incorporation
+- [x] Auto-paginating helpers for list queries — `get_all_issues`, `get_all_teams`,
+      `get_all_team_issues`, `get_all_projects` (TF-609)
+- [x] Automatic rate-limit retry with backoff (TF-610)
+- [x] Bounded-concurrency batch execution (`LinearClient::execute_batch`) —
+      connection pooling itself already came for free via the shared
+      `reqwest::Client`; what was missing was a capped-concurrency way to run
+      several independent requests at once (TF-611)
+- [x] Live integration tests against Linear's sandbox (TF-612)
+- [x] Detail pane: distinct bullet + hanging indent for wrapped Markdown list
+      items, so a wrapped line starting with `--` can't be mistaken for a new
+      bullet (TF-613)
+- [x] `c` (open `config.toml`) now works from every screen, with real
+      editor-handling for SSH use (TF-614)
+- [x] Fixed implement-prompt confirmation false-positives when agent startup
+      outlasts the fixed 800ms window (TF-619)
+
+**Known gap**: `execute_batch` (TF-611) isn't wired into `main.rs`'s
+multi-issue implement flow yet — it's still explicitly sequential. Performance
+benchmarks and open-ended "user feedback incorporation" were dropped from this
+phase's original scope; benchmarks move to Phase 2a below.
+
+### Phase 2a: Filtering, Batching & Performance Foundations
+
+**Target**: 2026-08-14. Tracked as issues in the
+[herdr-linear Linear project](https://linear.app/talent-factory/project/herdr-linear-10dca51ea35b/overview)
+(Phase 2a milestone). Closes out Phase 1.7's two loose ends, then delivers the
+first slice of Phase 2's "Filtering & Search".
+
+- [ ] Wire `execute_batch` (TF-611) into `main.rs`'s multi-issue implement
+      flow, replacing its still-sequential per-issue loop (TF-622)
+- [ ] Performance benchmarks (`criterion`) for pagination, batch execution,
+      and rate-limit retry (TF-623)
+- [ ] Query DSL parser: filter terms (`priority:`, `state:`, `label:`) + sort
+      keys (TF-615)
+- [ ] Wire the parsed filter terms into Linear's `IssueFilter` so filtering
+      happens server-side (TF-616) — depends on TF-615
+- [ ] `config.toml` `default_query` + a DSL-aware `/`-filter, backward
+      compatible with TF-580's plain substring match (TF-617) — depends on
+      TF-615 and TF-616
+
+TF-622/TF-623 are independent and can run in parallel with, or ahead of,
+TF-615→616→617's dependency chain.
 
 ### Phase 2: Advanced Features
 
@@ -72,14 +110,12 @@ rather than only ever showing "my issues". Tracked as issues in the
   - Real-time issue update notifications
   - Comment subscriptions
   - Project change events
-  
+
 - [ ] **Batch Operations**
-  - Bulk issue updates
-  - Efficient multi-issue queries
+  - Efficient multi-issue queries (beyond the implement flow — see Phase 2a)
   - Transaction support
 
-- [ ] **Filtering & Search**
-  - Advanced query builder
+- [ ] **Filtering & Search** — first slice in progress, see Phase 2a above
   - Saved filters
   - Full-text search integration
 
@@ -165,9 +201,11 @@ rather than only ever showing "my issues". Tracked as issues in the
 ### Current (Will be addressed)
 
 1. **No Webhook Support**: Events must be polled
-2. **Limited Batch Operations**: Some operations are sequential
+2. **Limited Batch Operations**: `main.rs`'s multi-issue implement flow is
+   still sequential — the bounded-concurrency primitive it would use
+   (`LinearClient::execute_batch`) shipped in Phase 1.7 (TF-611) but isn't
+   wired in yet
 3. **No Offline Mode**: Requires live connection
-4. **Pagination Manual**: No automatic pagination helpers
 
 ### By Design
 
@@ -191,7 +229,8 @@ Have ideas? Please:
 | Aug 2026  | Phase 1 Complete                | Done      |
 | Aug 2026  | Plugin v1 ("My Issues") Complete | Done      |
 | Aug 2026  | Phase 1.6 (Smart Issue Selection)| Done      |
-| Sep 2026  | Phase 1.7 (Stability)            | Planned   |
+| Aug 2026  | Phase 1.7 (Polish & Stability)   | Done      |
+| 2026-08-14| Phase 2a (Filtering/Batching/Perf)| In Progress |
 | Oct 2026  | Phase 2 (Advanced Features)     | Planned   |
 | Nov 2026  | Phase 3 (Herdr Integration)     | Planned   |
 | Dec 2026  | Phase 4 (Production)            | Planned   |
@@ -204,4 +243,4 @@ Have ideas? Please:
 
 ---
 
-Last updated: 2026-08-08
+Last updated: 2026-08-11
