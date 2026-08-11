@@ -30,6 +30,15 @@ fn bench_execute_batch_concurrency(c: &mut Criterion) {
                 b.to_async(&rt).iter(|| async {
                     let requests = (0..REQUEST_COUNT).map(|_| client.get_viewer()).collect();
                     let results = client.execute_batch(requests, Some(concurrency)).await;
+                    // `Iterator::all` is vacuously true on an empty
+                    // collection, so also pin down the count directly —
+                    // otherwise a regression that silently dropped requests
+                    // instead of erroring on them could pass both checks.
+                    assert_eq!(
+                        results.len(),
+                        REQUEST_COUNT,
+                        "execute_batch should return one result per request"
+                    );
                     assert!(
                         results.iter().all(|r| r.is_ok()),
                         "every mocked batch request should succeed"

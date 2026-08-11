@@ -15,10 +15,23 @@
 //! Both variants below hit the exact same success-path branch in
 //! `execute_graphql` — `rate_limit_retry` is only ever consulted once a
 //! `RateLimitExceeded` error has already been returned, so on success it's
-//! never read. The two benchmarks are expected to be statistically
-//! indistinguishable; they're kept side by side as a standing check that a
-//! future refactor doesn't accidentally make the success path branch on
-//! that flag and add measurable overhead to one of them.
+//! never read.
+//!
+//! **What this pair of benchmarks can and can't tell you:** the thing being
+//! measured (a single bool read plus a `Result` pattern match) costs
+//! single-digit nanoseconds, while the mocked network round trip both
+//! variants pay for costs on the order of 100µs — four to five orders of
+//! magnitude larger. Confirmed empirically: `retry_enabled_default` and
+//! `retry_disabled` show *non-overlapping* confidence intervals even on
+//! unmodified code, because the difference between two independent
+//! mocked-network samples is bigger noise than the thing being compared.
+//! **Do not treat a difference between the two variants' numbers as a
+//! signal** — at this magnitude it isn't one. What each variant *is* good
+//! for is its own absolute number, tracked release over release: a
+//! sustained, order-of-magnitude jump in either `retry_enabled_default` or
+//! `retry_disabled` on its own points at a real regression in
+//! `execute_graphql`'s success path (or in the mocked round trip itself);
+//! the two variants diverging from *each other* does not.
 
 #[path = "support/mod.rs"]
 mod support;

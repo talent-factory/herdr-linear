@@ -22,6 +22,8 @@ see the doc comment at the top of `rate_limit_retry.rs`.
 
 ```bash
 cargo bench
+# or
+just bench
 ```
 
 Or a single suite:
@@ -53,6 +55,14 @@ get_all_issues_pagination/pages/20
 - Treat the **point estimate** (middle value) as the number to compare
   across runs; the interval is criterion's confidence bound, not noise to
   read into.
+- Below each `time:` line, criterion prints one of three verdicts comparing
+  this run to the previous one: `No change in performance detected.`,
+  `Change within noise threshold.` (a statistically-detectable change that's
+  still smaller than this suite's 35% `noise_threshold` — see "Why a
+  smaller-than-default criterion profile" below), or `Performance has
+  regressed`/`improved`. Only the last one is worth acting on; the other two
+  are expected on every run, even with no code changes, given the mocked
+  network floor these benchmarks run against.
 - Pagination scales roughly linearly with page count — that's the auto-pagination
   loop's per-page overhead (one more mocked round trip, one more
   `Vec` extend). A super-linear jump between page counts would flag a
@@ -64,10 +74,12 @@ get_all_issues_pagination/pages/20
   *slower* than a lower one is the signal to look at the `buffered()`
   scheduler for a regression.
 - The two `rate_limit_retry_success_path_overhead` variants
-  (`retry_enabled_default` vs. `retry_disabled`) are expected to be
-  statistically indistinguishable — see the doc comment in
-  `rate_limit_retry.rs` for why. If a future change makes them diverge,
-  that's the regression this benchmark exists to catch.
+  (`retry_enabled_default` vs. `retry_disabled`) measure a difference
+  (a single bool read) far smaller than the mocked-network noise floor both
+  pay for, so **do not compare them to each other** — see the doc comment in
+  `rate_limit_retry.rs`. Instead watch each variant's own number across
+  successive runs; a sustained, large jump in either one on its own is the
+  regression signal.
 
 ## Why these aren't part of `cargo test` / CI
 
@@ -95,8 +107,19 @@ before a plain `cargo bench` finishes — reproduced reliably on macOS during
 development (`AddrNotAvailable`, "Can't assign requested address").
 
 `benches/support/mod.rs`'s `bench_config()` trades statistical precision
-(a 10-sample, ~70ms-per-input window instead of criterion's 100-sample, 8s
-default) for finishing reliably out of the box, on a laptop or CI runner,
-without needing OS-level socket tuning. That's still enough samples to
-catch a real regression — this suite's actual goal — just not enough
-sustained connection load to run a loopback host out of ports.
+(a 10-sample, 200ms-per-input measurement window instead of criterion's
+100-sample, 8s default) for finishing reliably out of the box, on a laptop
+or CI runner, without needing OS-level socket tuning. That's still enough
+samples to catch a real regression — this suite's actual goal — just not
+enough sustained connection load to run a loopback host out of ports.
+
+That trade-off has a second consequence, though: with only 10 samples
+against a ~100µs-scale operation dominated by per-connection socket setup,
+re-running the same benchmark twice in a row with **no code changes**
+reliably produces 15-55% swings that criterion's default 1% noise threshold
+would report as "Performance has regressed"/"improved" — confirmed
+empirically during development. `bench_config()` sets a 35% `noise_threshold`
+to absorb that swing (see the doc comment on `bench_config()` for the
+reasoning); the real cost is that a genuine regression smaller than ~35%
+won't be flagged by criterion's own verdict line — read the point estimates
+yourself for anything more precise.

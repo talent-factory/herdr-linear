@@ -24,10 +24,21 @@ fn bench_get_all_issues_pagination(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::new("pages", pages), &client, |b, client| {
             b.to_async(&rt).iter(|| async {
-                client
+                let issues = client
                     .get_all_issues(None, PaginationOptions::default())
                     .await
-                    .expect("mocked pagination should not fail")
+                    .expect("mocked pagination should not fail");
+                // A pagination regression that stops traversal early (e.g. a
+                // `hasNextPage` off-by-one) would still return `Ok` here —
+                // just with fewer issues and fewer HTTP round trips than
+                // `pages`, reporting a misleadingly *faster* benchmark
+                // instead of failing. Guard against that silently passing.
+                assert_eq!(
+                    issues.len(),
+                    pages,
+                    "pagination should traverse all {pages} mocked pages"
+                );
+                issues
             });
         });
     }

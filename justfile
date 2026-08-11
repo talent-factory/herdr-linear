@@ -56,6 +56,13 @@ test:
 check: fmt lint test
     @echo "✅ All checks passed!"
 
+# ─── Benchmark ────────────────────────────────────────────────────────────────
+
+# Run the performance benchmark suite (not part of `check`/CI — see benches/README.md)
+[group('bench')]
+bench:
+    cargo bench
+
 # ─── Run ──────────────────────────────────────────────────────────────────────
 
 # Run the example binary (requires LINEAR_API_KEY)

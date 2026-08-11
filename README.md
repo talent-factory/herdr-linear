@@ -234,6 +234,8 @@ overhead, run against a mocked backend:
 
 ```bash
 cargo bench
+# or
+just bench
 ```
 
 Not part of `cargo test`/CI — a local/manual tool for catching regressions
