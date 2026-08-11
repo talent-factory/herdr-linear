@@ -523,6 +523,21 @@ pub async fn pane_close(herdr_bin: &str, pane_id: &PaneId) -> Result<()> {
         .map(|_| ())
 }
 
+/// `herdr agent focus <target>`. Used by `main.rs`'s `open_config_in_herdr_pane` to reuse an
+/// already-open editor pane instead of creating a duplicate: `target` accepts a unique agent
+/// name (per herdr's own target resolution), so passing [`crate::plugin::editor::EDITOR_AGENT_NAME`]
+/// here finds the pane a previous `c` press already created via [`agent_start`], if any. Any
+/// error — most commonly `agent_not_found` (verified live against herdr 0.7.3: fails
+/// immediately with `{"error":{"code":"agent_not_found",...}}`, no timeout wait) — is treated
+/// identically by the caller: "not there, create it". Unlike [`agent_start`], there is no
+/// special-casing of any particular error code here, since there's only one thing to do next
+/// regardless of *why* focus failed.
+pub async fn agent_focus(herdr_bin: &str, target: &str) -> Result<()> {
+    run(herdr_bin, &["agent", "focus", target])
+        .await
+        .map(|_| ())
+}
+
 /// Extra attempts `agent_wait` makes when herdr responds with the missing-`result` bug (see the
 /// module docs) before giving up and returning that error to the caller.
 const AGENT_WAIT_MAX_RETRIES: u32 = 2;
