@@ -556,6 +556,76 @@ pub async fn pane_close(herdr_bin: &str, pane_id: &PaneId) -> Result<()> {
         .map(|_| ())
 }
 
+/// `herdr pane run <pane_id> <command>` — types `command` into `pane_id` followed by Enter.
+/// The pane must already be at an interactive shell prompt (the state every `tab_create` root
+/// pane starts in). Unlike the old `agent_start`, this works for *any* command — an arbitrary
+/// `agent_command` wrapper alias (e.g. `"hr"`), or `nvim`, neither of which fit herdr 0.8.0's
+/// `agent start --kind <fixed-enum>` model. herdr detects and tracks whatever recognized coding
+/// agent binary ends up running purely by passive observation of the pane — no separate
+/// registration call is needed or possible for an unrecognized command like `nvim`.
+pub async fn pane_run(herdr_bin: &str, pane_id: &PaneId, command: &str) -> Result<()> {
+    run(herdr_bin, &["pane", "run", pane_id.as_str(), command])
+        .await
+        .map(|_| ())
+}
+
+/// `herdr tab list` — the raw JSON text of the `result` field. Used by
+/// [`find_tab_id_by_label`] to locate an existing labeled tab (the config-editor pane's
+/// reuse-on-second-`c`-press check) — `agent focus`/`agent rename` can't do this for `nvim`,
+/// since herdr only tracks *recognized* coding-agent binaries as "agents", never a plain
+/// editor pane.
+pub async fn tab_list(herdr_bin: &str) -> Result<String> {
+    let result = run(herdr_bin, &["tab", "list"]).await?;
+    Ok(result.to_string())
+}
+
+/// Find the `tab_id` of the first tab in a `herdr tab list` JSON result (the already-unwrapped
+/// `result` value, serialized back to text by [`tab_list`]) whose `label` exactly matches
+/// `label`. Returns `None` on unparseable JSON, an empty/missing `tabs` array, or no match —
+/// all of which mean "nothing to reuse, create a fresh one" to every caller. Pure — no I/O — so
+/// the matching logic is unit-testable without spawning a process, mirroring
+/// [`crate::plugin::implement::resolve_preferred_agent`]'s same split for `agent list`.
+///
+/// `#[allow(dead_code)]`: this task (Task 1, TF-624) lands the function and its unit tests
+/// ahead of its only real caller, `find_existing_editor_tab`, which Task 5 adds — without the
+/// allow, `cargo clippy --all-features` fails this task's own commit in isolation (verified live
+/// during Task 1's review). Task 5 removes this attribute in the same edit that adds the caller.
+#[allow(dead_code)]
+fn find_tab_id_by_label(tab_list_json: &str, label: &str) -> Option<TabId> {
+    let parsed: Value = serde_json::from_str(tab_list_json).ok()?;
+    let tabs = parsed.get("tabs")?.as_array()?;
+    tabs.iter().find_map(|tab| {
+        let tab_label = tab.get("label")?.as_str()?;
+        if tab_label != label {
+            return None;
+        }
+        let tab_id = tab.get("tab_id")?.as_str()?;
+        Some(TabId(tab_id.to_string()))
+    })
+}
+
+/// `herdr tab focus <tab_id>`. Used to switch to an already-open config-editor tab on a second
+/// `c` press, in place of the old `agent focus <name>` (impossible for `nvim` — see
+/// [`find_tab_id_by_label`]'s doc).
+pub async fn tab_focus(herdr_bin: &str, tab_id: &TabId) -> Result<()> {
+    run(herdr_bin, &["tab", "focus", tab_id.as_str()])
+        .await
+        .map(|_| ())
+}
+
+/// `herdr agent rename <pane_id> <name>` — assigns a friendly display name to a pane herdr has
+/// already recognized as hosting a coding agent (requires the target to already be
+/// auto-detected; fails with `agent_not_found` otherwise — verified live against herdr 0.8.0).
+/// Used by [`crate::implement_one`] purely cosmetically, to preserve the per-issue names
+/// (`hr--tf-574`-style) users already see in herdr's own pane/agent list — TF-590's original
+/// motivation (avoiding a launch-time `agent_name_taken` collision) no longer applies, since
+/// nothing about [`pane_run`] can collide on a name.
+pub async fn agent_rename(herdr_bin: &str, pane_id: &PaneId, name: &str) -> Result<()> {
+    run(herdr_bin, &["agent", "rename", pane_id.as_str(), name])
+        .await
+        .map(|_| ())
+}
+
 /// `herdr agent focus <target>`. Used by `main.rs`'s `open_config_in_herdr_pane` to reuse an
 /// already-open editor pane instead of creating a duplicate: `target` accepts a unique agent
 /// name (per herdr's own target resolution), so passing [`crate::plugin::editor::EDITOR_AGENT_NAME`]
@@ -1647,5 +1717,34 @@ exit 1
 
         assert_eq!(next_retry_budget_ms(&err, 0, 30_000, 30_000), None);
         assert_eq!(next_retry_budget_ms(&err, 0, 40_000, 30_000), None);
+    }
+
+    #[test]
+    fn find_tab_id_by_label_returns_the_matching_tab_id() {
+        let json = r#"{"tabs":[{"tab_id":"w1:t1","label":"Terminal"},{"tab_id":"w1:t2","label":"herdr-linear-config"}]}"#;
+
+        let found = find_tab_id_by_label(json, "herdr-linear-config");
+
+        assert_eq!(found, Some(TabId("w1:t2".to_string())));
+    }
+
+    #[test]
+    fn find_tab_id_by_label_returns_none_when_no_tab_matches() {
+        let json = r#"{"tabs":[{"tab_id":"w1:t1","label":"Terminal"}]}"#;
+
+        assert_eq!(find_tab_id_by_label(json, "herdr-linear-config"), None);
+    }
+
+    #[test]
+    fn find_tab_id_by_label_returns_none_on_unparseable_json() {
+        assert_eq!(
+            find_tab_id_by_label("not json", "herdr-linear-config"),
+            None
+        );
+    }
+
+    #[test]
+    fn find_tab_id_by_label_returns_none_when_tabs_array_is_missing() {
+        assert_eq!(find_tab_id_by_label(r#"{}"#, "herdr-linear-config"), None);
     }
 }
