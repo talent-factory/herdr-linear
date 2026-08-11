@@ -398,10 +398,11 @@ one after another (each opens a herdr tab, starts the preferred coding agent, se
 issue to "In Progress", and injects an implement prompt once the agent is ready; the
 status banner then summarizes how many started, e.g. "3/4 started", plus a per-issue
 message for any that failed or finished with a warning) — `r` to retry after an error,
-`c` to open `config.toml` from an error screen (see "Configure" above — creates the file
-if it doesn't exist yet), and `Esc` to return to the menu (or, while filtering, to cancel
-the filter first). Press `q` to quit the panel from anywhere (menu or view). Press `?`
-from anywhere to open an in-app help overlay — **What's New** (recent changes),
+and `Esc` to return to the menu (or, while filtering, to cancel the filter first). Press
+`q` to quit the panel from anywhere (menu or view), and `c` to open `config.toml` from
+anywhere — menu, a loading or loaded view, or an error screen (see "Configure" above —
+creates the file if it doesn't exist yet). Press `?` from anywhere to open an in-app help
+overlay — **What's New** (recent changes),
 **Keybindings** (every binding above, plus this one), **Settings** (your currently
 resolved `config.toml` values — the API key is shown only as set/not-set, never in the
 clear), and **About** (version, repo, license) — without leaving the terminal. Switch
