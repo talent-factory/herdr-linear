@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `benches/` — a `criterion`-based benchmark suite (dev-dependency only) covering `get_all_issues`'s auto-pagination, `execute_batch`'s throughput at a few concurrency levels, and the rate-limit-retry wrapper's overhead on the common (no-retry) success path, all run against a mocked backend. Run with `cargo bench`; see `benches/README.md`. Not part of `cargo test`/CI — a local/manual tool for catching regressions before they ship (TF-623)
 
+### Fixed
+
+- Implement-on-`<Enter>`: when the installed `herdr` CLI is older than the version that added
+  `--cwd` support to `agent start`/`tab create`, the raw "unknown option: --cwd" herdr reports is
+  now followed by a hint that herdr-linear requires herdr >= 0.7.0 and needs upgrading, instead of
+  leaving the user to guess why a tab was created but the agent never started (TF-604)
+
 ## [0.2.0] - 2026-08-11
 
 ### Added

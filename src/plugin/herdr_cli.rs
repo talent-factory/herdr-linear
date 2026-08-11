@@ -81,13 +81,42 @@ pub fn herdr_bin() -> String {
     std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string())
 }
 
+/// herdr's minimum required version for this plugin, mirroring `min_herdr_version` in
+/// `herdr-plugin.toml` (duplicated here because that manifest field isn't readable by code in
+/// this crate at compile time — keep the two in sync by hand if either changes). Used only to
+/// word [`unsupported_cwd_flag_hint`]'s upgrade hint.
+const MIN_HERDR_VERSION: &str = "0.7.0";
+
+/// If `message` is herdr's own CLI-parser rejection of the `--cwd` flag, returns an upgrade hint
+/// to append to it. Every `herdr` call this plugin makes to a subcommand that accepts `--cwd`
+/// ([`tab_create`], [`agent_start`]) passes it unconditionally, so the only way an installed
+/// `herdr` binary could reject it is if that binary predates the version which added `--cwd`
+/// support (TF-579, TF-584) — i.e. it's older than [`MIN_HERDR_VERSION`]. Without this hint, the
+/// raw "unknown option: --cwd" that reaches the user (TF-604) gives no indication that the fix is
+/// upgrading herdr rather than anything on the plugin side. Matches only herdr's exact observed
+/// wording — a substring check, not a general "any unknown option" detector — so an unrelated
+/// unknown-option failure (e.g. a typo introduced elsewhere) isn't misattributed to this cause.
+fn unsupported_cwd_flag_hint(message: &str) -> Option<String> {
+    if message.contains("unknown option: --cwd") {
+        Some(format!(
+            "this herdr installation doesn't support --cwd on this subcommand; herdr-linear \
+             requires herdr >= {MIN_HERDR_VERSION} (see min_herdr_version in herdr-plugin.toml) — \
+             upgrade herdr and retry"
+        ))
+    } else {
+        None
+    }
+}
+
 /// Pure interpretation of a `herdr` CLI invocation's raw output into the `Result` `run` returns.
 /// Maps a non-zero exit, a top-level `{"error": {"message": ...}}` response (checked
 /// independently of the exit code — a future protocol change that reports failure via body
 /// alone, exit 0, must not be misread as success), or unparseable JSON to `Error::Internal` with
 /// the CLI's own error message (or raw stderr/stdout as a fallback) so failures are always
-/// actionable in the status banner they end up in. Split out from `run` so this logic — the part
-/// that actually decides success vs. failure — is unit-testable without spawning a process.
+/// actionable in the status banner they end up in. One specific failure gets a further hint
+/// appended — see [`unsupported_cwd_flag_hint`] — an installed `herdr` too old to support `--cwd`
+/// on `agent start`/`tab create` (TF-604). Split out from `run` so this logic — the part that
+/// actually decides success vs. failure — is unit-testable without spawning a process.
 ///
 /// When `check_agent_name_taken` is set, an `error.code == "agent_name_taken"` body is mapped to
 /// [`Error::AgentNameTaken`] instead of the generic `Error::Internal` path (see
@@ -134,6 +163,10 @@ fn interpret_output(
                 stderr.to_string()
             }
         });
+        let message = match unsupported_cwd_flag_hint(&message) {
+            Some(hint) => format!("{message} — {hint}"),
+            None => message,
+        };
         return Err(Error::Internal(format!(
             "`{command_desc}` failed: {message}"
         )));
@@ -725,6 +758,28 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("unknown option: --bogus"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn interpret_output_hints_at_upgrading_herdr_when_cwd_flag_is_unsupported() {
+        // TF-604: an installed `herdr` binary older than the version that added `--cwd` support
+        // to `agent start`/`tab create` rejects it with this exact wording. The raw message alone
+        // (as exercised by the `--bogus` case above) leaves the user with no idea *why* — this
+        // hint should point at the actual fix (upgrade herdr) instead of just echoing herdr's
+        // own CLI-parser error back at them.
+        let result = interpret_output(
+            "herdr agent start claude--tf-604 --cwd /repo --tab w2:tJ --focus -- claude",
+            false,
+            "",
+            "unknown option: --cwd\n",
+            false,
+        );
+
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unknown option: --cwd") && err.contains(MIN_HERDR_VERSION),
             "unexpected message: {err}"
         );
     }
