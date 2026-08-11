@@ -282,6 +282,14 @@ match client.get_viewer().await {
 panel you can open as a split pane or a tab from inside a Herdr session. Browsing
 issues is read-only; pressing `<Enter>` on a selected issue is not — see "Use" below.
 
+### Requirements
+
+Requires **herdr >= 0.8.0** (see `min_herdr_version` in `herdr-plugin.toml`). herdr's own
+`agent`/`pane`/`tab` CLI surface has changed shape between releases before (TF-604, TF-624) —
+this plugin has only ever been verified against 0.8.0; an older installed herdr will fail with
+`herdr config check`-style "unknown option"/"unknown subcommand" errors rather than a plugin bug.
+Run `herdr --version` to check yours, and `herdr update` to upgrade.
+
 <table>
 <tr>
 <td width="33%">
@@ -446,7 +454,7 @@ elsewhere, or closes it if it's already focused.
 > focused pane/workspace (via its injected launch context), not the plugin process's
 > own working directory — so it resolves correctly whether you opened the panel via
 > the **split** action (`herdr-linear.open-split`) or the **tab** one
-> (`herdr-linear.open-tab`). This requires herdr ≥ 0.7.0 (see `min_herdr_version` in
+> (`herdr-linear.open-tab`). This requires herdr ≥ 0.8.0 (see `min_herdr_version` in
 > `herdr-plugin.toml`); on an older/misbehaving herdr that omits the launch context,
 > it falls back to the plugin's own install directory. If that fallback also fails
 > (an unreadable process directory), `<Enter>` sets an actionable status instead of

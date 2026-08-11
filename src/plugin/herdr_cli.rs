@@ -80,7 +80,7 @@ pub fn herdr_bin() -> String {
 /// `herdr-plugin.toml` (duplicated here because that manifest field isn't readable by code in
 /// this crate at compile time — keep the two in sync by hand if either changes). Used only to
 /// word [`unsupported_cwd_flag_hint`]'s upgrade hint.
-const MIN_HERDR_VERSION: &str = "0.7.0";
+const MIN_HERDR_VERSION: &str = "0.8.0";
 
 /// If `message` is herdr's own CLI-parser rejection of the `--cwd` flag, returns an upgrade hint
 /// to append to it. The only `herdr` call this plugin makes to a subcommand that accepts `--cwd`
