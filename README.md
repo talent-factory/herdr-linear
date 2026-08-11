@@ -188,6 +188,7 @@ herdr-linear/
 │   ├── models.rs           # Type definitions
 │   ├── queries.rs          # GraphQL query strings
 │   └── error.rs            # Error types
+├── benches/                # Performance benchmarks (cargo bench)
 ├── Cargo.toml
 └── README.md
 ```
@@ -225,6 +226,19 @@ cargo run --example tracing_demo
 ```bash
 cargo test
 ```
+
+### Running Benchmarks
+
+Performance baselines for pagination, batch execution, and rate-limit-retry
+overhead, run against a mocked backend:
+
+```bash
+cargo bench
+```
+
+Not part of `cargo test`/CI — a local/manual tool for catching regressions
+before they ship. See [`benches/README.md`](benches/README.md) for what
+each benchmark measures and how to read the numbers.
 
 ### Logging
 

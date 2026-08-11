@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `benches/` — a `criterion`-based benchmark suite (dev-dependency only) covering `get_all_issues`'s auto-pagination, `execute_batch`'s throughput at a few concurrency levels, and the rate-limit-retry wrapper's overhead on the common (no-retry) success path, all run against a mocked backend. Run with `cargo bench`; see `benches/README.md`. Not part of `cargo test`/CI — a local/manual tool for catching regressions before they ship (TF-623)
+
 ## [0.2.0] - 2026-08-11
 
 ### Added
