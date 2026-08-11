@@ -204,7 +204,7 @@ pub async fn agent_prompt(herdr_bin: &str, pane_id: &PaneId, text: &str) -> Resu
 
 - [ ] **Step 3: Update `agent_read`'s doc comment** — it currently says `to confirm an [\`agent_send\`] actually reached...`; change the link to `[\`agent_prompt\`]`.
 
-- [ ] **Step 4: Update every call site** — `grep -rn "herdr_cli::agent_send" src/` and change each to `herdr_cli::agent_prompt` (main.rs's `send_prompt_until_visible`, covered fully in Task 5).
+- [ ] **Step 4: Update every call site** — `grep -rn "herdr_cli::agent_send" src/` and change each to `herdr_cli::agent_prompt` (main.rs's `send_prompt_until_visible`, covered fully in Task 6 Step 3).
 
 - [ ] **Step 5: Run tests to verify nothing else references the old names**
 
