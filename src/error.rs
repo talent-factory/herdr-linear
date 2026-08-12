@@ -50,6 +50,13 @@ pub enum Error {
     /// retry decision.
     #[error("{0}")]
     MissingResultField(String),
+
+    /// herdr reported that the target pane is not (yet) tracked as an agent. Distinct from
+    /// [`Error::Internal`] so `agent_wait` can poll: after `pane_run` types a launch command,
+    /// herdr needs a moment to observe the resulting process and identify it as a coding agent
+    /// (especially when the command is a shell alias/wrapper).
+    #[error("{0}")]
+    AgentNotFound(String),
 }
 
 /// Helper function to create GraphQL error responses

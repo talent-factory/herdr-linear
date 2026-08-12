@@ -145,6 +145,19 @@ fn interpret_output(
         .map(str::to_string);
 
     if !status_success || error_message.is_some() {
+        // herdr's `agent wait` returns `agent_not_found` when the target pane hasn't been
+        // identified as an agent yet. Surface it as a distinct variant so `agent_wait` can poll
+        // after `pane_run` rather than failing immediately.
+        if let Some(code) = error_obj
+            .and_then(|e| e.get("code"))
+            .and_then(|c| c.as_str())
+        {
+            if code == "agent_not_found" {
+                let target = error_message.clone().unwrap_or_default();
+                return Err(Error::AgentNotFound(target));
+            }
+        }
+
         let message = error_message.unwrap_or_else(|| {
             let stderr = stderr.trim();
             if stderr.is_empty() {
@@ -188,6 +201,13 @@ fn interpret_output(
 /// future wording change in [`interpret_output`] can't silently disable the retry.
 fn is_missing_result_response(error: &Error) -> bool {
     matches!(error, Error::MissingResultField(_))
+}
+
+/// True if `error` is herdr's `agent_not_found` response: the target pane isn't tracked as an
+/// agent yet. After `pane_run` types a launch command, herdr needs a short moment to observe the
+/// process and identify it as a coding agent, so `agent_wait` polls on this error.
+fn is_agent_not_found_response(error: &Error) -> bool {
+    matches!(error, Error::AgentNotFound(_))
 }
 
 /// Wall-clock ceiling for `herdr` subprocess calls that don't carry their own `--timeout`
@@ -458,6 +478,12 @@ const AGENT_WAIT_MAX_RETRIES: u32 = 2;
 /// own clean timeout response first.
 const AGENT_WAIT_CALL_TIMEOUT_BUFFER: Duration = Duration::from_secs(5);
 
+/// Pause between `agent_wait` polls when herdr reports `agent_not_found`. `pane_run` only types
+/// a command into the pane; herdr needs time to observe the resulting process and classify it as
+/// a coding agent before `agent wait --until idle` can succeed. A short fixed sleep prevents
+/// spamming herdr while still converging well within the caller's timeout budget.
+const AGENT_NOT_FOUND_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
 /// Decide whether `agent_wait`'s loop should retry after `err`, and if so, the timeout budget
 /// (in ms) remaining for the next attempt. Pure — no I/O — so the retry decision is
 /// unit-testable without mocking the `herdr` subprocess (the loop itself previously wasn't).
@@ -494,9 +520,16 @@ pub async fn agent_wait(
 ) -> Result<()> {
     let start = std::time::Instant::now();
     let mut attempt = 0;
-    let mut remaining_ms = timeout_ms;
 
     loop {
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        let remaining_ms = timeout_ms.saturating_sub(elapsed_ms);
+        if remaining_ms == 0 {
+            return Err(Error::Internal(format!(
+                "`herdr agent wait` timed out after {timeout_ms}ms waiting for agent to become {status}"
+            )));
+        }
+
         let timeout_str = remaining_ms.to_string();
         let call_timeout = Duration::from_millis(remaining_ms) + AGENT_WAIT_CALL_TIMEOUT_BUFFER;
 
@@ -520,11 +553,16 @@ pub async fn agent_wait(
             Err(err) => err,
         };
 
-        let elapsed_ms = start.elapsed().as_millis() as u64;
+        // `agent_not_found` means herdr hasn't classified the pane as an agent yet. Keep polling
+        // until the caller's timeout is exhausted rather than giving up immediately.
+        if is_agent_not_found_response(&err) {
+            tokio::time::sleep(AGENT_NOT_FOUND_POLL_INTERVAL).await;
+            continue;
+        }
+
         match next_retry_budget_ms(&err, attempt, elapsed_ms, timeout_ms) {
-            Some(next_remaining_ms) => {
+            Some(_) => {
                 attempt += 1;
-                remaining_ms = next_remaining_ms;
             }
             None => return Err(err),
         }
@@ -642,6 +680,22 @@ mod tests {
         let result = interpret_output("herdr pane run wY:p7X hr", true, "", "");
 
         assert_eq!(result.unwrap(), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn interpret_output_surfaces_agent_not_found_as_distinct_variant() {
+        let err = interpret_output(
+            "herdr agent wait wY:p7Z --until idle --timeout 30000",
+            false,
+            r#"{"error":{"code":"agent_not_found","message":"agent target wY:p7Z not found"},"id":"cli:agent:wait"}"#,
+            "",
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, Error::AgentNotFound(_)),
+            "expected AgentNotFound, got: {err:?}"
+        );
     }
 
     #[test]
@@ -822,6 +876,72 @@ exit 1
         assert!(
             err.to_string().contains("no such workspace"),
             "unexpected message: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_wait_polls_through_agent_not_found_until_success() {
+        // `agent_wait` should not fail on the first `agent_not_found`; after `pane_run` types a
+        // command, herdr needs time to detect the agent. A fake script returns `agent_not_found`
+        // twice, then success.
+        let counter_dir = tempfile::tempdir().unwrap();
+        let counter_file = counter_dir.path().join("count.txt");
+        std::fs::write(&counter_file, "0").unwrap();
+        let (_dir, script) = write_fake_herdr_script(&format!(
+            r#"
+count_file="{}"
+count=$(cat "$count_file")
+next=$((count + 1))
+echo "$next" > "$count_file"
+if [ "$next" -le 2 ]; then
+  echo '{{"error":{{"code":"agent_not_found","message":"agent target wY:p7Z not found"}},"id":"cli:agent:wait"}}'
+  exit 1
+fi
+echo '{{"result":{{}},"id":"cli:agent:wait"}}'
+"#,
+            counter_file.display()
+        ));
+
+        agent_wait(
+            script.to_str().unwrap(),
+            &PaneId("wY:p7Z".to_string()),
+            "idle",
+            5_000,
+        )
+        .await
+        .expect("agent_wait should poll through agent_not_found and succeed");
+
+        let final_count = std::fs::read_to_string(&counter_file).unwrap();
+        assert_eq!(
+            final_count.trim(),
+            "3",
+            "expected three calls before success"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_wait_times_out_when_agent_not_found_persists() {
+        let (_dir, script) = write_fake_herdr_script(
+            r#"
+echo '{"error":{"code":"agent_not_found","message":"agent target wY:p7Z not found"},"id":"cli:agent:wait"}'
+exit 1
+"#,
+        );
+
+        let err = agent_wait(
+            script.to_str().unwrap(),
+            &PaneId("wY:p7Z".to_string()),
+            "idle",
+            100,
+        )
+        .await
+        .expect_err("agent_wait should time out when agent_not_found persists");
+
+        assert!(
+            err.to_string().contains("timed out"),
+            "expected timeout error, got: {err}"
         );
     }
 
