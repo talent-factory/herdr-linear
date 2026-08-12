@@ -2,8 +2,9 @@
 //! issue list: deriving the preferred coding agent from other open herdr tabs, resolving
 //! the final agent command, building the shell-wrapped argv to launch it, building the
 //! literal prompt injected once the agent is ready, picking the right workflow state to
-//! move the issue to, and building a per-issue `herdr agent start` name so two issues
-//! implemented under the same `agent_command` don't collide (TF-590, see [`build_agent_name`]).
+//! move the issue to, and building a per-issue display name so two issues implemented under
+//! the same `agent_command` stay distinguishable in herdr's own pane/agent list (TF-590,
+//! applied cosmetically via `herdr agent rename` since TF-624 — see [`build_agent_name`]).
 //! No process/socket access here — see [`crate::plugin::herdr_cli`] for that; this module only
 //! ever sees JSON text and in-memory values.
 
@@ -85,10 +86,10 @@ pub fn resolve_agent_command(derived: Option<&str>, config_override: Option<&str
     config_override.or(derived).unwrap_or("hr").to_string()
 }
 
-/// True if `command` is safe to interpolate into `sh -i -c <command>` (see
-/// [`build_shell_argv`]) without unintended shell expansion: rejects command/variable
-/// substitution, chaining, redirection, quoting, newlines, glob metacharacters, and (since the
-/// shell runs with `-i`, interactive mode) `!` history expansion. Spaces and flags are allowed,
+/// True if `command` is safe to type as a literal command line into the tab's already-running
+/// interactive shell (via `pane_run`) without unintended shell expansion: rejects command/
+/// variable substitution, chaining, redirection, quoting, newlines, glob metacharacters, and
+/// (since it's an interactive shell) `!` history expansion. Spaces and flags are allowed,
 /// so a real-world `agent_command` value like `"headroom wrap claude --memory"` still passes.
 /// `derived` (from `herdr agent list`) and `config_override` (the user's own `config.toml`) are
 /// both low-risk inputs already, but this catches a mistyped/malicious value before it reaches
@@ -123,10 +124,11 @@ pub fn is_valid_agent_command(command: &str) -> bool {
         })
 }
 
-/// An `agent_command` string that has passed [`is_valid_agent_command`]. [`build_shell_argv`]
-/// only accepts this type rather than a bare `&str`, so the shell-injection guard is enforced
-/// by the compiler at every call site — not by remembering to call `is_valid_agent_command`
-/// first and never reordering or bypassing that call in a future refactor.
+/// An `agent_command` string that has passed [`is_valid_agent_command`], so `pane_run`'s caller
+/// only ever receives a validated command rather than a bare `&str` — the shell-injection guard
+/// is enforced by the compiler at every call site, not by remembering to call
+/// `is_valid_agent_command` first and never reordering or bypassing that call in a future
+/// refactor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedAgentCommand(String);
 
@@ -147,46 +149,40 @@ impl ValidatedAgentCommand {
     }
 }
 
-/// Build the argv to run `command` through an interactive instance of `shell`, so both a bare
-/// binary name (e.g. `"claude"`) and a shell alias/function defined in an rc file (e.g.
-/// `"hr"`) resolve correctly.
-pub fn build_shell_argv(shell: &str, command: &ValidatedAgentCommand) -> Vec<String> {
-    vec![
-        shell.to_string(),
-        "-i".to_string(),
-        "-c".to_string(),
-        command.as_str().to_string(),
-    ]
-}
-
 /// Build the literal prompt injected into the agent's pane once it's ready.
 pub fn build_implement_prompt(identifier: &str) -> String {
     format!("Implement Linear Issue {identifier} using a new git worktree")
 }
 
 /// True if `prompt` is visible anywhere in `pane_text` (a `herdr agent read` snapshot). Used by
-/// `main.rs`'s `send_prompt_until_visible` to confirm an [`crate::plugin::herdr_cli::agent_send`]
-/// actually reached the target's input box, rather than trusting `agent_wait`'s "idle" status
-/// alone — see [`crate::plugin::herdr_cli::agent_read`]'s docs for the race this guards against.
+/// `main.rs`'s `send_prompt_until_visible` to confirm an
+/// [`crate::plugin::herdr_cli::agent_prompt`] actually reached the target's input box, rather
+/// than trusting `agent_wait`'s "idle" status alone — see
+/// [`crate::plugin::herdr_cli::agent_read`]'s docs for the race this guards against.
 ///
 /// Strips *all* whitespace from both sides before comparing. The implement prompt is long
 /// enough (~55 chars) that a narrow `hr` pane — the common case, since it's usually a split
 /// column — hard-wraps it across multiple screen lines, observed live even splitting mid-word
 /// (no word-boundary wrapping) with a leading indent on continuation lines. A plain
 /// `pane_text.contains(prompt)` never matches a wrapped rendering, which was previously
-/// misread as "never landed" and triggered pointless resends (and, since `agent_send` appends
+/// misread as "never landed" and triggered pointless resends (and, since `agent_prompt` appends
 /// rather than replacing, visible duplication) even though the prompt had genuinely arrived.
 pub fn prompt_landed(pane_text: &str, prompt: &str) -> bool {
     let strip_whitespace = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
     strip_whitespace(pane_text).contains(&strip_whitespace(prompt))
 }
 
-/// Build the per-issue name passed to `herdr agent start` (see
-/// [`crate::plugin::herdr_cli::agent_start`]) so starting a second issue's agent tab while the
-/// first is still running under the same `agent_command` doesn't collide with herdr's
-/// `agent_name_taken` error (TF-590): every issue gets its own name derived from the resolved
-/// `command` plus the issue's identifier, instead of the bare `command` string being reused
-/// verbatim across every issue.
+/// Build the per-issue display name applied to an issue's agent pane after it starts, via
+/// [`crate::plugin::herdr_cli::agent_rename`] (TF-624). Every issue gets its own name derived
+/// from the resolved `command` plus the issue's identifier, instead of the bare `command` string
+/// being reused verbatim across every issue, so herdr's own pane/agent list distinguishes
+/// concurrently-running issues at a glance.
+///
+/// This is now purely cosmetic. TF-590 originally introduced it to avoid a launch-time
+/// `agent_name_taken` collision on `herdr agent start`, but herdr 0.8.0's CLI redesign
+/// removed that call from this plugin entirely — nothing passes a name at launch anymore
+/// (see [`crate::plugin::herdr_cli::pane_run`]), so there is no collision left to avoid and a
+/// rename failure is a non-fatal warning rather than a reason to retry under a different name.
 ///
 /// `command` and `issue_identifier` are sanitized *independently* (see `sanitize_agent_name`)
 /// and joined with a `--` boundary, rather than concatenated first and sanitized as one string.
@@ -208,8 +204,8 @@ pub fn build_agent_name(command: &str, issue_identifier: &str) -> String {
 
 /// Lowercases `raw` and collapses every run of one-or-more characters outside `[a-z0-9]` into
 /// a single hyphen, trimming leading/trailing hyphens — the character set herdr's own
-/// generated retry `candidates` (e.g. `"hr-2"`) follow, assumed here to be the same set herdr
-/// accepts for `agent start <name>` itself. Falls back to `"agent"` if nothing alphanumeric
+/// generated agent names (e.g. `"hr-2"`) follow, assumed here to be the same set herdr accepts
+/// for `agent rename <pane> <name>` itself. Falls back to `"agent"` if nothing alphanumeric
 /// survives, so this never returns an empty string. Never produces a `--`, which
 /// [`build_agent_name`] relies on to join two sanitized halves unambiguously.
 fn sanitize_agent_name(raw: &str) -> String {
@@ -323,21 +319,6 @@ mod tests {
     }
 
     #[test]
-    fn build_shell_argv_wraps_the_command_through_an_interactive_shell() {
-        let command = ValidatedAgentCommand::parse("hr".to_string()).unwrap();
-
-        assert_eq!(
-            build_shell_argv("/bin/zsh", &command),
-            vec![
-                "/bin/zsh".to_string(),
-                "-i".to_string(),
-                "-c".to_string(),
-                "hr".to_string()
-            ]
-        );
-    }
-
-    #[test]
     fn build_implement_prompt_matches_the_exact_wording() {
         assert_eq!(
             build_implement_prompt("TF-563"),
@@ -395,7 +376,7 @@ mod tests {
     #[test]
     fn build_agent_name_is_unique_per_issue() {
         // The whole point of TF-590: two issues started under the same `agent_command` must
-        // not collide on the name passed to `herdr agent start`.
+        // not end up sharing one display name in herdr's pane/agent list.
         let a = build_agent_name("hr", "TF-579");
         let b = build_agent_name("hr", "TF-588");
 
@@ -509,8 +490,8 @@ mod tests {
 
     #[test]
     fn is_valid_agent_command_rejects_glob_and_history_expansion_characters() {
-        // `build_shell_argv` runs the command through `sh -i`, so bash-style history expansion
-        // (`!`) is live in addition to the usual glob metacharacters.
+        // `pane_run` types the command into the tab's already-interactive shell, so bash-style
+        // history expansion (`!`) is live in addition to the usual glob metacharacters.
         assert!(!is_valid_agent_command("claude *"));
         assert!(!is_valid_agent_command("claude file?.txt"));
         assert!(!is_valid_agent_command("claude [a-z]"));

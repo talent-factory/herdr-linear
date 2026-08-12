@@ -12,9 +12,9 @@
 
 id = "herdr-linear"
 name = "herdr-linear"
-version = "0.2.0"
+version = "0.2.1"
 description = "A Linear issues panel for Herdr, with implement-on-Enter."
-min_herdr_version = "0.7.0"
+min_herdr_version = "0.8.0"
 platforms = ["linux", "macos", "windows"]
 
 [[build]]

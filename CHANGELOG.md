@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-12
+
+### Added
+
+- `benches/` — a `criterion`-based benchmark suite (dev-dependency only) covering `get_all_issues`'s auto-pagination, `execute_batch`'s throughput at a few concurrency levels, and the rate-limit-retry wrapper's overhead on the common (no-retry) success path, all run against a mocked backend. Run with `cargo bench`; see `benches/README.md`. Not part of `cargo test`/CI — a local/manual tool for catching regressions before they ship (TF-623)
+
+### Changed
+
+- Implement-on-`<Enter>`: each issue's per-issue agent name (e.g. `hr--tf-579`) is now applied
+  by a best-effort `agent rename` call *after* the agent starts, rather than being passed at
+  launch. Nothing passes a name at launch under herdr >= 0.8.0 (see TF-624 below), so the
+  0.2.0 auto-retry on herdr's `agent_name_taken` error has been removed — there is no longer a
+  launch-time name collision for it to recover from. A failed rename is now reported as a
+  warning and the agent keeps running under herdr's own default name (TF-624)
+
+### Fixed
+
+- `c` (open `config.toml`) and Implement-on-Enter both silently failed against herdr >= 0.8.0,
+  which redesigned `agent start`/`agent wait`/`agent send` out from under this plugin: `agent
+  start` dropped `--cwd`/`--tab`/`--focus` + arbitrary argv in favor of `--kind`/`--pane` against
+  a fixed enum of recognized agent binaries (unable to launch `nvim` or a custom `agent_command`
+  wrapper alias like `"hr"`), `agent wait` renamed `--status` to `--until`, and `agent send` was
+  replaced by `agent prompt`. Both flows now open their tab via `tab_create` (unchanged) and type
+  the launch command into its root pane via a new `pane_run` wrapper instead — herdr's own
+  passive auto-detection picks up whatever recognized agent ends up running, same as before.
+  TF-604's "upgrade herdr" hint (below) was addressing a different, no-longer-applicable case;
+  see TF-624 for the actual current-herdr incompatibility and its fix (TF-624)
+
+- TF-604's `--cwd`-rejection hint assumed the *only* way an installed herdr could reject `--cwd`
+  on `agent start`/`tab create` was predating `min_herdr_version = 0.7.0`. That's no longer true
+  for `agent start`: herdr >= 0.8.0 (well above the floor) rejects it too, having redesigned the
+  subcommand's flags entirely (see TF-624) — the hint's wording is now only accurate for
+  `tab_create`, the one remaining `--cwd`-accepting call (TF-624)
+
+- `min_herdr_version` (in `herdr-plugin.toml`, mirrored by `MIN_HERDR_VERSION` in
+  `herdr_cli.rs`) raised `0.7.0` → `0.8.0`: the new `pane_run`/`tab_list`/`tab_focus`/
+  `agent_rename`/`agent_prompt`/`agent_wait --until` calls this fix introduces have only ever
+  been verified against herdr 0.8.0 — publishing the old, now-inaccurate `0.7.0` floor would
+  send users on an older herdr into the exact silent-failure this ticket exists to fix. See the
+  new "Requirements" section in `README.md` (TF-624)
+
+- Implement-on-`<Enter>`: when the installed `herdr` CLI is older than the version that added
+  `--cwd` support to `agent start`/`tab create`, the raw "unknown option: --cwd" herdr reports is
+  now followed by a hint that herdr-linear requires herdr >= 0.7.0 and needs upgrading, instead of
+  leaving the user to guess why a tab was created but the agent never started (TF-604)
+
 ## [0.2.0] - 2026-08-11
 
 ### Added

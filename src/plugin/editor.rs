@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 /// every repo/workspace this plugin runs in (see `config.rs`'s module doc and README.md's
 /// "Configure" section), so every `c` press across every herdr-linear instance should reuse the
 /// *same* pane rather than each spawning its own — that's the whole point of
-/// `main.rs::open_config_in_herdr_pane` trying `agent_focus` before creating a new tab.
+/// `main.rs::open_config_in_herdr_pane` checking `herdr_cli::find_existing_editor_tab` before
+/// creating a new tab.
 pub const EDITOR_AGENT_NAME: &str = "herdr-linear-config";
 
 /// Locates a binary on the system by searching through `PATH` entries.
@@ -61,7 +62,7 @@ fn editor_override_is_usable(editor: &str, path_env: Option<&str>) -> bool {
 ///    rejected with a `tracing::warn!` rather than used blindly — using it as-is would spawn a
 ///    command already known to fail, silently strand the user in a dead pane (nothing in this
 ///    module's `main.rs` callers confirm the launched process actually stays up), and, on the
-///    `c` keybinding's every-later-press `agent_focus` reuse, keep repeating that same silent
+///    `c` keybinding's every-later-press tab-reuse check, keep repeating that same silent
 ///    no-op indefinitely.
 /// 2. Otherwise, if `nvim` is found on `PATH`, use `"nvim"`.
 /// 3. Otherwise, return `None` (caller falls back to OS default opener).
@@ -81,15 +82,33 @@ pub fn resolve_editor_command(
     find_on_path(path_env, "nvim").map(|_| "nvim".to_string())
 }
 
-/// Constructs the argv list for launching an editor with a config file.
+/// Shell-quotes `s` for safe interpolation into a command typed via `pane_run`: wraps it in
+/// single quotes, escaping any embedded single quote as `'\''` (the standard POSIX-shell
+/// technique — close the quote, emit an escaped literal quote, reopen the quote).
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// Builds the shell command line to type into a fresh pane (via
+/// `crate::plugin::herdr_cli::pane_run`) to launch `editor_cmd` on `config_path`. Unlike the old
+/// `build_editor_argv` (removed, TF-624) this returns one shell-quoted string, not an argv
+/// vector — `pane_run` types text into an already-interactive shell rather than exec'ing argv
+/// directly.
 ///
-/// Given an editor command and the path to the config file, returns a vector with the command
-/// and the path as its argument.
-pub fn build_editor_argv(editor_cmd: &str, config_path: &Path) -> Vec<String> {
-    vec![
-        editor_cmd.to_string(),
-        config_path.to_string_lossy().into_owned(),
-    ]
+/// *Both* halves are shell-quoted, `editor_cmd` included. It reaches here straight from
+/// `config.toml`'s user-supplied `editor` field, and the pane it's typed into is an interactive
+/// shell, so an unquoted value containing a space (`/Applications/My Editor/bin/ed`) would split
+/// into two words and an unquoted shell metacharacter (`` ` ``, `;`, `|`, `$`) would be
+/// interpreted rather than passed through. Quoting it is safe precisely because
+/// `editor_override_is_usable` already requires the value to resolve to a single real
+/// binary/path before it can get here — it never legitimately carries extra shell words or
+/// arguments, so there is nothing for quoting to break.
+pub fn build_editor_command(editor_cmd: &str, config_path: &Path) -> String {
+    format!(
+        "{} {}",
+        shell_quote(editor_cmd),
+        shell_quote(&config_path.to_string_lossy())
+    )
 }
 
 #[cfg(test)]
@@ -231,18 +250,56 @@ mod tests {
     }
 
     #[test]
-    fn build_editor_argv_pairs_the_command_with_the_config_path() {
-        let argv = build_editor_argv(
-            "nvim",
-            Path::new("/home/user/.config/herdr-linear/config.toml"),
+    fn build_editor_command_joins_the_shell_quoted_editor_and_config_path() {
+        let command = build_editor_command("nvim", Path::new("/fake/config/dir/config.toml"));
+
+        assert_eq!(command, "'nvim' '/fake/config/dir/config.toml'");
+    }
+
+    #[test]
+    fn build_editor_command_escapes_an_embedded_single_quote_in_the_path() {
+        let command = build_editor_command("nvim", Path::new("/fake/o'brien/config.toml"));
+
+        assert_eq!(command, r"'nvim' '/fake/o'\''brien/config.toml'");
+    }
+
+    #[test]
+    fn build_editor_command_quotes_an_editor_path_containing_a_space() {
+        // Unquoted, this `config.toml` `editor` override would split into two shell words
+        // ("/Applications/My" and "Editor/bin/ed") the moment `pane_run` typed it into the
+        // pane's interactive shell — even though `editor_override_is_usable` accepted it as a
+        // single existing path.
+        let command = build_editor_command(
+            "/Applications/My Editor/bin/ed",
+            Path::new("/fake/config/dir/config.toml"),
         );
 
         assert_eq!(
-            argv,
-            vec![
-                "nvim".to_string(),
-                "/home/user/.config/herdr-linear/config.toml".to_string()
-            ]
+            command,
+            "'/Applications/My Editor/bin/ed' '/fake/config/dir/config.toml'"
         );
+    }
+
+    #[test]
+    fn build_editor_command_neutralizes_shell_metacharacters_in_the_editor() {
+        // Filenames may legally contain `;`, backticks, `$`, and `|` — unquoted, an override
+        // pointing at such a path would have the shell execute the tail of it rather than pass
+        // it through as one argument-free command word.
+        let command = build_editor_command(
+            "/tmp/ed;touch $(pwd)/pwned`id`|cat",
+            Path::new("/fake/config/dir/config.toml"),
+        );
+
+        assert_eq!(
+            command,
+            "'/tmp/ed;touch $(pwd)/pwned`id`|cat' '/fake/config/dir/config.toml'"
+        );
+    }
+
+    #[test]
+    fn build_editor_command_escapes_an_embedded_single_quote_in_the_editor() {
+        let command = build_editor_command("/tmp/o'brien/ed", Path::new("/fake/config.toml"));
+
+        assert_eq!(command, r"'/tmp/o'\''brien/ed' '/fake/config.toml'");
     }
 }
