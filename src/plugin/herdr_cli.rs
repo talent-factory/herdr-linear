@@ -639,7 +639,8 @@ pub async fn agent_prompt(herdr_bin: &str, pane_id: &PaneId, text: &str) -> Resu
 /// `herdr agent read <pane_id> --source <source> --lines <lines>` — the pane's rendered
 /// terminal text. herdr >= 0.8.0 prints it straight to stdout as raw text — the JSON envelope
 /// other subcommands use does not apply here (TF-624) — while failures (an unknown or
-/// not-yet-detected pane) still arrive as a JSON error body on stderr; [`run_raw`] maps both.
+/// not-yet-detected pane) still arrive as a JSON error body on stderr; the private `run_raw`
+/// helper maps both.
 /// Used by `main.rs`'s `send_prompt_until_visible` to confirm an [`agent_prompt`]
 /// actually reached the target's input box, rather than trusting `agent_wait`'s screen-scraped
 /// "idle" status alone: that status can go true the instant the prompt box is *painted*, which
