@@ -2106,7 +2106,7 @@ case "$1 $2" in
   "agent wait") {agent_wait} ;;
   "agent rename") {agent_rename} ;;
   "agent prompt") echo '{{"result":{{}}}}'; exit 0 ;;
-  "agent read") echo '{{"result":{{"read":{{"text":"Implement Linear Issue TF-579 using a new git worktree"}}}}}}'; exit 0 ;;
+  "agent read") echo 'Implement Linear Issue TF-579 using a new git worktree'; exit 0 ;;
   *)
     echo '{{"error":{{"message":"unexpected herdr call: $1 $2"}}}}'
     exit 1
@@ -2147,7 +2147,7 @@ case "$1 $2" in
     idx=$n
     if [ "$idx" -gt {last} ]; then idx={last}; fi
     echo $((n + 1)) > "$count_file"
-    cat "$script_dir/response_${{idx}}.json"
+    cat "$script_dir/response_${{idx}}.txt"
     exit 0
     ;;
   *)
@@ -2159,8 +2159,8 @@ esac
         ));
 
         for (i, text) in read_responses.iter().enumerate() {
-            let body = json!({"result": {"read": {"text": text}}}).to_string();
-            std::fs::write(dir.path().join(format!("response_{i}.json")), body).unwrap();
+            // herdr >= 0.8.0's `agent read` prints raw terminal text, not a JSON envelope (TF-624).
+            std::fs::write(dir.path().join(format!("response_{i}.txt")), text).unwrap();
         }
 
         (dir, script)
@@ -2212,9 +2212,9 @@ case "$1 $2" in
     n=0
     [ -f "$count_file" ] && n=$(cat "$count_file")
     if [ "$n" -ge {lands_on_attempt} ]; then
-      cat "$script_dir/landed.json"
+      cat "$script_dir/landed.txt"
     else
-      cat "$script_dir/empty.json"
+      cat "$script_dir/empty.txt"
     fi
     exit 0
     ;;
@@ -2226,16 +2226,9 @@ esac
 "#
         ));
 
-        std::fs::write(
-            dir.path().join("landed.json"),
-            json!({"result": {"read": {"text": landed_text}}}).to_string(),
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join("empty.json"),
-            json!({"result": {"read": {"text": empty_text}}}).to_string(),
-        )
-        .unwrap();
+        // herdr >= 0.8.0's `agent read` prints raw terminal text, not a JSON envelope (TF-624).
+        std::fs::write(dir.path().join("landed.txt"), landed_text).unwrap();
+        std::fs::write(dir.path().join("empty.txt"), empty_text).unwrap();
 
         (dir, script)
     }
@@ -2411,7 +2404,7 @@ case "$1 $2" in
     exit 0
     ;;
   "agent read")
-    echo '{{"result":{{"read":{{"text":"Implement Linear Issue TF-579 using a new git worktree"}}}}}}'
+    echo 'Implement Linear Issue TF-579 using a new git worktree'
     exit 0
     ;;
   "pane run"|"agent wait"|"agent rename"|"agent prompt")
@@ -2745,9 +2738,7 @@ esac
         // Review gap: the `ever_landed == false` branch of the `TimedOut` message had no direct
         // test — only the "appeared but then disappeared" branch did.
         let prompt = plugin::implement::build_implement_prompt("TF-579");
-        let (dir, script) = write_prompt_read_always_script(
-            r#"echo '{"result":{"read":{"text":"no prompt here"}}}'; exit 0"#,
-        );
+        let (dir, script) = write_prompt_read_always_script(r#"echo 'no prompt here'; exit 0"#);
         let tab = plugin::herdr_cli::tab_create(script.to_str().unwrap(), dir.path(), "TF-579")
             .await
             .expect("stub tab_create must succeed");
@@ -2776,7 +2767,7 @@ esac
         // as just another "not landed" poll.
         let prompt = plugin::implement::build_implement_prompt("TF-579");
         let (dir, script) = write_prompt_read_always_script(
-            r#"echo '{"error":{"message":"pane closed"}}'; exit 1"#,
+            r#"echo '{"error":{"message":"pane closed"}}' >&2; exit 1"#,
         );
         let tab = plugin::herdr_cli::tab_create(script.to_str().unwrap(), dir.path(), "TF-579")
             .await

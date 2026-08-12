@@ -126,6 +126,13 @@ fn upgrade_hint(message: &str) -> Option<String> {
 /// surface (TF-604, TF-624). Split out from `run` so this logic — the part that actually decides
 /// success vs. failure — is unit-testable without spawning a process.
 ///
+/// herdr >= 0.8.0 writes its JSON error body to **stderr** on failure, leaving stdout empty
+/// (verified live: `herdr agent wait <unknown-pane> --until idle` exits 1 and prints
+/// `{"error":{"code":"agent_not_found",...}}` to stderr — TF-624). The structured error is
+/// therefore looked up in *both* streams; parsing stdout alone would never see it, so the
+/// `agent_not_found` mapping below would never fire and `agent_wait` would fail on the first
+/// poll instead of retrying until herdr's agent detection catches up.
+///
 /// A successful exit with empty stdout is treated as success (`Value::Null`). Some herdr
 /// subcommands — notably `pane run` — produce no output on success (they only type a command
 /// into a pane), so requiring parseable JSON there would falsely report failure.
@@ -135,45 +142,11 @@ fn interpret_output(
     stdout: &str,
     stderr: &str,
 ) -> Result<Value> {
-    let parsed: Option<Value> = serde_json::from_str(stdout.trim()).ok();
-
-    let error_obj = parsed.as_ref().and_then(|v| v.get("error"));
-
-    let error_message = error_obj
-        .and_then(|e| e.get("message"))
-        .and_then(|m| m.as_str())
-        .map(str::to_string);
-
-    if !status_success || error_message.is_some() {
-        // herdr's `agent wait` returns `agent_not_found` when the target pane hasn't been
-        // identified as an agent yet. Surface it as a distinct variant so `agent_wait` can poll
-        // after `pane_run` rather than failing immediately.
-        if let Some(code) = error_obj
-            .and_then(|e| e.get("code"))
-            .and_then(|c| c.as_str())
-        {
-            if code == "agent_not_found" {
-                let target = error_message.clone().unwrap_or_default();
-                return Err(Error::AgentNotFound(target));
-            }
-        }
-
-        let message = error_message.unwrap_or_else(|| {
-            let stderr = stderr.trim();
-            if stderr.is_empty() {
-                stdout.trim().to_string()
-            } else {
-                stderr.to_string()
-            }
-        });
-        let message = match upgrade_hint(&message) {
-            Some(hint) => format!("{message} — {hint}"),
-            None => message,
-        };
-        return Err(Error::Internal(format!(
-            "`{command_desc}` failed: {message}"
-        )));
+    if let Some(err) = output_error(command_desc, status_success, stdout, stderr) {
+        return Err(err);
     }
+
+    let parsed: Option<Value> = serde_json::from_str(stdout.trim()).ok();
 
     // `herdr pane run` exits 0 and prints nothing on success — don't treat that as failure.
     if parsed.is_none() && stdout.trim().is_empty() {
@@ -191,6 +164,62 @@ fn interpret_output(
         .get("result")
         .cloned()
         .ok_or_else(|| Error::MissingResultField(format!("`{command_desc}` had no `result` field")))
+}
+
+/// The failure half of [`interpret_output`], split out so [`run_raw`] can apply the exact same
+/// failure mapping to subcommands whose *success* output isn't a JSON envelope. Returns `None`
+/// when the invocation succeeded (zero exit and no error body in either stream).
+fn output_error(
+    command_desc: &str,
+    status_success: bool,
+    stdout: &str,
+    stderr: &str,
+) -> Option<Error> {
+    let parsed: Option<Value> = serde_json::from_str(stdout.trim()).ok();
+    let stderr_parsed: Option<Value> = serde_json::from_str(stderr.trim()).ok();
+
+    let error_obj = parsed
+        .as_ref()
+        .and_then(|v| v.get("error"))
+        .or_else(|| stderr_parsed.as_ref().and_then(|v| v.get("error")));
+
+    let error_message = error_obj
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+        .map(str::to_string);
+
+    if !status_success || error_message.is_some() {
+        // herdr's agent subcommands return `agent_not_found` when the target pane hasn't been
+        // identified as an agent yet. Surface it as a distinct variant so `agent_wait` can poll
+        // after `pane_run` rather than failing immediately.
+        if let Some(code) = error_obj
+            .and_then(|e| e.get("code"))
+            .and_then(|c| c.as_str())
+        {
+            if code == "agent_not_found" {
+                let target = error_message.clone().unwrap_or_default();
+                return Some(Error::AgentNotFound(target));
+            }
+        }
+
+        let message = error_message.unwrap_or_else(|| {
+            let stderr = stderr.trim();
+            if stderr.is_empty() {
+                stdout.trim().to_string()
+            } else {
+                stderr.to_string()
+            }
+        });
+        let message = match upgrade_hint(&message) {
+            Some(hint) => format!("{message} — {hint}"),
+            None => message,
+        };
+        return Some(Error::Internal(format!(
+            "`{command_desc}` failed: {message}"
+        )));
+    }
+
+    None
 }
 
 /// True if `error` is herdr's known "no `result` field" response — see the module docs for the
@@ -252,19 +281,31 @@ async fn spawn_with_etxtbsy_retry(
     }
 }
 
-/// Run a `herdr` CLI subcommand, bounded by `call_timeout`, returning the parsed `result` field
-/// on success. See [`interpret_output`] for the success/failure mapping.
-async fn run_with_timeout(herdr_bin: &str, args: &[&str], call_timeout: Duration) -> Result<Value> {
+/// Spawn a `herdr` CLI subcommand (via [`spawn_with_etxtbsy_retry`]), bounded by
+/// `call_timeout`. Shared by [`run_with_timeout`] (JSON-`result` success) and [`run_raw`] (raw
+/// text success).
+async fn spawn_output(
+    herdr_bin: &str,
+    args: &[&str],
+    call_timeout: Duration,
+) -> Result<std::process::Output> {
     let command_desc = format!("{herdr_bin} {}", args.join(" "));
 
-    let output = tokio::time::timeout(call_timeout, spawn_with_etxtbsy_retry(herdr_bin, args))
+    tokio::time::timeout(call_timeout, spawn_with_etxtbsy_retry(herdr_bin, args))
         .await
         .map_err(|_| {
             Error::Internal(format!(
                 "`{command_desc}` timed out after {call_timeout:?} waiting for herdr"
             ))
         })?
-        .map_err(|e| Error::Internal(format!("Failed to run `{herdr_bin}`: {e}")))?;
+        .map_err(|e| Error::Internal(format!("Failed to run `{herdr_bin}`: {e}")))
+}
+
+/// Run a `herdr` CLI subcommand, bounded by `call_timeout`, returning the parsed `result` field
+/// on success. See [`interpret_output`] for the success/failure mapping.
+async fn run_with_timeout(herdr_bin: &str, args: &[&str], call_timeout: Duration) -> Result<Value> {
+    let command_desc = format!("{herdr_bin} {}", args.join(" "));
+    let output = spawn_output(herdr_bin, args, call_timeout).await?;
 
     interpret_output(
         &command_desc,
@@ -278,6 +319,22 @@ async fn run_with_timeout(herdr_bin: &str, args: &[&str], call_timeout: Duration
 /// except `agent_wait`, which computes its own call-specific budget instead (see [`agent_wait`]).
 async fn run(herdr_bin: &str, args: &[&str]) -> Result<Value> {
     run_with_timeout(herdr_bin, args, DEFAULT_CLI_TIMEOUT).await
+}
+
+/// [`run`]'s sibling for subcommands whose success output is raw text rather than a JSON
+/// envelope: herdr >= 0.8.0's `agent read` prints the pane's rendered terminal content straight
+/// to stdout (TF-624). The failure mapping is [`output_error`]'s, unchanged (a JSON error body
+/// on stderr, a non-zero exit, ...) — only the success shape differs.
+async fn run_raw(herdr_bin: &str, args: &[&str]) -> Result<String> {
+    let command_desc = format!("{herdr_bin} {}", args.join(" "));
+    let output = spawn_output(herdr_bin, args, DEFAULT_CLI_TIMEOUT).await?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if let Some(err) = output_error(&command_desc, output.status.success(), &stdout, &stderr) {
+        return Err(err);
+    }
+    Ok(stdout)
 }
 
 /// `herdr agent list` — the raw JSON text of the `result` field, for
@@ -579,20 +636,11 @@ pub async fn agent_prompt(herdr_bin: &str, pane_id: &PaneId, text: &str) -> Resu
         .map(|_| ())
 }
 
-/// Extract the rendered pane text from a `herdr agent read` call's already-unwrapped `result`
-/// value. Split out from [`agent_read`] for the same testability reason [`interpret_output`] is
-/// split out of `run`.
-fn parse_agent_read(result: &Value) -> Result<String> {
-    result
-        .get("read")
-        .and_then(|r| r.get("text"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .ok_or_else(|| Error::Internal("agent.read response missing read.text".to_string()))
-}
-
 /// `herdr agent read <pane_id> --source <source> --lines <lines>` — the pane's rendered
-/// terminal text. Used by `main.rs`'s `send_prompt_until_visible` to confirm an [`agent_prompt`]
+/// terminal text. herdr >= 0.8.0 prints it straight to stdout as raw text — the JSON envelope
+/// other subcommands use does not apply here (TF-624) — while failures (an unknown or
+/// not-yet-detected pane) still arrive as a JSON error body on stderr; [`run_raw`] maps both.
+/// Used by `main.rs`'s `send_prompt_until_visible` to confirm an [`agent_prompt`]
 /// actually reached the target's input box, rather than trusting `agent_wait`'s screen-scraped
 /// "idle" status alone: that status can go true the instant the prompt box is *painted*, which
 /// can be a beat before the target's input loop has actually attached to read the pty — a
@@ -605,7 +653,7 @@ pub async fn agent_read(
     lines: u32,
 ) -> Result<String> {
     let lines_str = lines.to_string();
-    let result = run(
+    run_raw(
         herdr_bin,
         &[
             "agent",
@@ -617,8 +665,7 @@ pub async fn agent_read(
             &lines_str,
         ],
     )
-    .await?;
-    parse_agent_read(&result)
+    .await
 }
 
 #[cfg(test)]
@@ -684,18 +731,23 @@ mod tests {
 
     #[test]
     fn interpret_output_surfaces_agent_not_found_as_distinct_variant() {
-        let err = interpret_output(
-            "herdr agent wait wY:p7Z --until idle --timeout 30000",
-            false,
-            r#"{"error":{"code":"agent_not_found","message":"agent target wY:p7Z not found"},"id":"cli:agent:wait"}"#,
-            "",
-        )
-        .unwrap_err();
+        // herdr >= 0.8.0 prints its JSON error body to stderr, not stdout (verified live,
+        // TF-624) — the mapping must fire regardless of which stream carries the body.
+        let body = r#"{"error":{"code":"agent_not_found","message":"agent target wY:p7Z not found"},"id":"cli:agent:wait"}"#;
+        for (stdout, stderr) in [(body, ""), ("", body)] {
+            let err = interpret_output(
+                "herdr agent wait wY:p7Z --until idle --timeout 30000",
+                false,
+                stdout,
+                stderr,
+            )
+            .unwrap_err();
 
-        assert!(
-            matches!(err, Error::AgentNotFound(_)),
-            "expected AgentNotFound, got: {err:?}"
-        );
+            assert!(
+                matches!(err, Error::AgentNotFound(_)),
+                "expected AgentNotFound (stdout={stdout:?}, stderr={stderr:?}), got: {err:?}"
+            );
+        }
     }
 
     #[test]
@@ -895,7 +947,8 @@ count=$(cat "$count_file")
 next=$((count + 1))
 echo "$next" > "$count_file"
 if [ "$next" -le 2 ]; then
-  echo '{{"error":{{"code":"agent_not_found","message":"agent target wY:p7Z not found"}},"id":"cli:agent:wait"}}'
+  # Real herdr >= 0.8.0 prints its JSON error body to stderr (TF-624).
+  echo '{{"error":{{"code":"agent_not_found","message":"agent target wY:p7Z not found"}},"id":"cli:agent:wait"}}' >&2
   exit 1
 fi
 echo '{{"result":{{}},"id":"cli:agent:wait"}}'
@@ -925,7 +978,8 @@ echo '{{"result":{{}},"id":"cli:agent:wait"}}'
     async fn agent_wait_times_out_when_agent_not_found_persists() {
         let (_dir, script) = write_fake_herdr_script(
             r#"
-echo '{"error":{"code":"agent_not_found","message":"agent target wY:p7Z not found"},"id":"cli:agent:wait"}'
+# Real herdr >= 0.8.0 prints its JSON error body to stderr (TF-624).
+echo '{"error":{"code":"agent_not_found","message":"agent target wY:p7Z not found"},"id":"cli:agent:wait"}' >&2
 exit 1
 "#,
         );
@@ -1004,29 +1058,59 @@ exit 1
         );
     }
 
-    #[test]
-    fn parse_agent_read_extracts_the_rendered_text() {
-        let result = serde_json::json!({"read": {"text": "❯ Implement Linear Issue TF-579"}});
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_read_returns_the_raw_terminal_text() {
+        // herdr >= 0.8.0 prints the pane's rendered content as plain text on stdout — no JSON
+        // envelope (TF-624).
+        let (_dir, script) = write_fake_herdr_script(
+            r#"
+printf '> Implement Linear Issue TF-579 using a new git worktree\n'
+exit 0
+"#,
+        );
 
-        let text = parse_agent_read(&result).unwrap();
+        let text = agent_read(
+            script.to_str().unwrap(),
+            &PaneId("wY:p7Z".to_string()),
+            "visible",
+            60,
+        )
+        .await
+        .expect("agent_read should return the raw terminal text");
 
-        assert_eq!(text, "❯ Implement Linear Issue TF-579");
+        assert!(
+            text.contains("Implement Linear Issue TF-579"),
+            "unexpected text: {text:?}"
+        );
     }
 
-    #[test]
-    fn parse_agent_read_errors_when_read_text_is_missing() {
-        let result = serde_json::json!({"read": {"pane_id": "wY:p10"}});
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_read_maps_a_stderr_error_body_to_agent_not_found() {
+        // Real herdr >= 0.8.0 reports a not-yet-detected pane as a JSON error body on stderr
+        // (TF-624) — `agent_read` must surface that through the same mapping as every other
+        // subcommand, not fail with "unparseable output" on the empty stdout.
+        let (_dir, script) = write_fake_herdr_script(
+            r#"
+echo '{"error":{"code":"agent_not_found","message":"agent target wY:p7Z not found"},"id":"cli:agent:read"}' >&2
+exit 1
+"#,
+        );
 
-        let err = parse_agent_read(&result).unwrap_err().to_string();
+        let err = agent_read(
+            script.to_str().unwrap(),
+            &PaneId("wY:p7Z".to_string()),
+            "visible",
+            60,
+        )
+        .await
+        .expect_err("agent_read should surface the stderr error body");
 
-        assert!(err.contains("read.text"), "unexpected message: {err}");
-    }
-
-    #[test]
-    fn parse_agent_read_errors_when_the_read_object_is_missing_entirely() {
-        let result = serde_json::json!({"id": "cli:agent:read"});
-
-        assert!(parse_agent_read(&result).is_err());
+        assert!(
+            matches!(err, Error::AgentNotFound(_)),
+            "expected AgentNotFound, got: {err:?}"
+        );
     }
 
     #[test]
