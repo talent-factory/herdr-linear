@@ -81,22 +81,33 @@ pub fn herdr_bin() -> String {
 /// herdr's minimum required version for this plugin, mirroring `min_herdr_version` in
 /// `herdr-plugin.toml` (duplicated here because that manifest field isn't readable by code in
 /// this crate at compile time — keep the two in sync by hand if either changes). Used only to
-/// word [`unsupported_cwd_flag_hint`]'s upgrade hint.
+/// word [`upgrade_hint`]'s upgrade message.
 const MIN_HERDR_VERSION: &str = "0.8.0";
 
-/// If `message` is herdr's own CLI-parser rejection of the `--cwd` flag, returns an upgrade hint
-/// to append to it. The only `herdr` call this plugin makes to a subcommand that accepts `--cwd`
-/// ([`tab_create`]) passes it unconditionally, so the only way an installed
-/// `herdr` binary could reject it is if that binary predates the version which added `--cwd`
-/// support (TF-579, TF-584) — i.e. it's older than [`MIN_HERDR_VERSION`]. Without this hint, the
-/// raw "unknown option: --cwd" that reaches the user (TF-604) gives no indication that the fix is
-/// upgrading herdr rather than anything on the plugin side. Matches only herdr's exact observed
-/// wording — a substring check, not a general "any unknown option" detector — so an unrelated
-/// unknown-option failure (e.g. a typo introduced elsewhere) isn't misattributed to this cause.
-fn unsupported_cwd_flag_hint(message: &str) -> Option<String> {
-    if message.contains("unknown option: --cwd") {
+/// Substring patterns in herdr's own CLI-parser rejection messages that indicate an installed
+/// `herdr` binary predates the 0.8.0 agent-CLI redesign (TF-624). The plugin unconditionally uses
+/// these subcommands/options, so any such rejection means the binary is too old. Matches only
+/// observed/expected wordings — not a general "any unknown subcommand/option" detector — so an
+/// unrelated typo elsewhere isn't misattributed to a version mismatch.
+const TOO_OLD_HERDR_PATTERNS: &[&str] = &[
+    "unknown option: --cwd",
+    "unknown option: --until",
+    "unknown subcommand: run",
+    "unknown subcommand: prompt",
+    "unknown subcommand: rename",
+];
+
+/// If `message` matches one of the known herdr-CLI rejection patterns for features introduced in
+/// herdr 0.8.0, returns an upgrade hint to append to it. Without this hint, raw
+/// "unknown subcommand/option" errors from a too-old herdr give no indication that the fix is to
+/// upgrade herdr rather than anything on the plugin side.
+fn upgrade_hint(message: &str) -> Option<String> {
+    if TOO_OLD_HERDR_PATTERNS
+        .iter()
+        .any(|pattern| message.contains(pattern))
+    {
         Some(format!(
-            "this herdr installation doesn't support --cwd on this subcommand; herdr-linear \
+            "this herdr installation appears to be older than {MIN_HERDR_VERSION}; herdr-linear \
              requires herdr >= {MIN_HERDR_VERSION} (see min_herdr_version in herdr-plugin.toml) — \
              upgrade herdr and retry"
         ))
@@ -111,9 +122,9 @@ fn unsupported_cwd_flag_hint(message: &str) -> Option<String> {
 /// alone, exit 0, must not be misread as success), or unparseable JSON to `Error::Internal` with
 /// the CLI's own error message (or raw stderr/stdout as a fallback) so failures are always
 /// actionable in the status banner they end up in. One specific failure gets a further hint
-/// appended — see [`unsupported_cwd_flag_hint`] — an installed `herdr` too old to support `--cwd`
-/// on `tab create` (TF-604). Split out from `run` so this logic — the part that
-/// actually decides success vs. failure — is unit-testable without spawning a process.
+/// appended — see [`upgrade_hint`] — when the installed `herdr` is too old for the 0.8.0 CLI
+/// surface (TF-604, TF-624). Split out from `run` so this logic — the part that actually decides
+/// success vs. failure — is unit-testable without spawning a process.
 fn interpret_output(
     command_desc: &str,
     status_success: bool,
@@ -138,7 +149,7 @@ fn interpret_output(
                 stderr.to_string()
             }
         });
-        let message = match unsupported_cwd_flag_hint(&message) {
+        let message = match upgrade_hint(&message) {
             Some(hint) => format!("{message} — {hint}"),
             None => message,
         };
@@ -343,6 +354,67 @@ fn find_tab_id_by_label(tab_list_json: &str, label: &str) -> Option<TabId> {
 /// [`crate::plugin::editor::EDITOR_AGENT_NAME`] in a `tab list` JSON result.
 pub fn find_existing_editor_tab(tab_list_json: &str) -> Option<TabId> {
     find_tab_id_by_label(tab_list_json, crate::plugin::editor::EDITOR_AGENT_NAME)
+}
+
+/// `herdr pane list` — raw JSON text of the `result` field. Used by
+/// `main.rs::open_config_in_herdr_pane` to find the root pane of an existing editor tab so it can
+/// verify the editor process is still alive before reusing the tab.
+pub async fn pane_list(herdr_bin: &str) -> Result<String> {
+    let result = run(herdr_bin, &["pane", "list"]).await?;
+    Ok(result.to_string())
+}
+
+/// Find the `pane_id` of the first pane in a `herdr pane list` JSON result whose `tab_id`
+/// matches `tab_id`. Returns `None` on unparseable JSON, an empty/missing `panes` array, or no
+/// match — all of which make the caller fall back to creating a fresh tab.
+pub fn find_root_pane_for_tab(pane_list_json: &str, tab_id: &TabId) -> Option<PaneId> {
+    let parsed: Value = serde_json::from_str(pane_list_json).ok()?;
+    let panes = parsed.get("panes")?.as_array()?;
+    panes.iter().find_map(|pane| {
+        let pane_tab_id = pane.get("tab_id")?.as_str()?;
+        if pane_tab_id != tab_id.as_str() {
+            return None;
+        }
+        let pane_id = pane.get("pane_id")?.as_str()?;
+        Some(PaneId(pane_id.to_string()))
+    })
+}
+
+/// `herdr pane process-info --pane <pane_id>` — raw JSON text of the `result` field. Used by
+/// `main.rs::open_config_in_herdr_pane` to check whether an editor is still running in a pane.
+pub async fn pane_process_info(herdr_bin: &str, pane_id: &PaneId) -> Result<String> {
+    let result = run(
+        herdr_bin,
+        &["pane", "process-info", "--pane", pane_id.as_str()],
+    )
+    .await?;
+    Ok(result.to_string())
+}
+
+/// True if a `herdr pane process-info` JSON result shows a non-shell foreground process running
+/// in the pane, i.e. the pane is not sitting idle at a shell prompt. Returns `false` on
+/// unparseable JSON or a missing/empty `foreground_processes` array.
+pub fn is_pane_alive(process_info_json: &str) -> bool {
+    let Ok(parsed) = serde_json::from_str::<Value>(process_info_json) else {
+        return false;
+    };
+    let Some(process_info) = parsed.get("process_info") else {
+        return false;
+    };
+    let Some(shell_pid) = process_info.get("shell_pid").and_then(|v| v.as_i64()) else {
+        return false;
+    };
+    let Some(foreground) = process_info
+        .get("foreground_processes")
+        .and_then(|v| v.as_array())
+    else {
+        return false;
+    };
+    foreground.iter().any(|proc| {
+        proc.get("pid")
+            .and_then(|v| v.as_i64())
+            .is_some_and(|pid| pid != shell_pid)
+    })
 }
 
 /// `herdr tab focus <tab_id>`. Used to switch to an already-open config-editor tab on a second
@@ -572,6 +644,35 @@ mod tests {
             err.contains("unknown option: --cwd") && err.contains(MIN_HERDR_VERSION),
             "unexpected message: {err}"
         );
+    }
+
+    #[test]
+    fn interpret_output_hints_at_upgrading_herdr_for_other_08_only_features() {
+        // TF-624 review: a herdr between the old floor and 0.8.0 accepts `--cwd` on `tab create`
+        // but then fails on one of the redesigned agent-CLI commands (`pane run`, `agent prompt`,
+        // `agent wait --until`, `agent rename`) with no version hint.
+        for (command, stderr) in [
+            ("herdr pane run wY:p1 nvim", "unknown subcommand: run\n"),
+            (
+                "herdr agent prompt wY:p1 hi",
+                "unknown subcommand: prompt\n",
+            ),
+            (
+                "herdr agent wait --until idle wY:p1",
+                "unknown option: --until\n",
+            ),
+            (
+                "herdr agent rename wY:p1 Linear",
+                "unknown subcommand: rename\n",
+            ),
+        ] {
+            let result = interpret_output(command, false, "", stderr);
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains(MIN_HERDR_VERSION),
+                "expected upgrade hint for {command}, got: {err}"
+            );
+        }
     }
 
     #[test]
@@ -850,5 +951,51 @@ exit 1
     #[test]
     fn find_tab_id_by_label_returns_none_when_tabs_array_is_missing() {
         assert_eq!(find_tab_id_by_label(r#"{}"#, "herdr-linear-config"), None);
+    }
+
+    #[test]
+    fn find_root_pane_for_tab_returns_the_first_matching_pane_id() {
+        let json = r#"{"panes":[{"pane_id":"w1:p1","tab_id":"w1:t1"},{"pane_id":"w1:p2","tab_id":"w1:t2"}]}"#;
+
+        let found = find_root_pane_for_tab(json, &TabId("w1:t2".to_string()));
+
+        assert_eq!(found, Some(PaneId("w1:p2".to_string())));
+    }
+
+    #[test]
+    fn find_root_pane_for_tab_returns_none_when_no_pane_matches() {
+        let json = r#"{"panes":[{"pane_id":"w1:p1","tab_id":"w1:t1"}]}"#;
+
+        assert_eq!(
+            find_root_pane_for_tab(json, &TabId("w1:t2".to_string())),
+            None
+        );
+    }
+
+    #[test]
+    fn find_root_pane_for_tab_returns_none_on_unparseable_json() {
+        assert_eq!(
+            find_root_pane_for_tab("not json", &TabId("w1:t2".to_string())),
+            None
+        );
+    }
+
+    #[test]
+    fn is_pane_alive_is_true_when_foreground_process_is_not_the_shell() {
+        let json = r#"{"process_info":{"shell_pid":1000,"foreground_processes":[{"pid":2000,"name":"nvim"}]}}"#;
+
+        assert!(is_pane_alive(json));
+    }
+
+    #[test]
+    fn is_pane_alive_is_false_when_only_the_shell_is_in_foreground() {
+        let json = r#"{"process_info":{"shell_pid":1000,"foreground_processes":[{"pid":1000,"name":"zsh"}]}}"#;
+
+        assert!(!is_pane_alive(json));
+    }
+
+    #[test]
+    fn is_pane_alive_is_false_on_unparseable_json() {
+        assert!(!is_pane_alive("not json"));
     }
 }

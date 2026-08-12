@@ -624,9 +624,50 @@ impl std::fmt::Display for HerdrPaneError {
     }
 }
 
+/// True if the herdr tab `tab_id` (an existing config-editor tab) currently has a non-shell
+/// foreground process running in its root pane. Used by [`open_config_in_herdr_pane`] to avoid
+/// reusing a dead editor tab. Falls back to `false` on any I/O or parsing error — a tab whose
+/// liveness can't be verified is treated as dead, and a fresh tab is created instead.
+async fn editor_tab_is_alive(herdr_bin: &str, tab_id: &plugin::herdr_cli::TabId) -> bool {
+    let panes_json = match plugin::herdr_cli::pane_list(herdr_bin).await {
+        Ok(json) => json,
+        Err(err) => {
+            tracing::debug!(
+                "couldn't list panes to check liveness of existing '{}' tab ({err}) — assuming \
+                 dead",
+                plugin::editor::EDITOR_AGENT_NAME
+            );
+            return false;
+        }
+    };
+
+    let pane_id = match plugin::herdr_cli::find_root_pane_for_tab(&panes_json, tab_id) {
+        Some(pane_id) => pane_id,
+        None => {
+            tracing::debug!(
+                "couldn't find root pane for existing '{}' tab — assuming dead",
+                plugin::editor::EDITOR_AGENT_NAME
+            );
+            return false;
+        }
+    };
+
+    match plugin::herdr_cli::pane_process_info(herdr_bin, &pane_id).await {
+        Ok(info) => plugin::herdr_cli::is_pane_alive(&info),
+        Err(err) => {
+            tracing::debug!(
+                "couldn't read process info for existing '{}' tab ({err}) — assuming dead",
+                plugin::editor::EDITOR_AGENT_NAME
+            );
+            false
+        }
+    }
+}
+
 /// Runs `editor_cmd` on `config_path` inside a herdr pane, for the `c` keybinding: reuses an
 /// already-open editor tab from a previous `c` press if a `herdr tab list` label lookup
-/// ([`plugin::herdr_cli::find_existing_editor_tab`]) finds one, switching to it via
+/// ([`plugin::herdr_cli::find_existing_editor_tab`]) finds one *and* [`editor_tab_is_alive`]
+/// confirms the editor process is still running, switching to it via
 /// [`plugin::herdr_cli::tab_focus`]; otherwise opens a fresh tab and types the editor command
 /// into its root pane via [`plugin::herdr_cli::tab_create`] + [`plugin::herdr_cli::pane_run`].
 /// The tab label is always [`plugin::editor::EDITOR_AGENT_NAME`] — deliberately global, not
@@ -656,17 +697,25 @@ async fn open_config_in_herdr_pane(
 ) -> std::result::Result<(), HerdrPaneError> {
     // Reuse an already-open editor tab from a previous `c` press, if any — see this function's
     // own doc for why a tab-label lookup is the only reuse mechanism that still works for `nvim`.
+    // Guard against reusing a dead tab: a tab with the right label but no running editor process
+    // (e.g. the user quit nvim inside it) would otherwise strand the user on an empty shell pane.
     match plugin::herdr_cli::tab_list(herdr_bin).await {
         Ok(json) => {
             if let Some(tab_id) = plugin::herdr_cli::find_existing_editor_tab(&json) {
-                return plugin::herdr_cli::tab_focus(herdr_bin, &tab_id)
-                    .await
-                    .map_err(|err| {
-                        HerdrPaneError::Unavailable(format!(
-                            "found an existing '{}' tab but failed to focus it: {err}",
-                            plugin::editor::EDITOR_AGENT_NAME
-                        ))
-                    });
+                if editor_tab_is_alive(herdr_bin, &tab_id).await {
+                    return plugin::herdr_cli::tab_focus(herdr_bin, &tab_id)
+                        .await
+                        .map_err(|err| {
+                            HerdrPaneError::Unavailable(format!(
+                                "found an existing '{}' tab but failed to focus it: {err}",
+                                plugin::editor::EDITOR_AGENT_NAME
+                            ))
+                        });
+                }
+                tracing::debug!(
+                    "existing '{}' tab has no running editor process — creating a new tab",
+                    plugin::editor::EDITOR_AGENT_NAME
+                );
             }
         }
         Err(err) => {
@@ -1256,11 +1305,19 @@ mod tests {
     /// none of this fixture's callers need to simulate a `tab focus` failure — the one test that
     /// reaches it (`..._focuses_an_existing_tab_without_creating_a_new_one`) only needs to prove
     /// reuse short-circuits `tab create`/`pane run`, not exercise `tab focus`'s own error path.
+    /// `pane list`/`pane process-info` default to "no pane / dead pane" so callers that don't
+    /// expect to reach reuse don't need to supply them.
     fn write_editor_herdr_script(
         tab_list: &str,
         tab_create: &str,
         pane_run: &str,
+        pane_list: Option<&str>,
+        pane_process_info: Option<&str>,
     ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let pane_list = pane_list.unwrap_or(r#"echo '{"result":{"panes":[]}}'; exit 0"#);
+        let pane_process_info = pane_process_info.unwrap_or(
+            r#"echo '{"result":{"process_info":{"shell_pid":1,"foreground_processes":[]}}}'; exit 0"#,
+        );
         write_fake_herdr_script(&format!(
             r#"
 case "$1 $2" in
@@ -1268,6 +1325,8 @@ case "$1 $2" in
   "tab create") {tab_create} ;;
   "pane run") {pane_run} ;;
   "tab focus") echo '{{"result":{{}}}}'; exit 0 ;;
+  "pane list") {pane_list} ;;
+  "pane process-info") {pane_process_info} ;;
   *)
     echo '{{"error":{{"message":"unexpected herdr call: $1 $2"}}}}'
     exit 1
@@ -1284,6 +1343,10 @@ esac
             r#"echo '{"result":{"tabs":[{"tab_id":"w1:t2","label":"herdr-linear-config"}]}}'; exit 0"#,
             r#"echo 'tab create should not run'; exit 1"#,
             r#"echo 'pane run should not run'; exit 1"#,
+            Some(r#"echo '{"result":{"panes":[{"pane_id":"w1:p2","tab_id":"w1:t2"}]}}'; exit 0"#),
+            Some(
+                r#"echo '{"result":{"process_info":{"shell_pid":1000,"foreground_processes":[{"pid":2000,"name":"nvim"}]}}}'; exit 0"#,
+            ),
         );
 
         let result = open_config_in_herdr_pane(
@@ -1303,6 +1366,34 @@ esac
             r#"echo '{"result":{"tabs":[]}}'; exit 0"#,
             r#"echo '{"result":{"tab":{"tab_id":"t2","label":"herdr-linear-config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
             r#"echo '{"result":{}}'; exit 0"#,
+            None,
+            None,
+        );
+
+        let result = open_config_in_herdr_pane(
+            script.to_str().unwrap(),
+            "nvim",
+            std::path::Path::new("/fake/config/dir/config.toml"),
+        )
+        .await;
+
+        assert_eq!(result, Ok(()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_config_in_herdr_pane_creates_a_new_tab_when_the_existing_editor_tab_is_dead() {
+        // The tab exists with the right label, but the editor process has exited and the pane
+        // is back at the shell prompt. Reusing it via `tab focus` would strand the user on a
+        // dead pane, so we must create a fresh tab instead.
+        let (_dir, script) = write_editor_herdr_script(
+            r#"echo '{"result":{"tabs":[{"tab_id":"w1:t2","label":"herdr-linear-config"}]}}'; exit 0"#,
+            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"herdr-linear-config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
+            r#"echo '{"result":{}}'; exit 0"#,
+            Some(r#"echo '{"result":{"panes":[{"pane_id":"w1:p2","tab_id":"w1:t2"}]}}'; exit 0"#),
+            Some(
+                r#"echo '{"result":{"process_info":{"shell_pid":1000,"foreground_processes":[{"pid":1000,"name":"zsh"}]}}}'; exit 0"#,
+            ),
         );
 
         let result = open_config_in_herdr_pane(
@@ -1373,6 +1464,8 @@ esac
             r#"echo '{"error":{"message":"no such workspace"}}'; exit 1"#,
             r#"echo '{"result":{"tab":{"tab_id":"t2","label":"herdr-linear-config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
             r#"echo '{"result":{}}'; exit 0"#,
+            None,
+            None,
         );
 
         let result = open_config_in_herdr_pane(
@@ -1393,6 +1486,8 @@ esac
             r#"echo '{"result":{"tabs":[]}}'; exit 0"#,
             r#"echo '{"error":{"message":"no such workspace"}}'; exit 1"#,
             r#"echo 'pane run should not run'; exit 1"#,
+            None,
+            None,
         );
 
         let result = open_config_in_herdr_pane(
@@ -1422,6 +1517,8 @@ esac
             r#"echo '{"result":{"tabs":[]}}'; exit 0"#,
             r#"echo '{"result":{"tab":{"tab_id":"t2","label":"herdr-linear-config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
             r#"echo '{"error":{"message":"no such pane"}}'; exit 1"#,
+            None,
+            None,
         );
 
         let result = open_config_in_herdr_pane(
@@ -1471,6 +1568,10 @@ esac
             r#"echo '{"result":{"tabs":[{"tab_id":"w1:t2","label":"herdr-linear-config"}]}}'; exit 0"#,
             r#"echo 'tab create should not run'; exit 1"#,
             r#"echo 'pane run should not run'; exit 1"#,
+            Some(r#"echo '{"result":{"panes":[{"pane_id":"w1:p2","tab_id":"w1:t2"}]}}'; exit 0"#),
+            Some(
+                r#"echo '{"result":{"process_info":{"shell_pid":1000,"foreground_processes":[{"pid":2000,"name":"nvim"}]}}}'; exit 0"#,
+            ),
         );
         let opener_calls = std::cell::RefCell::new(Vec::new());
 
@@ -1499,6 +1600,8 @@ esac
             r#"echo '{"result":{"tabs":[]}}'; exit 0"#,
             r#"echo '{"error":{"message":"no such workspace"}}'; exit 1"#,
             r#"echo 'pane run should not run'; exit 1"#,
+            None,
+            None,
         );
         let opener_calls = std::cell::RefCell::new(Vec::new());
 
@@ -1530,6 +1633,8 @@ esac
             r#"echo '{"result":{"tabs":[]}}'; exit 0"#,
             r#"echo '{"result":{"tab":{"tab_id":"t2","label":"herdr-linear-config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
             r#"echo '{"error":{"message":"no such pane"}}'; exit 1"#,
+            None,
+            None,
         );
         let opener_calls = std::cell::RefCell::new(Vec::new());
 
@@ -1564,6 +1669,8 @@ esac
             r#"echo '{"result":{"tabs":[]}}'; exit 0"#,
             r#"echo '{"error":{"message":"no such workspace"}}'; exit 1"#,
             r#"echo 'pane run should not run'; exit 1"#,
+            None,
+            None,
         );
 
         let result = open_config_editor(
