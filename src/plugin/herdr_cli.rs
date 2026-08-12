@@ -125,6 +125,10 @@ fn upgrade_hint(message: &str) -> Option<String> {
 /// appended — see [`upgrade_hint`] — when the installed `herdr` is too old for the 0.8.0 CLI
 /// surface (TF-604, TF-624). Split out from `run` so this logic — the part that actually decides
 /// success vs. failure — is unit-testable without spawning a process.
+///
+/// A successful exit with empty stdout is treated as success (`Value::Null`). Some herdr
+/// subcommands — notably `pane run` — produce no output on success (they only type a command
+/// into a pane), so requiring parseable JSON there would falsely report failure.
 fn interpret_output(
     command_desc: &str,
     status_success: bool,
@@ -156,6 +160,11 @@ fn interpret_output(
         return Err(Error::Internal(format!(
             "`{command_desc}` failed: {message}"
         )));
+    }
+
+    // `herdr pane run` exits 0 and prints nothing on success — don't treat that as failure.
+    if parsed.is_none() && stdout.trim().is_empty() {
+        return Ok(Value::Null);
     }
 
     let parsed = parsed.ok_or_else(|| {
@@ -623,6 +632,16 @@ mod tests {
             err.contains("unknown option: --bogus"),
             "unexpected message: {err}"
         );
+    }
+
+    #[test]
+    fn interpret_output_treats_empty_stdout_with_success_exit_as_success() {
+        // `herdr pane run` exits 0 and prints nothing on success. Before this special case it
+        // was reported as "unparseable output", which made every issue launch look like it had
+        // failed even though the agent command was typed into the pane correctly.
+        let result = interpret_output("herdr pane run wY:p7X hr", true, "", "");
+
+        assert_eq!(result.unwrap(), serde_json::Value::Null);
     }
 
     #[test]
