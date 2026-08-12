@@ -369,8 +369,8 @@ async fn send_prompt_until_visible(
 /// See [`send_prompt_until_visible`]. This resends up to `attempts` times, delegating each
 /// attempt's confirmation to [`wait_for_prompt_stable`]; a `TimedOut`/error result falls through
 /// to the next (re)send rather than trusting an early sighting. Every attempt's failure is logged
-/// via `tracing::debug!` before moving on (see `main.rs::init_tracing`, and `agent_start`'s
-/// `agent_name_taken` retry loop in `herdr_cli.rs` for the established convention this follows)
+/// via `tracing::debug!` before moving on (see `main.rs::init_tracing`, and `agent_wait`'s
+/// missing-`result` retry loop in `herdr_cli.rs` for the established convention this follows)
 /// — only the *last* attempt's error is returned to the caller, so a log-enabled session is the
 /// only way to see what the earlier, discarded attempts actually failed with.
 async fn send_prompt_until_visible_with(
@@ -384,7 +384,7 @@ async fn send_prompt_until_visible_with(
 ) -> std::result::Result<(), String> {
     let mut last_err = None;
     for attempt in 1..=attempts {
-        if let Err(err) = plugin::herdr_cli::agent_send(herdr_bin, pane_id, prompt).await {
+        if let Err(err) = plugin::herdr_cli::agent_prompt(herdr_bin, pane_id, prompt).await {
             tracing::debug!(
                 "send_prompt_until_visible: attempt {attempt} failed to send ({err}), retrying"
             );
@@ -483,10 +483,9 @@ async fn resolve_validated_agent_command(
 /// ([`start_implementation`] for the single-issue case, [`start_implementation_many`] for the
 /// marked-multiple case) can turn it into whatever status banner fits their situation,
 /// mirroring `ensure_loaded`'s "inline error instead of crashing" philosophy. Any non-fatal
-/// warnings collected along the way (the agent landing in an unexpected tab, closing the tab's
-/// redundant root pane, workflow-state lookup, the actual state transition) are preserved in
-/// *every* terminal outcome, not just the final success case — a failure late in the flow (e.g.
-/// `agent_wait` timing out) must not hide
+/// warnings collected along the way (a failed cosmetic agent rename, workflow-state lookup, the
+/// actual state transition) are preserved in *every* terminal outcome, not just the final
+/// success case — a failure late in the flow (e.g. `agent_wait` timing out) must not hide
 /// an earlier one (e.g. the issue never actually reaching "In Progress"). See
 /// docs/superpowers/specs/2026-08-05-implement-on-enter-design.md for the full original data
 /// flow this extends, and docs/superpowers/specs/2026-08-06-guaranteed-tab-per-issue-design.md
@@ -501,15 +500,13 @@ async fn resolve_validated_agent_command(
 /// split-only caveat this replaces. `resolve_cwd` itself never fails outright (see its own
 /// doc), so this function separately guards against the one case that matters here: both its
 /// launch-context parse *and* its `current_dir()` fallback failing, which would otherwise pass
-/// an empty `--cwd` straight through to `tab_create` and `agent_start`.
+/// an empty `--cwd` straight through to `tab_create`.
 async fn implement_one(
     herdr_bin: &str,
     client: &herdr_linear::LinearClient,
     issue: &herdr_linear::Issue,
     command: &plugin::implement::ValidatedAgentCommand,
 ) -> ImplementOutcome {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-    let argv = plugin::implement::build_shell_argv(&shell, command);
     let cwd = plugin::host::resolve_cwd();
     if cwd.as_os_str().is_empty() {
         return ImplementOutcome::Failed(
@@ -520,12 +517,9 @@ async fn implement_one(
         );
     }
 
-    // TF-590: a per-issue name, not the bare `command`, so starting a second issue while the
-    // first's agent tab is still running under the same `agent_command` doesn't collide on
-    // herdr's side with `agent_name_taken` (which `agent_start` itself also retries
-    // automatically, up to `AGENT_START_NAME_TAKEN_MAX_RETRIES` times, with a different
-    // suggested name each time — this is what makes those retries something other than the
-    // exact same losing name).
+    // TF-590: a per-issue name, not the bare `command`, so two issues running under the same
+    // `agent_command` stay distinguishable in herdr's own pane/agent list. Applied cosmetically
+    // via `agent_rename` further below, once the pane is up — see that call site.
     let agent_name = plugin::implement::build_agent_name(command.as_str(), &issue.identifier);
 
     let created_tab = match plugin::herdr_cli::tab_create(herdr_bin, &cwd, &issue.identifier).await
@@ -534,58 +528,22 @@ async fn implement_one(
         Err(err) => return ImplementOutcome::Failed(format!("failed to create a tab: {err}")),
     };
 
-    let started = match plugin::herdr_cli::agent_start(
-        herdr_bin,
-        &agent_name,
-        &cwd,
-        &created_tab.tab_id,
-        &argv,
-    )
-    .await
+    // A `pane_run` `Err` does not necessarily mean the agent never started — the most likely
+    // cause is `run_with_timeout` giving up on a `herdr` call that's still running in the
+    // background (no `kill_on_drop`), so the agent may well be up despite the error. Don't
+    // assert the tab is empty; tell the user to check first.
+    if let Err(err) =
+        plugin::herdr_cli::pane_run(herdr_bin, &created_tab.root_pane_id, command.as_str()).await
     {
-        Ok(started) => started,
-        Err(err) => {
-            // `agent_start` returning `Err` does not necessarily mean the agent never started —
-            // the most likely cause is `run_with_timeout` giving up on a `herdr` call that's
-            // still running in the background (no `kill_on_drop`), so the agent may well be up
-            // despite the error. Don't assert the tab is empty; tell the user to check first.
-            return ImplementOutcome::Failed(format!(
-                "tab created but the agent-start call failed ({err}) — check the '{}' tab: it \
-                 may be empty (safe to close) or the agent may have started anyway despite the \
-                 error, so verify before closing it",
-                issue.identifier
-            ));
-        }
-    };
-
-    let mut warnings = Vec::new();
-
-    // TF-579 regression guard: `--tab` should have placed the agent inside `created_tab.tab_id`.
-    // If herdr ever placed it elsewhere, the guarantee this whole flow exists for silently
-    // didn't hold — surface that rather than quietly accepting whatever tab herdr picked.
-    if started.tab_id != created_tab.tab_id {
-        warnings.push(format!(
-            "agent started in tab {} instead of the requested tab {} — herdr may have ignored \
-             --tab",
-            started.tab_id.as_str(),
-            created_tab.tab_id.as_str()
+        return ImplementOutcome::Failed(format!(
+            "tab created but launching the agent failed ({err}) — check the '{}' tab: it may \
+             be empty (safe to close) or the agent may have started anyway despite the error, \
+             so verify before closing it",
+            issue.identifier
         ));
     }
 
-    // `agent_start` is assumed to split alongside a tab's existing panes rather than replace
-    // them (see docs/superpowers/specs/2026-08-06-guaranteed-tab-per-issue-design.md's addendum
-    // — verified live against herdr 0.7.3, but a future herdr version could change this). Guard
-    // against that assumption breaking: if the agent's own pane turned out to *be*
-    // `root_pane_id` (herdr replaced rather than split), there is no redundant pane left to
-    // close — closing it anyway would kill the agent's own pane instead of a leftover one.
-    if started.pane_id != created_tab.root_pane_id {
-        if let Err(err) = plugin::herdr_cli::pane_close(herdr_bin, &created_tab.root_pane_id).await
-        {
-            warnings.push(format!(
-                "failed to close the tab's now-redundant empty pane: {err}"
-            ));
-        }
-    }
+    let mut warnings = Vec::new();
 
     match client.get_workflow_states(&issue.team.id).await {
         Ok(states) => match plugin::implement::pick_in_progress_state(&states) {
@@ -605,7 +563,7 @@ async fn implement_one(
     // From here on, every early return must still report `warnings` — a failure below doesn't
     // undo (or excuse hiding) a warning collected above it.
     if let Err(err) =
-        plugin::herdr_cli::agent_wait(herdr_bin, &started.pane_id, "idle", 30_000).await
+        plugin::herdr_cli::agent_wait(herdr_bin, &created_tab.root_pane_id, "idle", 30_000).await
     {
         return ImplementOutcome::Failed(status_with_warnings(
             format!("agent didn't become ready ({err}) — run manually: {prompt}"),
@@ -613,7 +571,19 @@ async fn implement_one(
         ));
     }
 
-    if let Err(err) = send_prompt_until_visible(herdr_bin, &started.pane_id, &prompt).await {
+    // Cosmetic only (TF-590's original motivation — avoiding a launch-time name collision —
+    // no longer applies, since `pane_run` never passes a name to herdr): best-effort, so a
+    // failure here is a warning, not a reason to abandon an otherwise-working flow.
+    if let Err(err) =
+        plugin::herdr_cli::agent_rename(herdr_bin, &created_tab.root_pane_id, &agent_name).await
+    {
+        warnings.push(format!(
+            "failed to rename the agent pane to {agent_name:?}: {err}"
+        ));
+    }
+
+    if let Err(err) = send_prompt_until_visible(herdr_bin, &created_tab.root_pane_id, &prompt).await
+    {
         return ImplementOutcome::Failed(status_with_warnings(
             format!("{err} — run manually: {prompt}"),
             &warnings,
@@ -631,15 +601,16 @@ async fn implement_one(
 /// [`open_config_editor`]: an `Unavailable` failure means nothing was created and the OS-opener
 /// fallback is safe; an `Ambiguous` failure means a tab may already exist with the editor
 /// running in it, so falling back would risk opening `config.toml` a second time — see
-/// `agent_start`'s handling below and [`implement_one`]'s identical `run_with_timeout` caveat
+/// `pane_run`'s handling above and [`implement_one`]'s identical `run_with_timeout` caveat
 /// for why a herdr-call `Err` doesn't mean the call didn't actually take effect.
 #[derive(Debug, PartialEq, Eq)]
 enum HerdrPaneError {
-    /// No tab was created — the `agent_focus` miss and `tab_create` call both failed cleanly,
-    /// so the caller's OS-opener fallback is safe.
+    /// No tab was created — either an existing tab was found but `tab_focus` failed, or no
+    /// existing tab was found and `tab_create` failed; either way the caller's OS-opener
+    /// fallback is safe.
     Unavailable(String),
-    /// A tab was created but `agent_start`'s outcome is unknown (it may have started despite
-    /// the error). The caller must not fall back to the OS opener here.
+    /// A tab was created but `pane_run`'s outcome is unknown (the editor may have started
+    /// despite the error). The caller must not fall back to the OS opener here.
     Ambiguous(String),
 }
 
@@ -653,20 +624,67 @@ impl std::fmt::Display for HerdrPaneError {
     }
 }
 
+/// True if the herdr tab `tab_id` (an existing config-editor tab) currently has a non-shell
+/// foreground process running in its root pane. Used by [`open_config_in_herdr_pane`] to avoid
+/// reusing a dead editor tab. Falls back to `false` on any I/O or parsing error — a tab whose
+/// liveness can't be verified is treated as dead, and a fresh tab is created instead.
+async fn editor_tab_is_alive(herdr_bin: &str, tab_id: &plugin::herdr_cli::TabId) -> bool {
+    let panes_json = match plugin::herdr_cli::pane_list(herdr_bin).await {
+        Ok(json) => json,
+        Err(err) => {
+            tracing::debug!(
+                "couldn't list panes to check liveness of existing '{}' tab ({err}) — assuming \
+                 dead",
+                plugin::editor::EDITOR_AGENT_NAME
+            );
+            return false;
+        }
+    };
+
+    let pane_id = match plugin::herdr_cli::find_root_pane_for_tab(&panes_json, tab_id) {
+        Some(pane_id) => pane_id,
+        None => {
+            tracing::debug!(
+                "couldn't find root pane for existing '{}' tab — assuming dead",
+                plugin::editor::EDITOR_AGENT_NAME
+            );
+            return false;
+        }
+    };
+
+    match plugin::herdr_cli::pane_process_info(herdr_bin, &pane_id).await {
+        Ok(info) => plugin::herdr_cli::is_pane_alive(&info),
+        Err(err) => {
+            tracing::debug!(
+                "couldn't read process info for existing '{}' tab ({err}) — assuming dead",
+                plugin::editor::EDITOR_AGENT_NAME
+            );
+            false
+        }
+    }
+}
+
 /// Runs `editor_cmd` on `config_path` inside a herdr pane, for the `c` keybinding: reuses an
-/// already-open editor pane if a previous `c` press created one ([`plugin::herdr_cli::agent_focus`]
-/// on [`plugin::editor::EDITOR_AGENT_NAME`]), otherwise opens a fresh tab for it
-/// ([`plugin::herdr_cli::tab_create`] + [`plugin::herdr_cli::agent_start`], closing the tab's
-/// now-redundant root pane exactly like [`implement_one`] does). The pane/tab/agent name is
-/// always [`plugin::editor::EDITOR_AGENT_NAME`] — deliberately global, not derived from repo or
-/// issue; see that constant's own doc for why a single shared pane across every herdr-linear
-/// instance is correct here, unlike `implement_one`'s per-issue names. A cleanup `pane_close`
-/// failure is logged but never turned into an `Err` — the editor itself already opened
-/// successfully in `started`'s pane by that point, and reporting failure here would make the
-/// caller fall back to the OS opener and open the file a second time.
+/// already-open editor tab from a previous `c` press if a `herdr tab list` label lookup
+/// ([`plugin::herdr_cli::find_existing_editor_tab`]) finds one *and* [`editor_tab_is_alive`]
+/// confirms the editor process is still running, switching to it via
+/// [`plugin::herdr_cli::tab_focus`]; otherwise opens a fresh tab and types the editor command
+/// into its root pane via [`plugin::herdr_cli::tab_create`] + [`plugin::herdr_cli::pane_run`].
+/// The tab label is always [`plugin::editor::EDITOR_AGENT_NAME`] — deliberately global, not
+/// derived from repo or issue; see that constant's own doc for why a single shared tab across
+/// every herdr-linear instance is correct here, unlike `implement_one`'s per-issue names.
 ///
-/// `agent_start`'s `Err` is treated as [`HerdrPaneError::Ambiguous`], not a plain failure: per
-/// `implement_one`'s doc on the same `herdr_cli` call, a timed-out `run_with_timeout` (no
+/// `nvim` can never become a herdr-recognized "agent" — it isn't in herdr's fixed `--kind` enum,
+/// and herdr only auto-detects/tracks recognized coding-agent binaries (verified live against
+/// herdr 0.8.0, TF-624) — so the old `agent focus`/`agent start` reuse-and-launch model is
+/// unusable for it; a tab-label lookup plus a plain `pane run` is the only mechanism that still
+/// works for an arbitrary editor command. The editor therefore runs directly in the tab's own
+/// root pane — exactly like `implement_one`'s agent does — so, unlike the pre-TF-624
+/// implementation, there is no separate agent pane split in alongside it and no redundant root
+/// pane to close afterward.
+///
+/// `pane_run`'s `Err` is treated as [`HerdrPaneError::Ambiguous`], not a plain failure: per
+/// `implement_one`'s doc on the same `herdr_cli` call pattern, a timed-out `run_with_timeout` (no
 /// `kill_on_drop` on the underlying subprocess) doesn't mean the editor never started — it may
 /// well be up in the tab that was just created. Reporting this as `Unavailable` would make
 /// [`open_config_editor`] fall back to the OS opener, opening `config.toml` a second time
@@ -677,11 +695,33 @@ async fn open_config_in_herdr_pane(
     editor_cmd: &str,
     config_path: &std::path::Path,
 ) -> std::result::Result<(), HerdrPaneError> {
-    match plugin::herdr_cli::agent_focus(herdr_bin, plugin::editor::EDITOR_AGENT_NAME).await {
-        Ok(()) => return Ok(()),
+    // Reuse an already-open editor tab from a previous `c` press, if any — see this function's
+    // own doc for why a tab-label lookup is the only reuse mechanism that still works for `nvim`.
+    // Guard against reusing a dead tab: a tab with the right label but no running editor process
+    // (e.g. the user quit nvim inside it) would otherwise strand the user on an empty shell pane.
+    match plugin::herdr_cli::tab_list(herdr_bin).await {
+        Ok(json) => {
+            if let Some(tab_id) = plugin::herdr_cli::find_existing_editor_tab(&json) {
+                if editor_tab_is_alive(herdr_bin, &tab_id).await {
+                    return plugin::herdr_cli::tab_focus(herdr_bin, &tab_id)
+                        .await
+                        .map_err(|err| {
+                            HerdrPaneError::Unavailable(format!(
+                                "found an existing '{}' tab but failed to focus it: {err}",
+                                plugin::editor::EDITOR_AGENT_NAME
+                            ))
+                        });
+                }
+                tracing::debug!(
+                    "existing '{}' tab has no running editor process — creating a new tab",
+                    plugin::editor::EDITOR_AGENT_NAME
+                );
+            }
+        }
         Err(err) => {
             tracing::debug!(
-                "no existing '{}' pane to focus ({err}) — creating a new tab",
+                "couldn't list tabs to check for an existing '{}' pane ({err}) — creating a new \
+                 tab",
                 plugin::editor::EDITOR_AGENT_NAME
             );
         }
@@ -691,41 +731,29 @@ async fn open_config_in_herdr_pane(
         .parent()
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(plugin::host::resolve_cwd);
-    let argv = plugin::editor::build_editor_argv(editor_cmd, config_path);
+    let command = plugin::editor::build_editor_command(editor_cmd, config_path);
 
     let created_tab =
         plugin::herdr_cli::tab_create(herdr_bin, &cwd, plugin::editor::EDITOR_AGENT_NAME)
             .await
             .map_err(|err| HerdrPaneError::Unavailable(format!("failed to create a tab: {err}")))?;
 
-    let started = match plugin::herdr_cli::agent_start(
-        herdr_bin,
-        plugin::editor::EDITOR_AGENT_NAME,
-        &cwd,
-        &created_tab.tab_id,
-        &argv,
-    )
-    .await
-    {
-        Ok(started) => started,
-        Err(err) => {
-            return Err(HerdrPaneError::Ambiguous(format!(
-                "tab created but the editor-start call failed ({err}) — check the '{}' tab: it \
+    // A `pane_run` `Err` doesn't necessarily mean the editor never launched — the same
+    // `run_with_timeout`-without-`kill_on_drop` caveat `implement_one`'s own `pane_run` call
+    // documents applies here too (a client-side timeout on a `herdr` call that's still running
+    // in the background).
+    // Report `Ambiguous`, not `Unavailable`, so the caller doesn't fall back to the OS opener and
+    // risk opening the file a second time.
+    plugin::herdr_cli::pane_run(herdr_bin, &created_tab.root_pane_id, &command)
+        .await
+        .map_err(|err| {
+            HerdrPaneError::Ambiguous(format!(
+                "tab created but launching the editor failed ({err}) — check the '{}' tab: it \
                  may be empty (safe to close) or the editor may have started anyway despite the \
                  error, so verify before closing it",
                 plugin::editor::EDITOR_AGENT_NAME
-            )));
-        }
-    };
-
-    if started.pane_id != created_tab.root_pane_id {
-        if let Err(err) = plugin::herdr_cli::pane_close(herdr_bin, &created_tab.root_pane_id).await
-        {
-            tracing::warn!("failed to close the config tab's redundant empty pane: {err}");
-        }
-    }
-
-    Ok(())
+            ))
+        })
 }
 
 /// Resolves which editor `c` should use from the real environment: `config.toml`'s `editor`
@@ -883,7 +911,7 @@ fn summarize_many(
 /// Runs [`implement_one`] for every issue in `issues` under the same already-resolved `command`,
 /// concurrently, via [`herdr_linear::LinearClient::execute_batch`] (TF-622) — each issue gets its
 /// own herdr tab/pane (see [`implement_one`]'s per-issue `agent_name`), so the interactive
-/// `herdr agent wait`/`agent send`/`agent read` cycles for different issues don't target the same
+/// `herdr agent wait`/`agent prompt`/`agent read` cycles for different issues don't target the same
 /// pane and are safe to interleave. `execute_batch` is called with `None` concurrency, i.e. its
 /// own default cap (5) — deliberately not surfaced as config here; revisit only if a real need
 /// shows up. Each future owns its `issue` and carries its `identifier` through to the returned
@@ -1032,10 +1060,10 @@ fn is_buffered_quit_key(
 /// (`Action::Implement` / `Action::ImplementMany`) ran, so a buffered `<Enter>` doesn't replay
 /// as a fresh action once we're back to polling. Every step in that flow has its own bound —
 /// `agent_wait`'s own budget (up to 30s plus retry buffer), `get_workflow_states`/
-/// `update_issue`'s 30s HTTP timeout each, `tab_create`/`pane_close`/`agent_send`/`agent_list`
-/// at `DEFAULT_CLI_TIMEOUT` (15s) each, and `agent_start` at up to `DEFAULT_CLI_TIMEOUT` times
-/// `1 + AGENT_START_NAME_TAKEN_MAX_RETRIES` (TF-590's `agent_name_taken` retry loop, ~45s
-/// worst case, not a flat 15s) — but within one issue they're sequential, so the flow as a
+/// `update_issue`'s 30s HTTP timeout each, and `agent_list`/`tab_create`/`pane_run`/
+/// `agent_rename` at `DEFAULT_CLI_TIMEOUT` (15s) each, plus the prompt-send loop's own
+/// `PROMPT_SEND_ATTEMPTS` × `PROMPT_SEND_ATTEMPT_TIMEOUT` ceiling over its
+/// `agent_prompt`/`agent_read` cycles — but within one issue they're sequential, so the flow as a
 /// whole can run well past any single step's bound in the worst case. For `Action::ImplementMany`
 /// this per-issue budget no longer simply multiplies by the marked-issue count: since TF-622,
 /// [`implement_many`] runs issues concurrently through `execute_batch`, bounded to
@@ -1271,24 +1299,34 @@ mod tests {
         (dir, script)
     }
 
-    /// Fake `herdr` script dispatching `agent focus`, `tab create`, `agent start`, and
-    /// `pane close` calls to canned bodies — the four subcommands
-    /// `open_config_in_herdr_pane` can issue. A shorter, purpose-built sibling of
-    /// `write_dispatching_herdr_script` (which also covers `agent wait`, irrelevant here: the
-    /// editor flow never waits on agent status).
+    /// Fake `herdr` script dispatching `tab list`, `tab create`, and `pane run` calls to canned
+    /// bodies — the three subcommands `open_config_in_herdr_pane` can issue after TF-624's
+    /// redesign. `tab focus` is not parameterized: it always succeeds (`{"result":{}}`), since
+    /// none of this fixture's callers need to simulate a `tab focus` failure — the one test that
+    /// reaches it (`..._focuses_an_existing_tab_without_creating_a_new_one`) only needs to prove
+    /// reuse short-circuits `tab create`/`pane run`, not exercise `tab focus`'s own error path.
+    /// `pane list`/`pane process-info` default to "no pane / dead pane" so callers that don't
+    /// expect to reach reuse don't need to supply them.
     fn write_editor_herdr_script(
-        agent_focus: &str,
+        tab_list: &str,
         tab_create: &str,
-        agent_start: &str,
-        pane_close: &str,
+        pane_run: &str,
+        pane_list: Option<&str>,
+        pane_process_info: Option<&str>,
     ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let pane_list = pane_list.unwrap_or(r#"echo '{"result":{"panes":[]}}'; exit 0"#);
+        let pane_process_info = pane_process_info.unwrap_or(
+            r#"echo '{"result":{"process_info":{"shell_pid":1,"foreground_processes":[]}}}'; exit 0"#,
+        );
         write_fake_herdr_script(&format!(
             r#"
 case "$1 $2" in
-  "agent focus") {agent_focus} ;;
+  "tab list") {tab_list} ;;
   "tab create") {tab_create} ;;
-  "agent start") {agent_start} ;;
-  "pane close") {pane_close} ;;
+  "pane run") {pane_run} ;;
+  "tab focus") echo '{{"result":{{}}}}'; exit 0 ;;
+  "pane list") {pane_list} ;;
+  "pane process-info") {pane_process_info} ;;
   *)
     echo '{{"error":{{"message":"unexpected herdr call: $1 $2"}}}}'
     exit 1
@@ -1300,12 +1338,15 @@ esac
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn open_config_in_herdr_pane_focuses_an_existing_pane_without_creating_a_tab() {
+    async fn open_config_in_herdr_pane_focuses_an_existing_tab_without_creating_a_new_one() {
         let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"result":{}}'; exit 0"#,
+            r#"echo '{"result":{"tabs":[{"tab_id":"w1:t2","label":"herdr-linear-config"}]}}'; exit 0"#,
             r#"echo 'tab create should not run'; exit 1"#,
-            r#"echo 'agent start should not run'; exit 1"#,
-            r#"echo 'pane close should not run'; exit 1"#,
+            r#"echo 'pane run should not run'; exit 1"#,
+            Some(r#"echo '{"result":{"panes":[{"pane_id":"w1:p2","tab_id":"w1:t2"}]}}'; exit 0"#),
+            Some(
+                r#"echo '{"result":{"process_info":{"shell_pid":1000,"foreground_processes":[{"pid":2000,"name":"nvim"}]}}}'; exit 0"#,
+            ),
         );
 
         let result = open_config_in_herdr_pane(
@@ -1320,12 +1361,13 @@ esac
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn open_config_in_herdr_pane_creates_a_tab_when_no_pane_exists_yet() {
+    async fn open_config_in_herdr_pane_creates_a_tab_when_no_existing_one_is_found() {
         let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"error":{"code":"agent_not_found","message":"agent target config not found"}}'; exit 1"#,
-            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
-            r#"echo '{"result":{"agent":{"pane_id":"p1","tab_id":"t2"}}}'; exit 0"#,
+            r#"echo '{"result":{"tabs":[]}}'; exit 0"#,
+            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"herdr-linear-config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
             r#"echo '{"result":{}}'; exit 0"#,
+            None,
+            None,
         );
 
         let result = open_config_in_herdr_pane(
@@ -1340,31 +1382,52 @@ esac
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn open_config_in_herdr_pane_threads_the_agent_name_editor_cmd_and_cwd_into_the_cli_calls(
-    ) {
+    async fn open_config_in_herdr_pane_creates_a_new_tab_when_the_existing_editor_tab_is_dead() {
+        // The tab exists with the right label, but the editor process has exited and the pane
+        // is back at the shell prompt. Reusing it via `tab focus` would strand the user on a
+        // dead pane, so we must create a fresh tab instead.
+        let (_dir, script) = write_editor_herdr_script(
+            r#"echo '{"result":{"tabs":[{"tab_id":"w1:t2","label":"herdr-linear-config"}]}}'; exit 0"#,
+            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"herdr-linear-config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
+            r#"echo '{"result":{}}'; exit 0"#,
+            Some(r#"echo '{"result":{"panes":[{"pane_id":"w1:p2","tab_id":"w1:t2"}]}}'; exit 0"#),
+            Some(
+                r#"echo '{"result":{"process_info":{"shell_pid":1000,"foreground_processes":[{"pid":1000,"name":"zsh"}]}}}'; exit 0"#,
+            ),
+        );
+
+        let result = open_config_in_herdr_pane(
+            script.to_str().unwrap(),
+            "nvim",
+            std::path::Path::new("/fake/config/dir/config.toml"),
+        )
+        .await;
+
+        assert_eq!(result, Ok(()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_config_in_herdr_pane_threads_the_editor_cmd_and_cwd_into_the_cli_calls() {
         // `write_editor_herdr_script`'s tests above only prove the right subcommand runs in the
         // right order — none of them inspect the argv beyond `$1 $2`. A regression that hardcoded
-        // the wrong editor, reused a stale pane name, or dropped/swapped `cwd`/`config_path`
-        // would pass every one of them. This captures every call's full argv instead.
+        // the wrong editor, dropped/swapped `cwd`/`config_path`, or built the wrong shell-quoted
+        // command would pass every one of them. This captures every call's full argv instead.
         let capture_dir = tempfile::tempdir().unwrap();
         let args_file = capture_dir.path().join("args.txt");
         let (_dir, script) = write_fake_herdr_script(&format!(
             r#"
 printf 'CALL: %s\n' "$*" >> "{args_file}"
 case "$1 $2" in
-  "agent focus")
-    echo '{{"error":{{"code":"agent_not_found","message":"agent target config not found"}}}}'
-    exit 1
+  "tab list")
+    echo '{{"result":{{"tabs":[]}}}}'
+    exit 0
     ;;
   "tab create")
     echo '{{"result":{{"tab":{{"tab_id":"t2","label":"herdr-linear-config"}},"root_pane":{{"pane_id":"p9"}}}}}}'
     exit 0
     ;;
-  "agent start")
-    echo '{{"result":{{"agent":{{"pane_id":"p1","tab_id":"t2"}}}}}}'
-    exit 0
-    ;;
-  "pane close")
+  "pane run")
     echo '{{"result":{{}}}}'
     exit 0
     ;;
@@ -1385,83 +1448,46 @@ esac
         let captured = std::fs::read_to_string(&args_file).unwrap();
         assert_eq!(
             captured,
-            "CALL: agent focus herdr-linear-config\n\
+            "CALL: tab list\n\
              CALL: tab create --cwd /fake/config/dir --label herdr-linear-config --focus\n\
-             CALL: agent start herdr-linear-config --cwd /fake/config/dir --tab t2 --focus -- nvim /fake/config/dir/config.toml\n\
-             CALL: pane close p9\n",
+             CALL: pane run p9 'nvim' '/fake/config/dir/config.toml'\n",
             "unexpected sequence of herdr CLI calls: {captured}"
         );
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn open_config_in_herdr_pane_succeeds_even_when_cleanup_pane_close_fails() {
-        // The editor already opened successfully in `started`'s pane by the time `pane_close`
-        // runs — a leftover empty pane is cosmetic, not a reason to report failure (which would
-        // make the caller fall back to `open::that` and open the file a second time).
+    async fn open_config_in_herdr_pane_treats_an_unlistable_tabs_call_as_no_existing_tab() {
+        // `tab list` failing outright (rather than succeeding with an empty/non-matching list)
+        // must fall through to creating a fresh tab, not bubble up as a hard failure.
         let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"error":{"message":"agent target config not found"}}'; exit 1"#,
-            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
-            r#"echo '{"result":{"agent":{"pane_id":"p1","tab_id":"t2"}}}'; exit 0"#,
-            r#"echo '{"error":{"message":"no such pane"}}'; exit 1"#,
-        );
-
-        let result = open_config_in_herdr_pane(
-            script.to_str().unwrap(),
-            "nvim",
-            std::path::Path::new("/fake/config/dir/config.toml"),
-        )
-        .await;
-
-        assert_eq!(result, Ok(()));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn open_config_in_herdr_pane_does_not_close_a_pane_when_agent_replaced_the_root_pane() {
-        // `agent_start`'s pane id equals the tab's root pane id here (herdr replaced rather
-        // than split) — `pane close` must not run at all. A marker file (rather than just a
-        // loudly-failing script) proves this: `pane_close` failures are unconditionally
-        // swallowed into `tracing::warn!` elsewhere in this function (see the sibling test
-        // `..._succeeds_even_when_cleanup_pane_close_fails`), so "the script failed" and "the
-        // script never ran" are indistinguishable from `result` alone — both yield `Ok(())`.
-        // A separate tempdir (rather than the herdr script's own) sidesteps the
-        // chicken-and-egg problem of needing the marker path before `write_editor_herdr_script`
-        // (which owns and returns the script's tempdir) has run.
-        let marker_dir = tempfile::tempdir().unwrap();
-        let marker_path = marker_dir.path().join("pane_close_was_called");
-        let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"error":{"message":"agent target config not found"}}'; exit 1"#,
-            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
-            r#"echo '{"result":{"agent":{"pane_id":"p9","tab_id":"t2"}}}'; exit 0"#,
-            &format!(
-                r#"touch "{}"; echo 'pane close should not run'; exit 1"#,
-                marker_path.to_str().unwrap()
-            ),
-        );
-
-        let result = open_config_in_herdr_pane(
-            script.to_str().unwrap(),
-            "nvim",
-            std::path::Path::new("/fake/config/dir/config.toml"),
-        )
-        .await;
-
-        assert_eq!(result, Ok(()));
-        assert!(
-            !marker_path.exists(),
-            "pane_close must not run when agent_start's pane replaced the tab's root pane"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn open_config_in_herdr_pane_fails_when_tab_create_fails_after_a_focus_miss() {
-        let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"error":{"message":"agent target config not found"}}'; exit 1"#,
             r#"echo '{"error":{"message":"no such workspace"}}'; exit 1"#,
-            r#"echo 'agent start should not run'; exit 1"#,
-            r#"echo 'pane close should not run'; exit 1"#,
+            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"herdr-linear-config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
+            r#"echo '{"result":{}}'; exit 0"#,
+            None,
+            None,
+        );
+
+        let result = open_config_in_herdr_pane(
+            script.to_str().unwrap(),
+            "nvim",
+            std::path::Path::new("/fake/config/dir/config.toml"),
+        )
+        .await;
+
+        assert_eq!(result, Ok(()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_config_in_herdr_pane_fails_when_tab_create_fails_after_no_existing_tab_is_found()
+    {
+        let (_dir, script) = write_editor_herdr_script(
+            r#"echo '{"result":{"tabs":[]}}'; exit 0"#,
+            r#"echo '{"error":{"message":"no such workspace"}}'; exit 1"#,
+            r#"echo 'pane run should not run'; exit 1"#,
+            None,
+            None,
         );
 
         let result = open_config_in_herdr_pane(
@@ -1482,17 +1508,17 @@ esac
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn open_config_in_herdr_pane_returns_ambiguous_when_agent_start_fails_after_a_focus_miss()
-    {
-        // `agent_start`'s `Err` doesn't mean the editor never started (see this function's own
-        // doc on `run_with_timeout`'s lack of `kill_on_drop`) — so this must be reported as
+    async fn open_config_in_herdr_pane_returns_ambiguous_when_pane_run_fails_after_tab_create() {
+        // `pane_run`'s `Err` doesn't mean the editor never launched (see this function's own doc
+        // on `run_with_timeout`'s lack of `kill_on_drop`) — so this must be reported as
         // `Ambiguous`, not `Unavailable`, or the caller would fall back to the OS opener and risk
         // opening the file a second time.
         let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"error":{"message":"agent target config not found"}}'; exit 1"#,
-            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
-            r#"echo '{"error":{"message":"no such tab"}}'; exit 1"#,
-            r#"echo 'pane close should not run'; exit 1"#,
+            r#"echo '{"result":{"tabs":[]}}'; exit 0"#,
+            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"herdr-linear-config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
+            r#"echo '{"error":{"message":"no such pane"}}'; exit 1"#,
+            None,
+            None,
         );
 
         let result = open_config_in_herdr_pane(
@@ -1506,7 +1532,7 @@ esac
             panic!("expected Err(Ambiguous), got {result:?}");
         };
         assert!(
-            message.contains("no such tab")
+            message.contains("no such pane")
                 && message.contains("check the")
                 && message.contains(plugin::editor::EDITOR_AGENT_NAME),
             "unexpected message: {message}"
@@ -1539,10 +1565,13 @@ esac
     #[tokio::test]
     async fn open_config_editor_does_not_call_the_opener_when_the_herdr_pane_succeeds() {
         let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"result":{}}'; exit 0"#,
+            r#"echo '{"result":{"tabs":[{"tab_id":"w1:t2","label":"herdr-linear-config"}]}}'; exit 0"#,
             r#"echo 'tab create should not run'; exit 1"#,
-            r#"echo 'agent start should not run'; exit 1"#,
-            r#"echo 'pane close should not run'; exit 1"#,
+            r#"echo 'pane run should not run'; exit 1"#,
+            Some(r#"echo '{"result":{"panes":[{"pane_id":"w1:p2","tab_id":"w1:t2"}]}}'; exit 0"#),
+            Some(
+                r#"echo '{"result":{"process_info":{"shell_pid":1000,"foreground_processes":[{"pid":2000,"name":"nvim"}]}}}'; exit 0"#,
+            ),
         );
         let opener_calls = std::cell::RefCell::new(Vec::new());
 
@@ -1568,10 +1597,11 @@ esac
     #[tokio::test]
     async fn open_config_editor_falls_back_to_the_opener_when_the_herdr_pane_path_fails() {
         let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"error":{"message":"agent target config not found"}}'; exit 1"#,
+            r#"echo '{"result":{"tabs":[]}}'; exit 0"#,
             r#"echo '{"error":{"message":"no such workspace"}}'; exit 1"#,
-            r#"echo 'agent start should not run'; exit 1"#,
-            r#"echo 'pane close should not run'; exit 1"#,
+            r#"echo 'pane run should not run'; exit 1"#,
+            None,
+            None,
         );
         let opener_calls = std::cell::RefCell::new(Vec::new());
 
@@ -1595,15 +1625,16 @@ esac
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn open_config_editor_does_not_fall_back_when_agent_start_ambiguously_fails() {
+    async fn open_config_editor_does_not_fall_back_when_pane_run_ambiguously_fails() {
         // Unlike the `tab_create`-fails case above (nothing was created, safe to fall back),
-        // an `agent_start` failure after a tab was already created is ambiguous — falling back
+        // a `pane_run` failure after a tab was already created is ambiguous — falling back
         // to the opener here would risk opening the file a second time. The opener must not run.
         let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"error":{"message":"agent target config not found"}}'; exit 1"#,
-            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
-            r#"echo '{"error":{"message":"no such tab"}}'; exit 1"#,
-            r#"echo 'pane close should not run'; exit 1"#,
+            r#"echo '{"result":{"tabs":[]}}'; exit 0"#,
+            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"herdr-linear-config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
+            r#"echo '{"error":{"message":"no such pane"}}'; exit 1"#,
+            None,
+            None,
         );
         let opener_calls = std::cell::RefCell::new(Vec::new());
 
@@ -1627,7 +1658,7 @@ esac
         );
         assert!(
             opener_calls.into_inner().is_empty(),
-            "opener must not run on an ambiguous agent_start failure — it could open the file twice"
+            "opener must not run on an ambiguous pane_run failure — it could open the file twice"
         );
     }
 
@@ -1635,10 +1666,11 @@ esac
     #[tokio::test]
     async fn open_config_editor_fails_when_both_the_herdr_pane_and_the_opener_fail() {
         let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"error":{"message":"agent target config not found"}}'; exit 1"#,
+            r#"echo '{"result":{"tabs":[]}}'; exit 0"#,
             r#"echo '{"error":{"message":"no such workspace"}}'; exit 1"#,
-            r#"echo 'agent start should not run'; exit 1"#,
-            r#"echo 'pane close should not run'; exit 1"#,
+            r#"echo 'pane run should not run'; exit 1"#,
+            None,
+            None,
         );
 
         let result = open_config_editor(
@@ -2051,21 +2083,30 @@ exit 1
     }
 
     /// A `herdr` fake script that dispatches on `$1 $2` so [`implement_one`]'s whole
-    /// `tab_create` → `agent_start` → `pane_close` → `agent_wait` sequence can be driven from a
-    /// single process, each branch supplying its own canned `echo '{...}'; exit N`.
+    /// `tab_create` → `pane_run` → `agent_wait` → `agent_rename` → `agent_prompt` sequence can be
+    /// driven from a single process, each branch supplying its own canned `echo '{...}'; exit N`.
+    /// `agent prompt` always succeeds and `agent read` always reports the implement prompt for
+    /// `TF-579` (every caller's `sample_issue` identifier) as already landed — not the empty text
+    /// a genuinely-idle pane would start with — so a test whose script lets the flow run past
+    /// `agent_rename` (i.e. `agent_wait` succeeds) reaches [`send_prompt_until_visible`]'s real
+    /// stability poll and completes in just over its 2s stability window instead of burning
+    /// through all [`PROMPT_SEND_ATTEMPTS`] × [`PROMPT_SEND_ATTEMPT_TIMEOUT`] waiting for text
+    /// that would never arrive.
     fn write_dispatching_herdr_script(
         tab_create: &str,
-        agent_start: &str,
-        pane_close: &str,
+        pane_run: &str,
         agent_wait: &str,
+        agent_rename: &str,
     ) -> (tempfile::TempDir, std::path::PathBuf) {
         write_fake_herdr_script(&format!(
             r#"
 case "$1 $2" in
   "tab create") {tab_create} ;;
-  "agent start") {agent_start} ;;
-  "pane close") {pane_close} ;;
+  "pane run") {pane_run} ;;
   "agent wait") {agent_wait} ;;
+  "agent rename") {agent_rename} ;;
+  "agent prompt") echo '{{"result":{{}}}}'; exit 0 ;;
+  "agent read") echo 'Implement Linear Issue TF-579 using a new git worktree'; exit 0 ;;
   *)
     echo '{{"error":{{"message":"unexpected herdr call: $1 $2"}}}}'
     exit 1
@@ -2077,9 +2118,9 @@ esac
 
     /// A sibling of [`write_dispatching_herdr_script`] (TF-619) exposing `tab create` (so a real
     /// [`plugin::herdr_cli::PaneId`] can be minted the same way production code always does — the
-    /// type has no public constructor of its own) plus `agent send`/`agent read`, so
+    /// type has no public constructor of its own) plus `agent prompt`/`agent read`, so
     /// [`send_prompt_until_visible`]/[`wait_for_prompt_stable`] can be driven directly without
-    /// also having to script `agent_start`/`pane_close`/`agent_wait`. `agent send` always
+    /// also having to script `pane_run`/`agent_wait`/`agent_rename`. `agent prompt` always
     /// succeeds (its own failure path is exercised elsewhere); each `agent read` call returns the
     /// next entry from `read_responses` in order, then sticks on the last entry once exhausted —
     /// so a short list can script "landed, landed, reverted-to-empty, landed-and-stays-that-way"
@@ -2097,7 +2138,7 @@ case "$1 $2" in
     echo '{{"result":{{"tab":{{"tab_id":"t1","label":"TF-579"}},"root_pane":{{"pane_id":"p1"}}}}}}'
     exit 0
     ;;
-  "agent send") echo '{{"result":{{}}}}'; exit 0 ;;
+  "agent prompt") echo '{{"result":{{}}}}'; exit 0 ;;
   "agent read")
     script_dir=$(dirname "$0")
     count_file="$script_dir/read_count"
@@ -2106,7 +2147,7 @@ case "$1 $2" in
     idx=$n
     if [ "$idx" -gt {last} ]; then idx={last}; fi
     echo $((n + 1)) > "$count_file"
-    cat "$script_dir/response_${{idx}}.json"
+    cat "$script_dir/response_${{idx}}.txt"
     exit 0
     ;;
   *)
@@ -2118,8 +2159,8 @@ esac
         ));
 
         for (i, text) in read_responses.iter().enumerate() {
-            let body = json!({"result": {"read": {"text": text}}}).to_string();
-            std::fs::write(dir.path().join(format!("response_{i}.json")), body).unwrap();
+            // herdr >= 0.8.0's `agent read` prints raw terminal text, not a JSON envelope (TF-624).
+            std::fs::write(dir.path().join(format!("response_{i}.txt")), text).unwrap();
         }
 
         (dir, script)
@@ -2140,7 +2181,7 @@ esac
     /// [`write_prompt_send_read_sequence_script`]'s per-*read* counter would be flaky: how many
     /// `agent read` polls a given attempt takes before timing out varies with real subprocess
     /// spawn latency, so there's no reliable read-count boundary to plant a landed/empty switch
-    /// on. This script instead switches on how many `agent send` calls have happened — i.e. which
+    /// on. This script instead switches on how many `agent prompt` calls have happened — i.e. which
     /// *attempt* is in flight — so every read within an attempt gets the same answer regardless
     /// of how many polls that attempt actually takes: attempts before `lands_on_attempt` always
     /// read `empty_text`, and attempt `lands_on_attempt` onward always reads `landed_text`.
@@ -2156,7 +2197,7 @@ case "$1 $2" in
     echo '{{"result":{{"tab":{{"tab_id":"t1","label":"TF-579"}},"root_pane":{{"pane_id":"p1"}}}}}}'
     exit 0
     ;;
-  "agent send")
+  "agent prompt")
     script_dir=$(dirname "$0")
     count_file="$script_dir/send_count"
     n=0
@@ -2171,9 +2212,9 @@ case "$1 $2" in
     n=0
     [ -f "$count_file" ] && n=$(cat "$count_file")
     if [ "$n" -ge {lands_on_attempt} ]; then
-      cat "$script_dir/landed.json"
+      cat "$script_dir/landed.txt"
     else
-      cat "$script_dir/empty.json"
+      cat "$script_dir/empty.txt"
     fi
     exit 0
     ;;
@@ -2185,16 +2226,9 @@ esac
 "#
         ));
 
-        std::fs::write(
-            dir.path().join("landed.json"),
-            json!({"result": {"read": {"text": landed_text}}}).to_string(),
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join("empty.json"),
-            json!({"result": {"read": {"text": empty_text}}}).to_string(),
-        )
-        .unwrap();
+        // herdr >= 0.8.0's `agent read` prints raw terminal text, not a JSON envelope (TF-624).
+        std::fs::write(dir.path().join("landed.txt"), landed_text).unwrap();
+        std::fs::write(dir.path().join("empty.txt"), empty_text).unwrap();
 
         (dir, script)
     }
@@ -2212,7 +2246,7 @@ case "$1 $2" in
     echo '{{"result":{{"tab":{{"tab_id":"t1","label":"TF-579"}},"root_pane":{{"pane_id":"p1"}}}}}}'
     exit 0
     ;;
-  "agent send") echo '{{"result":{{}}}}'; exit 0 ;;
+  "agent prompt") echo '{{"result":{{}}}}'; exit 0 ;;
   "agent read") {read_response} ;;
   *)
     echo '{{"error":{{"message":"unexpected herdr call: $1 $2"}}}}'
@@ -2228,9 +2262,9 @@ esac
     async fn implement_one_fails_immediately_when_tab_create_fails() {
         let (_dir, script) = write_dispatching_herdr_script(
             r#"echo '{"error":{"message":"no such workspace"}}'; exit 1"#,
-            r#"echo '{"error":{"message":"agent start should not run"}}'; exit 1"#,
-            r#"echo '{"error":{"message":"pane close should not run"}}'; exit 1"#,
+            r#"echo '{"error":{"message":"pane run should not run"}}'; exit 1"#,
             r#"echo '{"error":{"message":"agent wait should not run"}}'; exit 1"#,
+            r#"echo '{"error":{"message":"agent rename should not run"}}'; exit 1"#,
         );
         let client = herdr_linear::LinearClient::new("lin_api_test_key").unwrap();
         let issue = sample_issue("TF-579");
@@ -2249,16 +2283,16 @@ esac
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn implement_one_reports_a_possibly_orphaned_tab_when_agent_start_fails() {
-        // tab_create succeeds (so a tab now exists), then agent_start fails — the flow must not
-        // claim the tab is definitely empty (agent_start's own failure could be a client-side
-        // timeout with the agent actually running), and it must not attempt pane_close or
-        // agent_wait afterwards.
+    async fn implement_one_reports_a_possibly_orphaned_tab_when_pane_run_fails() {
+        // tab_create succeeds (so a tab now exists), then pane_run fails — the flow must not
+        // claim the tab is definitely empty (pane_run's own failure could be a client-side
+        // timeout with the agent actually running), and it must not attempt agent_wait or
+        // agent_rename afterwards.
         let (_dir, script) = write_dispatching_herdr_script(
             r#"echo '{"result":{"tab":{"tab_id":"t2","label":"TF-579"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
             r#"echo '{"error":{"message":"no such pane"}}'; exit 1"#,
-            r#"echo '{"error":{"message":"pane close should not run"}}'; exit 1"#,
             r#"echo '{"error":{"message":"agent wait should not run"}}'; exit 1"#,
+            r#"echo '{"error":{"message":"agent rename should not run"}}'; exit 1"#,
         );
         let client = herdr_linear::LinearClient::new("lin_api_test_key").unwrap();
         let issue = sample_issue("TF-579");
@@ -2281,12 +2315,11 @@ esac
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn implement_one_records_a_pane_close_failure_as_a_warning_but_continues() {
-        // tab_create and agent_start both succeed with distinct pane ids (root_pane_id != the
-        // agent's own pane_id, i.e. herdr split rather than replaced), so pane_close actually
-        // runs and its failure must be recorded as a warning, not abort the flow — the
-        // subsequent workflow-state lookup and agent_wait calls must still happen and their own
-        // failures must still surface alongside the pane_close warning in one terminal outcome.
+    async fn implement_one_records_an_agent_rename_failure_as_a_warning_but_continues() {
+        // tab_create and pane_run both succeed, and agent_wait succeeds too, so agent_rename
+        // actually runs — its failure must be recorded as a warning, not abort the flow, since
+        // it's best-effort. The workflow-state lookup's own failure must still surface alongside
+        // the agent_rename warning in one terminal outcome.
         let mut server = mockito::Server::new_async().await;
         server
             .mock("POST", "/graphql")
@@ -2305,36 +2338,44 @@ esac
         .unwrap();
         let (_dir, script) = write_dispatching_herdr_script(
             r#"echo '{"result":{"tab":{"tab_id":"t2","label":"TF-579"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
-            r#"echo '{"result":{"agent":{"pane_id":"p1","tab_id":"t2"}}}'; exit 0"#,
-            r#"echo '{"error":{"message":"no such pane"}}'; exit 1"#,
-            r#"echo '{"error":{"message":"agent never went idle"}}'; exit 1"#,
+            r#"echo '{"result":{}}'; exit 0"#,
+            r#"echo '{"result":{}}'; exit 0"#,
+            r#"echo '{"error":{"message":"agent_not_found"}}'; exit 1"#,
         );
         let issue = sample_issue("TF-579");
         let command = plugin::implement::ValidatedAgentCommand::parse("hr".to_string()).unwrap();
 
         let outcome = implement_one(script.to_str().unwrap(), &client, &issue, &command).await;
 
-        let ImplementOutcome::Failed(message) = outcome else {
-            panic!("expected Failed, got {outcome:?}");
+        let ImplementOutcome::StartedWithWarnings(message) = outcome else {
+            panic!("expected StartedWithWarnings, got {outcome:?}");
         };
         assert!(
-            message.contains("failed to close the tab's now-redundant empty pane:")
-                && message.contains("no such pane"),
-            "pane_close failure warning missing: {message}"
+            message.contains("failed to rename the agent pane")
+                && message.contains("agent_not_found"),
+            "agent_rename failure warning missing: {message}"
         );
         assert!(
             message.contains("failed to load workflow states"),
-            "workflow-state warning missing (proves the flow continued past pane_close): {message}"
-        );
-        assert!(
-            message.contains("agent didn't become ready"),
             "unexpected message: {message}"
         );
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn implement_one_adds_no_warning_when_pane_close_succeeds() {
+    async fn implement_one_threads_the_expected_flags_into_every_herdr_cli_call() {
+        // `write_dispatching_herdr_script`'s tests above only prove the right subcommand runs in
+        // the right order — none of them inspect the argv beyond `$1 $2`. A regression that
+        // reverted `agent wait`'s `--until` back to herdr <0.8.0's `--status` (the single most
+        // load-bearing token this branch changed — TF-624), dropped the `--timeout` budget, or
+        // renamed/reordered the wrong pane would pass every one of them while silently breaking
+        // Implement-on-`<Enter>` against real herdr. This captures every call's full argv
+        // instead, exactly like `open_config_in_herdr_pane_threads_the_editor_cmd_and_cwd_into_
+        // the_cli_calls` does for the `c` keybinding.
+        //
+        // The workflow-state lookup is mocked to fail so the flow lands on
+        // `StartedWithWarnings` without a live Linear endpoint — it issues no `herdr` call
+        // either way, so it doesn't affect the captured sequence.
         let mut server = mockito::Server::new_async().await;
         server
             .mock("POST", "/graphql")
@@ -2351,27 +2392,78 @@ esac
             format!("{}/graphql", server.url()),
         )
         .unwrap();
-        let (_dir, script) = write_dispatching_herdr_script(
-            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"TF-579"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
-            r#"echo '{"result":{"agent":{"pane_id":"p1","tab_id":"t2"}}}'; exit 0"#,
-            r#"echo '{"result":{}}'; exit 0"#,
-            r#"echo '{"error":{"message":"agent never went idle"}}'; exit 1"#,
-        );
+
+        let capture_dir = tempfile::tempdir().unwrap();
+        let args_file = capture_dir.path().join("args.txt");
+        let (_dir, script) = write_fake_herdr_script(&format!(
+            r#"
+printf 'CALL: %s\n' "$*" >> "{args_file}"
+case "$1 $2" in
+  "tab create")
+    echo '{{"result":{{"tab":{{"tab_id":"t2","label":"TF-579"}},"root_pane":{{"pane_id":"p9"}}}}}}'
+    exit 0
+    ;;
+  "agent read")
+    echo 'Implement Linear Issue TF-579 using a new git worktree'
+    exit 0
+    ;;
+  "pane run"|"agent wait"|"agent rename"|"agent prompt")
+    echo '{{"result":{{}}}}'
+    exit 0
+    ;;
+  *)
+    echo '{{"error":{{"message":"unexpected herdr call"}}}}'
+    exit 1
+    ;;
+esac
+"#,
+            args_file = args_file.display()
+        ));
         let issue = sample_issue("TF-579");
         let command = plugin::implement::ValidatedAgentCommand::parse("hr".to_string()).unwrap();
 
         let outcome = implement_one(script.to_str().unwrap(), &client, &issue, &command).await;
 
-        let ImplementOutcome::Failed(message) = outcome else {
-            panic!("expected Failed, got {outcome:?}");
+        let ImplementOutcome::StartedWithWarnings(message) = outcome else {
+            panic!("expected StartedWithWarnings, got {outcome:?}");
         };
         assert!(
-            !message.contains("redundant empty pane"),
-            "a successful pane_close must not produce a warning: {message}"
+            message.contains("failed to load workflow states"),
+            "the only warning should be the mocked workflow-state failure: {message}"
+        );
+
+        let captured = std::fs::read_to_string(&args_file).unwrap();
+        let calls: Vec<&str> = captured.lines().collect();
+
+        // `tab create`'s `--cwd` is whatever `plugin::host::resolve_cwd()` reports in the test
+        // process, so match it by shape rather than by an exact path.
+        let tab_create = calls.first().expect("expected at least one herdr call");
+        assert!(
+            tab_create.starts_with("CALL: tab create --cwd ")
+                && tab_create.ends_with(" --label TF-579 --focus"),
+            "unexpected `tab create` invocation: {tab_create}"
+        );
+
+        // Every remaining call, in order, with `agent read`'s repeated stability polls collapsed
+        // (how many of them a run takes depends on real subprocess timing).
+        let rest: Vec<&str> = calls[1..]
+            .iter()
+            .copied()
+            .filter(|call| !call.starts_with("CALL: agent read "))
+            .collect();
+        assert_eq!(
+            rest,
+            vec![
+                "CALL: pane run p9 hr",
+                "CALL: agent wait p9 --until idle --timeout 30000",
+                "CALL: agent rename p9 hr--tf-579",
+                "CALL: agent prompt p9 Implement Linear Issue TF-579 using a new git worktree",
+            ],
+            "unexpected sequence of herdr CLI calls: {captured}"
         );
         assert!(
-            message.contains("failed to load workflow states"),
-            "unexpected message: {message}"
+            calls.contains(&"CALL: agent read p9 --source visible --lines 60"),
+            "expected the prompt-stability poll to read the same pane: {captured}"
         );
     }
 
@@ -2382,19 +2474,19 @@ esac
     /// drives `implement_many` directly with an already-built `command`, bypassing
     /// `resolve_validated_agent_command` (the only caller that would issue `agent list`); the
     /// branch is kept here only so this fake `herdr` would also serve a test that went through
-    /// that path instead. `tab create` sleeps `delay` before succeeding — recording, in
+    /// that path instead. `tab create` sleeps `delay` before failing — recording, in
     /// `<dir>/peaks/<pid>`, how many `tab create` calls were in flight at once when it started —
-    /// and `agent start` then fails immediately, echoing the requested agent name (`$3`) back in
-    /// its error message so a caller can verify each `ImplementOutcome::Failed` stayed paired with
-    /// the issue it actually belongs to, not just any issue sharing the same generic failure text.
-    /// This makes `implement_one` return `Failed` right after `tab create` without ever reaching
-    /// `get_workflow_states`/`update_issue`/`agent_wait`/the prompt-stability poll (TF-579's ~2s
-    /// floor — see `PROMPT_SEND_STABILITY_DURATION`), keeping the probe fast and its timing signal
-    /// attributable to `tab create`'s concurrency alone. The "in flight" count comes from each
-    /// invocation creating a uniquely-named file (`$$`, its own PID) under `<dir>/inflight` before
-    /// sleeping and removing it after — no cross-process locking needed, since every writer only
-    /// ever touches its own file; `peak_concurrency` below then takes the max over every recorded
-    /// snapshot once the whole batch has finished.
+    /// echoing the requested tab label (`$6`, i.e. `--label`'s value) back in its error message so
+    /// a caller can verify each `ImplementOutcome::Failed` stayed paired with the issue it
+    /// actually belongs to, not just any issue sharing the same generic failure text. This makes
+    /// `implement_one` return `Failed` right at `tab create` without ever reaching `pane_run`/
+    /// `get_workflow_states`/`update_issue`/`agent_wait`/`agent_rename`/the prompt-stability poll
+    /// (TF-579's ~2s floor — see `PROMPT_SEND_STABILITY_DURATION`), keeping the probe fast and its
+    /// timing signal attributable to `tab create`'s concurrency alone. The "in flight" count comes
+    /// from each invocation creating a uniquely-named file (`$$`, its own PID) under
+    /// `<dir>/inflight` before sleeping and removing it after — no cross-process locking needed,
+    /// since every writer only ever touches its own file; `peak_concurrency` below then takes the
+    /// max over every recorded snapshot once the whole batch has finished.
     #[cfg(unix)]
     fn write_batch_concurrency_probe_script(
         delay: std::time::Duration,
@@ -2413,11 +2505,7 @@ esac
     echo "$count" > "$script_dir/peaks/$$"
     sleep {delay_secs}
     rm -f "$script_dir/inflight/$$"
-    echo '{{"result":{{"tab":{{"tab_id":"t1","label":"batch"}},"root_pane":{{"pane_id":"p1"}}}}}}'
-    exit 0
-    ;;
-  "agent start")
-    echo "{{\"error\":{{\"message\":\"agent start intentionally fails for the concurrency probe (name: $3)\"}}}}"
+    echo "{{\"error\":{{\"message\":\"tab create intentionally fails for the concurrency probe (label: $6)\"}}}}"
     exit 1
     ;;
   *)
@@ -2464,12 +2552,12 @@ esac
     /// under load (observed once across a full `cargo test --all-features` run, where real
     /// subprocess-spawn overhead across ~500 tests pushed a run past the window) without ever
     /// catching a real regression — see PR #37 review discussion. Also verifies each returned
-    /// `(identifier, outcome)` pair stayed correctly matched: the fake `agent start` above echoes
-    /// the agent name it was invoked with back into its failure message, and
-    /// [`plugin::implement::build_agent_name`] derives that name from `command` plus the issue's
-    /// own identifier, so a pairing bug (e.g. a future refactor that zips `issues` against
-    /// `execute_batch`'s output by position after either side got reordered) would surface here as
-    /// a mismatched name rather than being masked by every issue sharing one generic message.
+    /// `(identifier, outcome)` pair stayed correctly matched: the fake `tab create` above echoes
+    /// its own `--label` argument (which `implement_one` builds directly from the issue's
+    /// identifier) back into its failure message, so a pairing bug (e.g. a future refactor that
+    /// zips `issues` against `execute_batch`'s output by position after either side got reordered)
+    /// would surface here as a mismatched identifier rather than being masked by every issue
+    /// sharing one generic message.
     #[cfg(unix)]
     #[tokio::test]
     async fn implement_many_runs_issues_concurrently_up_to_the_default_batch_limit() {
@@ -2496,21 +2584,20 @@ esac
         assert_eq!(results.len(), ISSUE_COUNT);
         for (identifier, outcome) in &results {
             let ImplementOutcome::Failed(message) = outcome else {
-                panic!("expected every issue to fail (agent start always fails): {identifier} -> {outcome:?}");
+                panic!("expected every issue to fail (tab create always fails): {identifier} -> {outcome:?}");
             };
             assert!(
-                message.contains("agent start intentionally fails"),
+                message.contains("tab create intentionally fails"),
                 "unexpected failure for {identifier}: {message}"
             );
-            // Pairing check: the fake `agent start` echoed back the name it was actually invoked
-            // with, which is derived from this same `identifier` — if a future change shuffled
-            // identifiers against the wrong outcome, this issue's expected name wouldn't appear
-            // in its own message.
-            let expected_name = plugin::implement::build_agent_name(command.as_str(), identifier);
+            // Pairing check: the fake `tab create` echoed back its own `--label` value, which
+            // `implement_one` sets directly to this same `identifier` — if a future change
+            // shuffled identifiers against the wrong outcome, this issue's own identifier
+            // wouldn't appear in its own message.
             assert!(
-                message.contains(&expected_name),
-                "outcome for {identifier} doesn't carry its own agent name {expected_name:?} — \
-                 got: {message} (identifier/outcome pairing may be broken)"
+                message.contains(identifier),
+                "outcome for {identifier} doesn't carry its own identifier — got: {message} \
+                 (identifier/outcome pairing may be broken)"
             );
         }
 
@@ -2651,9 +2738,7 @@ esac
         // Review gap: the `ever_landed == false` branch of the `TimedOut` message had no direct
         // test — only the "appeared but then disappeared" branch did.
         let prompt = plugin::implement::build_implement_prompt("TF-579");
-        let (dir, script) = write_prompt_read_always_script(
-            r#"echo '{"result":{"read":{"text":"no prompt here"}}}'; exit 0"#,
-        );
+        let (dir, script) = write_prompt_read_always_script(r#"echo 'no prompt here'; exit 0"#);
         let tab = plugin::herdr_cli::tab_create(script.to_str().unwrap(), dir.path(), "TF-579")
             .await
             .expect("stub tab_create must succeed");
@@ -2682,7 +2767,7 @@ esac
         // as just another "not landed" poll.
         let prompt = plugin::implement::build_implement_prompt("TF-579");
         let (dir, script) = write_prompt_read_always_script(
-            r#"echo '{"error":{"message":"pane closed"}}'; exit 1"#,
+            r#"echo '{"error":{"message":"pane closed"}}' >&2; exit 1"#,
         );
         let tab = plugin::herdr_cli::tab_create(script.to_str().unwrap(), dir.path(), "TF-579")
             .await
@@ -2711,7 +2796,7 @@ esac
     async fn send_prompt_until_visible_resends_after_an_attempt_times_out() {
         // Review gap: send_prompt_until_visible's cross-attempt retry logic (does a timed-out
         // attempt actually trigger a resend, and can a later attempt succeed?) had no test at
-        // all. `write_prompt_send_lands_on_attempt_script` switches on the `agent send` count
+        // all. `write_prompt_send_lands_on_attempt_script` switches on the `agent prompt` count
         // rather than the `agent read` count so this isn't sensitive to how many polls either
         // attempt actually takes.
         let prompt = plugin::implement::build_implement_prompt("TF-579");

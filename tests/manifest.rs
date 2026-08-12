@@ -92,7 +92,7 @@ fn unix_actions_and_build_step_are_unchanged_by_id() {
 #[test]
 fn min_herdr_version_is_unchanged() {
     let m = manifest();
-    assert!(m.contains(r#"min_herdr_version = "0.7.0""#));
+    assert!(m.contains(r#"min_herdr_version = "0.8.0""#));
 }
 
 #[test]
