@@ -29,7 +29,7 @@ const MAX_PAGES: u32 = 20;
 
 /// A Linear issue filter matching open (not completed, not canceled) issues assigned to
 /// `user_id`, additionally narrowed by `filter_terms` (TF-615's parsed `priority:`/
-/// `state:`/`label:` terms — see [`merge_filter_terms`]). "Open" is expressed as an
+/// `state:`/`label:` terms — see `merge_filter_terms` below). "Open" is expressed as an
 /// exclusion (`nin`) rather than an allowlist of the non-terminal state types
 /// (`triage`/`backlog`/`unstarted`/`started`), so it can't silently drop issues in a
 /// state type this code doesn't know about — mirrors [`project_open_filter`]. An empty
@@ -79,6 +79,18 @@ pub fn team_open_filter(team_id: &str, filter_terms: &[FilterTerm]) -> Value {
 /// [`assignee_open_filter`]/[`project_open_filter`]/[`team_open_filter`] each document,
 /// and what keeps every existing caller (none of which have a query yet) byte-identical
 /// to pre-TF-616 behavior.
+///
+/// Two terms of the same kind combine only when their fragments touch *different* leaf
+/// keys under a shared object — e.g. `priority:>=2` and `priority:<=4` fold into one
+/// `{"gte":2,"lte":4}` range, since `>=`/`<=` map to distinct comparator keys (see
+/// [`filter_term_fragment`]). When two terms land on the *same* leaf key instead (two
+/// `priority:>=` terms, two `state:` terms, two `label:` terms), the later term wins and
+/// the earlier one is silently dropped — ordinary last-write-wins map-insert semantics.
+/// `query.rs`'s `ParsedQuery::filters` doc left this an open question for TF-616 to
+/// settle; this is the answer, and it's deliberately simple: no attempt is made here to
+/// combine same-key repeats into an `and`/`or` group. If that turns out to be the wrong
+/// UX once TF-617 lets a real query produce repeats, the fix belongs at the query layer
+/// (dedupe or reject repeats before they reach this function), not in this merge.
 fn merge_filter_terms(mut base: Value, filter_terms: &[FilterTerm]) -> Value {
     for term in filter_terms {
         merge_json_object(&mut base, filter_term_fragment(term));
@@ -92,9 +104,11 @@ fn merge_filter_terms(mut base: Value, filter_terms: &[FilterTerm]) -> Value {
 /// `labels.name`): `priority:` maps its [`PriorityOp`] onto Linear's own `eq`/`gte`/
 /// `lte` keys operating on [`crate::plugin::query::Priority`]'s raw `0..=4` scale (see
 /// that module's "Priority ordering" doc for why no translation is needed); `state:`/
-/// `label:` match by exact name via `eq` — Linear resolves the comparison server-side,
-/// so no case-folding happens here, and a case mismatch simply matches nothing, like
-/// any other `eq` filter.
+/// `label:` match by name via `eqIgnoreCase` rather than plain `eq` — the DSL's own
+/// grammar is lowercase-first (`priority:high`, `sort:priority`), so a user typing
+/// `state:done` expects it to match Linear's `"Done"`, not silently match nothing. The
+/// comparison still runs entirely server-side — only the case-folding is delegated to
+/// Linear's API rather than done here.
 fn filter_term_fragment(term: &FilterTerm) -> Value {
     match term {
         FilterTerm::Priority { op, value } => {
@@ -105,8 +119,8 @@ fn filter_term_fragment(term: &FilterTerm) -> Value {
             };
             json!({ "priority": { (comparator): value.value() } })
         }
-        FilterTerm::State(name) => json!({ "state": { "name": { "eq": name } } }),
-        FilterTerm::Label(name) => json!({ "labels": { "name": { "eq": name } } }),
+        FilterTerm::State(name) => json!({ "state": { "name": { "eqIgnoreCase": name } } }),
+        FilterTerm::Label(name) => json!({ "labels": { "name": { "eqIgnoreCase": name } } }),
     }
 }
 
@@ -528,6 +542,49 @@ mod tests {
     }
 
     #[test]
+    fn assignee_open_filter_merges_two_priority_terms_with_different_comparators_into_one_range() {
+        // A query like `priority:>=2 priority:<=3` produces two FilterTerm::Priority
+        // entries — repeated terms of the same kind aren't deduped upstream (see
+        // ParsedQuery::filters' doc in query.rs) — that must combine into a single
+        // range fragment rather than one overwriting the other, since `>=`/`<=` map to
+        // distinct comparator keys under the shared "priority" object.
+        let terms = [
+            FilterTerm::Priority {
+                op: PriorityOp::Ge,
+                value: Priority::new(2).unwrap(),
+            },
+            FilterTerm::Priority {
+                op: PriorityOp::Le,
+                value: Priority::new(3).unwrap(),
+            },
+        ];
+        let filter = assignee_open_filter("user-123", &terms);
+
+        assert_eq!(filter["priority"]["gte"], 2);
+        assert_eq!(filter["priority"]["lte"], 3);
+    }
+
+    #[test]
+    fn assignee_open_filter_second_of_two_same_comparator_priority_terms_silently_wins() {
+        // Unlike the different-comparator case above, two `priority:>=` terms land on
+        // the *same* leaf key ("gte") — documents the deliberate last-write-wins
+        // collision behavior described in merge_filter_terms' doc.
+        let terms = [
+            FilterTerm::Priority {
+                op: PriorityOp::Ge,
+                value: Priority::new(2).unwrap(),
+            },
+            FilterTerm::Priority {
+                op: PriorityOp::Ge,
+                value: Priority::new(4).unwrap(),
+            },
+        ];
+        let filter = assignee_open_filter("user-123", &terms);
+
+        assert_eq!(filter["priority"]["gte"], 4);
+    }
+
+    #[test]
     fn project_open_filter_merges_a_single_state_term_alongside_the_base_state_filter() {
         // The base filter already has a `"state"` key (`type: { nin: [...] }`); a
         // `state:` term must merge its `name` constraint into that same object rather
@@ -539,7 +596,29 @@ mod tests {
             filter["state"]["type"]["nin"],
             json!(["completed", "canceled"])
         );
-        assert_eq!(filter["state"]["name"]["eq"], "In Review");
+        assert_eq!(filter["state"]["name"]["eqIgnoreCase"], "In Review");
+    }
+
+    #[test]
+    fn open_filter_second_of_two_colliding_state_terms_silently_wins() {
+        // Two `state:` terms collide on the same leaf key ("state.name.eqIgnoreCase").
+        // Documents the current last-write-wins behavior of merge_json_object's
+        // non-object-leaf collision branch.
+        let filter = project_open_filter(
+            "project-123",
+            &[
+                FilterTerm::State("Todo".into()),
+                FilterTerm::State("Done".into()),
+            ],
+        );
+
+        assert_eq!(filter["state"]["name"]["eqIgnoreCase"], "Done");
+        // The base filter's own "state.type" constraint must survive the collision on
+        // the sibling "state.name" key — it's a different leaf under the same object.
+        assert_eq!(
+            filter["state"]["type"]["nin"],
+            json!(["completed", "canceled"])
+        );
     }
 
     #[test]
@@ -547,7 +626,20 @@ mod tests {
         let filter = team_open_filter("team-123", &[FilterTerm::Label("urgent-fix".into())]);
 
         assert_eq!(filter["team"]["id"]["eq"], "team-123");
-        assert_eq!(filter["labels"]["name"]["eq"], "urgent-fix");
+        assert_eq!(filter["labels"]["name"]["eqIgnoreCase"], "urgent-fix");
+    }
+
+    #[test]
+    fn open_filter_second_of_two_colliding_label_terms_silently_wins() {
+        let filter = team_open_filter(
+            "team-123",
+            &[
+                FilterTerm::Label("bug".into()),
+                FilterTerm::Label("urgent".into()),
+            ],
+        );
+
+        assert_eq!(filter["labels"]["name"]["eqIgnoreCase"], "urgent");
     }
 
     #[test]
@@ -567,9 +659,52 @@ mod tests {
             filter["state"]["type"]["nin"],
             json!(["completed", "canceled"])
         );
-        assert_eq!(filter["state"]["name"]["eq"], "In Review");
+        assert_eq!(filter["state"]["name"]["eqIgnoreCase"], "In Review");
         assert_eq!(filter["priority"]["gte"], 2);
-        assert_eq!(filter["labels"]["name"]["eq"], "urgent-fix");
+        assert_eq!(filter["labels"]["name"]["eqIgnoreCase"], "urgent-fix");
+    }
+
+    #[test]
+    fn merge_json_object_non_object_patch_is_a_no_op() {
+        let mut target = json!({ "a": 1 });
+        merge_json_object(&mut target, json!("not an object"));
+        assert_eq!(target, json!({ "a": 1 }));
+    }
+
+    #[test]
+    fn merge_json_object_non_object_target_is_a_no_op() {
+        let mut target = json!("scalar target");
+        merge_json_object(&mut target, json!({ "a": 1 }));
+        assert_eq!(target, json!("scalar target"));
+    }
+
+    #[test]
+    fn merge_json_object_patch_object_overwrites_a_non_object_existing_value_at_the_same_key() {
+        // existing["priority"] is a scalar, patch["priority"] is an object — the
+        // `existing.is_object() && patch_value.is_object()` guard fails, so this falls
+        // to the `_` arm and the object wins outright rather than attempting a partial
+        // merge into a non-object.
+        let mut target = json!({ "priority": 5 });
+        merge_json_object(&mut target, json!({ "priority": { "gte": 2 } }));
+        assert_eq!(target, json!({ "priority": { "gte": 2 } }));
+    }
+
+    #[test]
+    fn merge_json_object_recursively_merges_disjoint_keys_under_a_shared_object_key() {
+        let mut target = json!({ "state": { "type": { "nin": ["completed"] } } });
+        merge_json_object(
+            &mut target,
+            json!({ "state": { "name": { "eqIgnoreCase": "Done" } } }),
+        );
+        assert_eq!(
+            target,
+            json!({
+                "state": {
+                    "type": { "nin": ["completed"] },
+                    "name": { "eqIgnoreCase": "Done" }
+                }
+            })
+        );
     }
 
     fn sample_team(id: &str, key: &str, name: &str) -> Team {
