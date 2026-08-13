@@ -423,11 +423,25 @@ Every view's own base filter only ever fetches non-terminal issues, so `state:Do
 `state:Canceled`/`state:Cancelled` never match anything — there's no way to bring a
 completed or canceled issue back into view with a `state:` term.
 
-Set a default for every view with `default_query` in `config.toml`:
+Set a default for every view with `default_query` in `config.toml`. A few worked
+examples, each a single line to paste in as-is:
 
 ```toml
+# Only what actually needs attention, most urgent first — good for a daily-driver view
+# that skips low-priority backlog noise entirely.
 default_query = "priority:>=2 sort:-priority"
+
+# See everything, most recently touched first — no filtering, just a sort default so a
+# freshly-opened view doesn't start in whatever order the API happened to return.
+default_query = "sort:-updated"
+
+# Only issues someone's actively reviewing, oldest first (so the longest-waiting review
+# surfaces at the top).
+default_query = "state:\"In Review\" sort:created"
 ```
+
+(`config.toml` only reads one `default_query` value — these are three alternatives to
+pick from, not something you'd set all at once.)
 
 Filter terms in `default_query` narrow the fetch itself, so an excluded issue is never
 loaded in the first place; `sort:` in `default_query` orders the view as soon as it's
@@ -446,6 +460,31 @@ If a `priority:`/`state:`/`label:`/`sort:` term isn't recognized — a typo like
 free-text search instead of being applied; the currently-active filter's title bar shows
 `(⚠ not recognized: ...)` when that happens, and a `default_query` with the same problem
 shows a status message under the loaded list.
+
+Every key above lives in the one `config.toml`, so a real one ends up with several set at
+once. A minimal setup — just enough to get going, letting everything else fall back to
+its default:
+
+```toml
+api_key = "lin_api_your_key_here"
+default_query = "priority:>=2 sort:-priority"
+```
+
+A more filled-in one — multiple repos overridden to their Linear projects, a specific
+team picked for "Team Issues", a custom editor and agent, and a `default_query` that
+only shows what's actively being worked on:
+
+```toml
+api_key = "lin_api_your_key_here"
+team_id = "linear-team-id"
+editor = "vim"
+agent_command = "hr"
+default_query = "state:\"In Progress\" sort:-updated"
+
+[project_overrides]
+"herdr-linear" = "proj-abc123"
+"some-other-repo" = "proj-def456"
+```
 
 ### Use
 
