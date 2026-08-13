@@ -405,6 +405,20 @@ it, `priority:`/`state:`/`label:` narrow by those fields and `sort:` orders the 
 | `label:bug` | Has a label with this name (case-insensitive) |
 | `sort:priority`, `sort:-updated` | Order by `priority`/`updated`/`created`/`identifier` |
 
+`priority:`/`state:`/`label:`/`sort:` — the *keys* themselves, the `>=`/`<=` operators,
+the priority level names (`urgent`/`high`/…), and the sort field names
+(`priority`/`updated`/…) all have to be typed exactly as shown, lowercase: `Priority:2`,
+`SORT:priority`, and `priority:HIGH` are every bit as unrecognized as a plain typo like
+`prioroty:2`. This matters more than it sounds like it should, because it fails
+*differently* from a bad value on an otherwise-correct key: `priority:2` with a garbage
+*value* (`priority:notanumber`) is a recognized key that still gets flagged — you'll see
+`(⚠ not recognized: ...)` in the filter title, or a status message for `default_query` —
+but a wrong-case *key* like `Priority:2` isn't recognized as a key at all, so it's
+silently treated as two ordinary words of free text instead, with no warning either way.
+Free text itself can also be quoted — `"fix login"` is one search term rather than two —
+which mostly only matters if the phrase has irregular internal whitespace you want
+preserved exactly.
+
 Every view's own base filter only ever fetches non-terminal issues, so `state:Done`/
 `state:Canceled`/`state:Cancelled` never match anything — there's no way to bring a
 completed or canceled issue back into view with a `state:` term.

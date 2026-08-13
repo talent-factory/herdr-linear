@@ -91,11 +91,11 @@ first slice of Phase 2's "Filtering & Search".
       flow, replacing its still-sequential per-issue loop (TF-622)
 - [ ] Performance benchmarks (`criterion`) for pagination, batch execution,
       and rate-limit retry (TF-623)
-- [ ] Query DSL parser: filter terms (`priority:`, `state:`, `label:`) + sort
+- [x] Query DSL parser: filter terms (`priority:`, `state:`, `label:`) + sort
       keys (TF-615)
-- [ ] Wire the parsed filter terms into Linear's `IssueFilter` so filtering
+- [x] Wire the parsed filter terms into Linear's `IssueFilter` so filtering
       happens server-side (TF-616) — depends on TF-615
-- [ ] `config.toml` `default_query` + a DSL-aware `/`-filter, backward
+- [x] `config.toml` `default_query` + a DSL-aware `/`-filter, backward
       compatible with TF-580's plain substring match (TF-617) — depends on
       TF-615 and TF-616
 
