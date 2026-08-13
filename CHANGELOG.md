@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `src/plugin/query.rs` — a hand-rolled parser for the plugin's query DSL: `priority:`/`state:`/`label:` filter terms (with `=`/`>=`/`<=` comparisons and named priority levels) and `sort:field,...` sort keys (with `-` for descending), plus a stable multi-key `sort_issues` helper. Double-quoted values (`state:"In Review"`) support multi-word names. Parsing never errors — unrecognized or malformed terms fall back to free text for the existing substring matcher (TF-580), with recognized-but-malformed terms additionally recorded in `ParsedQuery::rejected` for a future caller to surface as a hint. Not yet wired into the running plugin — server-side filter application is TF-616, `default_query`/`/`-filter integration is TF-617 (TF-615)
+
 ## [0.2.1] - 2026-08-12
 
 ### Added
