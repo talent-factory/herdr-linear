@@ -3078,8 +3078,21 @@ esac
         // Review gap: send_prompt_until_visible's cross-attempt retry logic (does a timed-out
         // attempt actually trigger a resend, and can a later attempt succeed?) had no test at
         // all. `write_prompt_send_lands_on_attempt_script` switches on the `agent prompt` count
-        // rather than the `agent read` count so this isn't sensitive to how many polls either
-        // attempt actually takes.
+        // rather than the `agent read` count so which text a given poll sees isn't sensitive to
+        // how many polls either attempt actually takes.
+        //
+        // The *durations* below still are, though — unlike the other `wait_for_prompt_stable`/
+        // `send_prompt_until_visible_with` tests in this file, this is the one case that needs
+        // attempt 2 to actually *reach* `stability_duration` (not just eventually time out),
+        // which means enough real reads have to land inside `attempt_timeout` — and each read is
+        // a genuine subprocess spawn (`write_fake_herdr_script`'s `sh`), not a free poll. The
+        // original `5ms`/`20ms`/`30ms` gave a real CI runner under load essentially no margin for
+        // that spawn latency: observed flaking in CI (`Test (beta)`, not reproducible locally)
+        // with `attempt 2: ... appeared but then disappeared before it stuck` — the generic
+        // `TimedOut`-with-`ever_landed` message, meaning attempt 2's own reads never accumulated
+        // a full unbroken `stability_duration` before its own `attempt_timeout` cut it off, not
+        // that the prompt actually flickered. Widened with real headroom for subprocess spawn
+        // jitter under load, while staying well under a second overall.
         let prompt = plugin::implement::build_implement_prompt("TF-579");
         let landed = format!("❯ {prompt}\n");
         let empty = "❯ \n";
@@ -3093,9 +3106,9 @@ esac
             &tab.root_pane_id,
             &prompt,
             2,
-            std::time::Duration::from_millis(5),
-            std::time::Duration::from_millis(20),
-            std::time::Duration::from_millis(30),
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(150),
         )
         .await;
 
