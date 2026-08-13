@@ -90,7 +90,7 @@ use std::cmp::Ordering;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct ParsedQuery {
     /// Recognized `priority:`/`state:`/`label:` terms, in the order they appeared, with
-    /// same-leaf-key repeats already resolved (TF-617, see [`push_filter_term`]): a
+    /// same-leaf-key repeats already resolved (TF-617, see `push_filter_term`): a
     /// query may still contain more than one term of the same *kind* — e.g.
     /// `priority:>=2 priority:<=4`, which combine into one range downstream — but two
     /// terms that would land on the very same leaf key once merged into Linear's

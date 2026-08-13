@@ -118,7 +118,7 @@ pub struct FilterState {
 /// byte-identical to `query` for e.g. irregular whitespace) — so nothing about TF-580's
 /// original behavior changes; see the `matching_issue_indices_*` tests below, which this
 /// path keeps passing unmodified (a query wrapped in one pair of double quotes is the one
-/// exception: [`strip_surrounding_quotes`] unwraps it first, so a whole-phrase quoted
+/// exception: `strip_surrounding_quotes` unwraps it first, so a whole-phrase quoted
 /// search behaves the same whether or not the query also happens to contain a `sort:`/
 /// filter term that pushes it onto the DSL path below — see that function's doc). A query
 /// that *does* contain recognized `priority:`/`state:`/`label:` terms additionally
