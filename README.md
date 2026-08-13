@@ -375,8 +375,11 @@ you quit it, so it's usable over SSH (e.g. herdr on an iPad) where there's no GU
 file to, with no extra pane left behind to close afterward. Set `editor` in the same
 `config.toml` to use a different command instead (a bare binary name, no flags — e.g.
 `editor = "vim"`); it's launched the same way. If neither `nvim` nor an `editor` override is
-available, or the editor exits before it can be launched, `c` falls back to your OS's default
-handler for `.toml` files — today's original behavior.
+available, or the editor couldn't be launched at all (e.g. removed from disk at the last
+moment), `c` falls back to your OS's default handler for `.toml` files — today's original
+behavior. Once the editor actually starts, though, `c` no longer falls back on its own — an
+editor that exits with an error is reported as-is rather than silently retried through a second
+opener, since it already had the terminal.
 
 "Team Issues" shows a Linear team's open issues. Unlike a project, a team has no
 repo-derived name to match, so it needs an explicit default: set `team_id` in the same

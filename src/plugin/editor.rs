@@ -53,12 +53,11 @@ fn editor_override_is_usable(editor: &str, path_env: Option<&str>) -> bool {
 /// Implements a three-tier priority:
 /// 1. If `config_editor` is set (from `config.toml`'s `editor` field) *and* it resolves to a
 ///    real binary (this module's private `editor_override_is_usable`), use it. An override that
-///    doesn't resolve is
-///    rejected with a `tracing::warn!` rather than used blindly — using it as-is would spawn a
-///    command already known to fail, silently strand the user in a dead pane (nothing in this
-///    module's `main.rs` callers confirm the launched process actually stays up), and, on the
-///    `c` keybinding's every-later-press tab-reuse check, keep repeating that same silent
-///    no-op indefinitely.
+///    doesn't resolve is rejected with a `tracing::warn!` rather than used blindly — using it
+///    as-is would hand `main.rs`'s `run_editor_in_terminal` a command already known to fail,
+///    which `run_editor_command` would then report as `EditorOutcome::NotLaunched` on every
+///    single `c` press until the override is fixed, instead of just falling straight through to
+///    `nvim`/the OS opener here, once, before the terminal is ever suspended.
 /// 2. Otherwise, if `nvim` is found on `PATH`, use `"nvim"`.
 /// 3. Otherwise, return `None` (caller falls back to OS default opener).
 pub fn resolve_editor_command(

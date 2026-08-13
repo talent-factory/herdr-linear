@@ -701,14 +701,17 @@ async fn implement_one(
     }
 }
 
-/// Outcome of [`run_editor_command`] — the actual "launch the editor and wait for it" attempt.
-/// Distinguishes "never ran" (safe for [`open_config_editor`] to fall back to the OS opener)
-/// from "ran, but exited non-zero" (it already had the terminal, so a fallback next would risk
-/// a second, confusing "open" for a file the user just closed) — mirrors
-/// `herdr-file-viewer`'s own `SpawnError`/`EditorOutcome` split for the identical hand-off.
+/// Outcome of [`run_editor_command`]/[`run_editor_in_terminal_with`] — the actual "launch the
+/// editor and wait for it" attempt. Distinguishes "never ran" (safe for [`open_config_editor`]
+/// to fall back to the OS opener) from "ran, and already had the terminal" (a fallback next
+/// would risk a second, confusing "open" for a file the user just closed) — loosely mirrors
+/// `herdr-file-viewer`'s own `NotLaunched`/`NonZeroExit` distinction for the identical
+/// spawn-and-wait hand-off (that project splits the concern across two types, `SpawnError` at
+/// its `Spawner` layer and a 4-variant `EditorOutcome` at its `EditorHandoff` layer, including a
+/// `TookOver`/`NoTakeover` split this one has no equivalent of — the two aren't a 1:1 match).
 #[derive(Debug, PartialEq, Eq)]
 enum EditorOutcome {
-    /// The editor ran and exited successfully.
+    /// The editor ran, exited successfully, and the terminal was restored afterward.
     Ok,
     /// The editor could not be launched at all — e.g. removed from disk in the gap between
     /// [`resolve_editor_command_from_env`] resolving it and this call. Nothing happened, so
@@ -718,13 +721,26 @@ enum EditorOutcome {
     /// real crash). It already took over the terminal, so the caller must not also try the OS
     /// opener.
     NonZeroExit(String),
+    /// The editor itself ran fine (or already failed to launch/exited non-zero — see
+    /// [`run_editor_in_terminal_with`]), but restoring herdr-linear's own TUI afterward failed.
+    /// Treated like `NonZeroExit` by [`open_config_editor`] (the terminal was already handed
+    /// over, so no OS-opener fallback) but kept as its own variant so the message can point at
+    /// the *terminal*, not the editor, as what needs attention — and, critically, so this
+    /// failure is never silently dropped the way it used to be: previously a `resume_tui`
+    /// failure after a successful edit left `run_editor_in_terminal` returning a bare `Ok`,
+    /// which `open_config_editor`/`open_config_result_status` turn into *clearing* the status
+    /// bar — zero on-screen indication that the terminal might now be broken (PR #46 review).
+    TerminalNotRestored(String),
 }
 
 /// Runs `editor_cmd` on `config_path` as a blocking child process and waits for it to exit, via
 /// the injected `spawn` (`std::process::Command::new(editor_cmd).arg(config_path).status()` in
-/// production — see [`run_editor_in_terminal`]) — kept as a parameter so this stays
+/// production — see [`run_editor_in_terminal_with`]) — kept as a parameter so this stays
 /// unit-testable without really launching anything, the same reason [`open_config_editor`]
-/// takes its own `opener` as a parameter rather than calling `open::that` directly.
+/// takes its own `opener` as a parameter rather than calling `open::that` directly. Never
+/// returns [`EditorOutcome::TerminalNotRestored`] — that variant only exists to report a
+/// terminal-resume failure, which is [`run_editor_in_terminal_with`]'s concern, layered on top
+/// of whatever this function already decided.
 fn run_editor_command(
     editor_cmd: &str,
     config_path: &std::path::Path,
@@ -739,21 +755,91 @@ fn run_editor_command(
 
 /// Leaves raw mode and the alternate screen — and drops mouse capture, which would otherwise
 /// leak raw escape sequences into the editor's own input — so `editor_cmd` gets a clean
-/// terminal to draw into. Mirrors `herdr-file-viewer`'s identical `suspend_tui`. Real terminal
-/// I/O, so — like `run_tui`'s own raw-mode setup — deliberately untested.
+/// terminal to draw into. Real terminal I/O, so — like `run_tui`'s own raw-mode setup —
+/// deliberately untested.
+///
+/// Every step is attempted regardless of whether an earlier one failed — mirrors `run_tui`'s
+/// own teardown discipline (its doc: "Always attempt full teardown, even if an earlier step in
+/// it failed"), which the first cut of this function *didn't* follow (PR #46 review): it used
+/// `?` after the mouse-capture step, so a `disable_raw_mode` failure skipped `LeaveAlternateScreen`
+/// entirely, leaving a worse, more inconsistent partial state than attempting it too would have.
+/// Mouse-capture failure is still swallowed outright (`let _ = ...`), matching `run_tui`'s own
+/// identical treatment of it elsewhere — not every terminal supports mouse reporting, and that's
+/// an accepted, best-effort-only case, unlike raw mode / the alternate screen.
 fn suspend_tui() -> std::io::Result<()> {
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
-    crossterm::terminal::disable_raw_mode()?;
-    crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen)
+    let raw_mode_result = crossterm::terminal::disable_raw_mode();
+    let alt_screen_result =
+        crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+    raw_mode_result.and(alt_screen_result)
 }
 
 /// Re-enters raw mode and the alternate screen, and re-arms mouse capture, after the editor
-/// exits. Mirrors `herdr-file-viewer`'s identical `resume_tui`.
+/// exits. Every step is attempted regardless of an earlier one's outcome, for the same reason
+/// [`suspend_tui`]'s doc gives.
 fn resume_tui() -> std::io::Result<()> {
-    crossterm::terminal::enable_raw_mode()?;
-    crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
+    let raw_mode_result = crossterm::terminal::enable_raw_mode();
+    let alt_screen_result =
+        crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen);
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
-    Ok(())
+    raw_mode_result.and(alt_screen_result)
+}
+
+/// Pure core of [`run_editor_in_terminal`]: `suspend`/`spawn`/`resume` as injected closures, so
+/// the *composition* around them — the suspend-failure branch, and the "resume is always
+/// attempted, and its failure is never silently dropped" invariant — is unit-testable without
+/// touching a real terminal or process. Mirrors [`run_editor_command`]'s/[`open_config_editor`]'s
+/// own pure-core/real-wrapper split; this function was the one place in the original PR #46 that
+/// skipped it, which is exactly where the review found its two real bugs (PR #46 review).
+///
+/// `resume` runs unconditionally — even when `suspend` itself failed (best-effort: whatever
+/// `suspend` may have partially changed before failing still deserves an attempt at restoring)
+/// and even when the editor never ran or exited non-zero — mirroring `run_tui`'s "always attempt
+/// full teardown" discipline extended to this suspend/resume pair. A `resume` failure folds into
+/// the returned [`EditorOutcome`] rather than being dropped: paired with an editor that already
+/// took over the terminal (`Ok`/`NonZeroExit`), it becomes `TerminalNotRestored`, which
+/// `open_config_editor` treats like `NonZeroExit` — no OS-opener fallback, since the terminal
+/// was already handed over. Paired with `NotLaunched` (the editor never ran at all — nothing
+/// touched the display), the resume failure is folded into that same `NotLaunched` message
+/// instead: the OS-opener fallback is still safe there regardless of whether this specific
+/// recovery attempt succeeded, so reclassifying it as `TerminalNotRestored` would incorrectly
+/// block a fallback that's still fine to try.
+fn run_editor_in_terminal_with(
+    editor_cmd: &str,
+    config_path: &std::path::Path,
+    suspend: impl FnOnce() -> std::io::Result<()>,
+    spawn: impl FnOnce(&str, &std::path::Path) -> std::io::Result<std::process::ExitStatus>,
+    resume: impl FnOnce() -> std::io::Result<()>,
+) -> EditorOutcome {
+    if let Err(suspend_err) = suspend() {
+        if let Err(resume_err) = resume() {
+            return EditorOutcome::NotLaunched(format!(
+                "couldn't suspend the terminal ({suspend_err}); it also failed to restore \
+                 afterward: {resume_err}"
+            ));
+        }
+        return EditorOutcome::NotLaunched(format!("couldn't suspend the terminal: {suspend_err}"));
+    }
+
+    let outcome = run_editor_command(editor_cmd, config_path, spawn);
+
+    if let Err(resume_err) = resume() {
+        return match outcome {
+            EditorOutcome::NotLaunched(editor_err) => EditorOutcome::NotLaunched(format!(
+                "{editor_err}; the terminal also failed to restore afterward: {resume_err}"
+            )),
+            EditorOutcome::Ok => EditorOutcome::TerminalNotRestored(resume_err.to_string()),
+            EditorOutcome::NonZeroExit(editor_err) => EditorOutcome::TerminalNotRestored(format!(
+                "{editor_err}; the terminal also failed to restore afterward: {resume_err}"
+            )),
+            EditorOutcome::TerminalNotRestored(_) => unreachable!(
+                "run_editor_command (the only source of `outcome` here) never returns \
+                 TerminalNotRestored — see its own doc"
+            ),
+        };
+    }
+
+    outcome
 }
 
 /// The real, real-environment editor hand-off for the `c` keybinding: suspends herdr-linear's
@@ -764,23 +850,15 @@ fn resume_tui() -> std::io::Result<()> {
 /// via `tab_create`/`pane_run`), there's no separate pane at all here, so nothing is left
 /// behind to close manually once the editor exits — quitting the editor returns straight to
 /// herdr-linear's own screen. Real terminal I/O plus a real subprocess, so deliberately
-/// untested itself; [`run_editor_command`] is its tested, injectable core.
+/// untested itself; [`run_editor_in_terminal_with`] is its tested, injectable core.
 fn run_editor_in_terminal(editor_cmd: &str, config_path: &std::path::Path) -> EditorOutcome {
-    if let Err(err) = suspend_tui() {
-        return EditorOutcome::NotLaunched(format!("couldn't suspend the terminal: {err}"));
-    }
-    let outcome = run_editor_command(editor_cmd, config_path, |cmd, path| {
-        std::process::Command::new(cmd).arg(path).status()
-    });
-    // Always attempt to restore the terminal, even though the editor already ran — leaving raw
-    // mode / the alternate screen off would strand the rest of the app. A resume failure here
-    // doesn't change `outcome`: the editor's own result is more informative to the user than a
-    // terminal-restore hiccup, and `event_loop`'s `terminal.clear()` after this call forces a
-    // full repaint regardless of which branch ran.
-    if let Err(err) = resume_tui() {
-        tracing::warn!("couldn't resume the terminal after the editor exited: {err}");
-    }
-    outcome
+    run_editor_in_terminal_with(
+        editor_cmd,
+        config_path,
+        suspend_tui,
+        |cmd, path| std::process::Command::new(cmd).arg(path).status(),
+        resume_tui,
+    )
 }
 
 /// Resolves which editor `c` should use from the real environment: `config.toml`'s `editor`
@@ -803,15 +881,16 @@ fn resolve_editor_command_from_env() -> Option<String> {
 /// Opens `config.toml` for the `c` keybinding: if `editor_cmd` resolved to something (see
 /// [`resolve_editor_command_from_env`]), runs it via `run_editor` (`run_editor_in_terminal` in
 /// production — suspends the TUI, runs the editor in-place, resumes the TUI). On
-/// [`EditorOutcome::Ok`], `opener` is never called — the file must never be opened twice. An
-/// [`EditorOutcome::NonZeroExit`] is reported straight to the caller instead of falling back —
-/// the editor already had the terminal, so trying the OS opener next would risk a second,
-/// confusing "open" for a file the user just closed. Only [`EditorOutcome::NotLaunched`] (or no
-/// `editor_cmd` at all) falls through to `opener(path)` — `open::that` in production, today's
-/// unchanged OS-default-opener fallback. `run_editor` and `opener` are both explicit parameters
-/// so this whole function stays testable against fakes for both, mirroring how `implement_one`
-/// takes `herdr_bin: &str` while only its real-environment caller (`start_implementation`) is
-/// left untested.
+/// [`EditorOutcome::Ok`], `opener` is never called — the file must never be opened twice. Both
+/// [`EditorOutcome::NonZeroExit`] and [`EditorOutcome::TerminalNotRestored`] are reported
+/// straight to the caller instead of falling back — the editor already had the terminal (one
+/// way or another), so trying the OS opener next would risk a second, confusing "open" for a
+/// file the user just closed. Only [`EditorOutcome::NotLaunched`] (or no `editor_cmd` at all)
+/// falls through to `opener(path)` — `open::that` in production, today's unchanged
+/// OS-default-opener fallback. `run_editor` and `opener` are both explicit parameters so this
+/// whole function stays testable against fakes for both, mirroring how `implement_one` takes
+/// `herdr_bin: &str` while only its real-environment caller (`start_implementation`) is left
+/// untested.
 fn open_config_editor(
     path: &std::path::Path,
     editor_cmd: Option<String>,
@@ -821,7 +900,9 @@ fn open_config_editor(
     if let Some(cmd) = &editor_cmd {
         match run_editor(cmd, path) {
             EditorOutcome::Ok => return Ok(()),
-            EditorOutcome::NonZeroExit(message) => return Err(message),
+            EditorOutcome::NonZeroExit(message) | EditorOutcome::TerminalNotRestored(message) => {
+                return Err(message);
+            }
             EditorOutcome::NotLaunched(message) => {
                 tracing::warn!(
                     "editor could not be launched, falling back to the OS opener: {message}"
@@ -1424,6 +1505,147 @@ mod tests {
     }
 
     #[test]
+    fn run_editor_in_terminal_with_reports_not_launched_when_suspend_fails_and_never_spawns() {
+        let outcome = run_editor_in_terminal_with(
+            "nvim",
+            std::path::Path::new("/fake/config.toml"),
+            || Err(std::io::Error::other("suspend boom")),
+            |_cmd, _path| panic!("spawn must not run when suspend fails"),
+            || Ok(()),
+        );
+
+        let EditorOutcome::NotLaunched(message) = outcome else {
+            panic!("expected NotLaunched, got {outcome:?}");
+        };
+        assert!(
+            message.contains("suspend boom"),
+            "unexpected message: {message}"
+        );
+    }
+
+    #[test]
+    fn run_editor_in_terminal_with_folds_a_resume_failure_into_a_failed_suspends_message() {
+        // A `suspend` failure that ALSO can't recover via `resume` must stay classified as
+        // `NotLaunched` (nothing ever touched the terminal from the editor's side, so the
+        // OS-opener fallback is still safe), just with both errors folded into one message —
+        // not silently dropped, and not reclassified into a fallback-blocking variant.
+        let outcome = run_editor_in_terminal_with(
+            "nvim",
+            std::path::Path::new("/fake/config.toml"),
+            || Err(std::io::Error::other("suspend boom")),
+            |_cmd, _path| panic!("spawn must not run when suspend fails"),
+            || Err(std::io::Error::other("resume boom")),
+        );
+
+        let EditorOutcome::NotLaunched(message) = outcome else {
+            panic!("expected NotLaunched, got {outcome:?}");
+        };
+        assert!(
+            message.contains("suspend boom") && message.contains("resume boom"),
+            "unexpected message: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_editor_in_terminal_with_reports_terminal_not_restored_when_resume_fails_after_success() {
+        use std::os::unix::process::ExitStatusExt;
+
+        // Regression test (PR #46 review): previously a `resume` failure after a
+        // successful edit was silently dropped — `run_editor_in_terminal` returned a bare
+        // `Ok`, which `open_config_editor`/`open_config_result_status` turn into *clearing*
+        // the status bar, leaving zero on-screen indication anything went wrong.
+        let outcome = run_editor_in_terminal_with(
+            "nvim",
+            std::path::Path::new("/fake/config.toml"),
+            || Ok(()),
+            |_cmd, _path| Ok(std::process::ExitStatus::from_raw(0)),
+            || Err(std::io::Error::other("resume boom")),
+        );
+
+        let EditorOutcome::TerminalNotRestored(message) = outcome else {
+            panic!("expected TerminalNotRestored, got {outcome:?}");
+        };
+        assert!(
+            message.contains("resume boom"),
+            "unexpected message: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_editor_in_terminal_with_folds_a_resume_failure_into_a_non_zero_exits_message() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let outcome = run_editor_in_terminal_with(
+            "nvim",
+            std::path::Path::new("/fake/config.toml"),
+            || Ok(()),
+            |_cmd, _path| Ok(std::process::ExitStatus::from_raw(1 << 8)),
+            || Err(std::io::Error::other("resume boom")),
+        );
+
+        let EditorOutcome::TerminalNotRestored(message) = outcome else {
+            panic!("expected TerminalNotRestored, got {outcome:?}");
+        };
+        assert!(
+            message.contains("nvim") && message.contains("resume boom"),
+            "unexpected message: {message}"
+        );
+    }
+
+    #[test]
+    fn run_editor_in_terminal_with_folds_a_resume_failure_into_a_not_launched_message() {
+        // Mirrors the non-zero-exit case above, but for the "editor never even launched"
+        // outcome — must stay `NotLaunched` (still safe to fall back to the OS opener),
+        // not get reclassified into a fallback-blocking `TerminalNotRestored`.
+        let outcome = run_editor_in_terminal_with(
+            "nvim",
+            std::path::Path::new("/fake/config.toml"),
+            || Ok(()),
+            |_cmd, _path| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no such file",
+                ))
+            },
+            || Err(std::io::Error::other("resume boom")),
+        );
+
+        let EditorOutcome::NotLaunched(message) = outcome else {
+            panic!("expected NotLaunched, got {outcome:?}");
+        };
+        assert!(
+            message.contains("no such file") && message.contains("resume boom"),
+            "unexpected message: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_editor_in_terminal_with_resumes_and_returns_ok_when_everything_succeeds() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let resume_called = std::cell::Cell::new(false);
+        let outcome = run_editor_in_terminal_with(
+            "nvim",
+            std::path::Path::new("/fake/config.toml"),
+            || Ok(()),
+            |_cmd, _path| Ok(std::process::ExitStatus::from_raw(0)),
+            || {
+                resume_called.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(
+            resume_called.get(),
+            "resume must always run after a successful spawn"
+        );
+        assert_eq!(outcome, EditorOutcome::Ok);
+    }
+
+    #[test]
     fn open_config_editor_calls_the_opener_when_no_editor_resolved() {
         let opener_calls = std::cell::RefCell::new(Vec::new());
 
@@ -1441,6 +1663,33 @@ mod tests {
         assert_eq!(
             opener_calls.into_inner(),
             vec![std::path::PathBuf::from("/fake/config/dir/config.toml")]
+        );
+    }
+
+    #[test]
+    fn open_config_editor_fails_when_no_editor_resolved_and_the_opener_fails() {
+        // The `None`-`editor_cmd` precondition, paired with a failing opener — the sibling
+        // `..._fails_when_both_the_editor_and_the_opener_fail` test above covers the same
+        // final `opener(path).map_err(...)` line, but only reaches it via `NotLaunched`, not
+        // via `editor_cmd: None`.
+        let result = open_config_editor(
+            std::path::Path::new("/fake/config/dir/config.toml"),
+            None,
+            |_cmd, _path| panic!("run_editor must not be called when no editor resolved"),
+            |_p| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no handler registered",
+                ))
+            },
+        );
+
+        let Err(message) = result else {
+            panic!("expected Err, got {result:?}");
+        };
+        assert!(
+            message.contains("Couldn't open") && message.contains("no handler registered"),
+            "unexpected message: {message}"
         );
     }
 
@@ -1513,6 +1762,37 @@ mod tests {
         assert!(
             opener_calls.into_inner().is_empty(),
             "opener must not run when the editor already exited — it could open the file twice"
+        );
+    }
+
+    #[test]
+    fn open_config_editor_does_not_fall_back_when_the_terminal_fails_to_restore() {
+        // Mirrors the non-zero-exit case above: `TerminalNotRestored` means the terminal was
+        // already handed over to the editor, so the opener must not run either.
+        let opener_calls = std::cell::RefCell::new(Vec::new());
+
+        let result = open_config_editor(
+            std::path::Path::new("/fake/config/dir/config.toml"),
+            Some("nvim".to_string()),
+            |_cmd, _path| {
+                EditorOutcome::TerminalNotRestored("couldn't re-enter raw mode".to_string())
+            },
+            |p| {
+                opener_calls.borrow_mut().push(p.to_path_buf());
+                Ok(())
+            },
+        );
+
+        let Err(message) = result else {
+            panic!("expected Err, got {result:?}");
+        };
+        assert!(
+            message.contains("raw mode"),
+            "unexpected message: {message}"
+        );
+        assert!(
+            opener_calls.into_inner().is_empty(),
+            "opener must not run when the terminal was already handed over to the editor"
         );
     }
 
@@ -1675,9 +1955,9 @@ exit 1
     #[test]
     fn open_config_result_status_sets_an_error_on_failure() {
         assert_eq!(
-            open_config_result_status(&Err("herdr unreachable".to_string())),
+            open_config_result_status(&Err("nvim exited with exit status: 1".to_string())),
             Some(plugin::app::Status::Error(
-                "herdr unreachable. Edit it manually.".to_string()
+                "nvim exited with exit status: 1. Edit it manually.".to_string()
             ))
         );
     }
