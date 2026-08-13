@@ -380,25 +380,61 @@ fn parse_sort_field(field: &str) -> Option<SortKey> {
 /// the module doc's "Priority ordering" section for what ascending/descending mean under
 /// Linear's lower-is-more-urgent scale.
 pub fn sort_issues(issues: &mut [Issue], sort_keys: &[SortKey]) {
-    issues.sort_by(|a, b| {
-        for key in sort_keys {
-            let ordering = match key.field {
-                SortField::Priority => a.priority.cmp(&b.priority),
-                SortField::Updated => a.updated_at.cmp(&b.updated_at),
-                SortField::Created => a.created_at.cmp(&b.created_at),
-                SortField::Identifier => a.identifier.cmp(&b.identifier),
-            };
-            let ordering = if key.ascending {
-                ordering
-            } else {
-                ordering.reverse()
-            };
-            if ordering != Ordering::Equal {
-                return ordering;
+    issues.sort_by(|a, b| compare_issues(a, b, sort_keys));
+}
+
+/// The comparator [`sort_issues`] sorts by, split out so TF-617's `/`-filter can apply
+/// the identical ordering to a filtered *subset* of issue indices (see
+/// `crate::plugin::app::matching_issue_indices`) without duplicating the tiebreaker
+/// logic or re-sorting the full `issues` slice in place. See [`sort_issues`]'s own doc
+/// for what each field/direction means; this function only extracts the comparison,
+/// the semantics are unchanged.
+pub fn compare_issues(a: &Issue, b: &Issue, sort_keys: &[SortKey]) -> Ordering {
+    for key in sort_keys {
+        let ordering = match key.field {
+            SortField::Priority => a.priority.cmp(&b.priority),
+            SortField::Updated => a.updated_at.cmp(&b.updated_at),
+            SortField::Created => a.created_at.cmp(&b.created_at),
+            SortField::Identifier => a.identifier.cmp(&b.identifier),
+        };
+        let ordering = if key.ascending {
+            ordering
+        } else {
+            ordering.reverse()
+        };
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    Ordering::Equal
+}
+
+/// Does `issue` satisfy `term`? The client-side counterpart to
+/// `crate::plugin::data::filter_term_fragment` (TF-616), which translates the same
+/// [`FilterTerm`] into Linear's server-side `IssueFilter` JSON instead. TF-617's `/`-filter
+/// needs this because it narrows an *already-fetched* issue list live as the user types,
+/// rather than re-querying Linear's API on every keystroke — so recognized `key:value`
+/// terms are matched here, against the `Issue` struct's own fields, using the same
+/// semantics `filter_term_fragment` documents for its server-side comparators
+/// (`state:`/`label:` case-insensitive name match, `priority:` against Linear's raw
+/// `0..=4` scale — see the module doc's "Priority ordering" section).
+pub fn matches_filter_term(issue: &Issue, term: &FilterTerm) -> bool {
+    match term {
+        FilterTerm::Priority { op, value } => {
+            let value = value.value();
+            match op {
+                PriorityOp::Eq => issue.priority == value,
+                PriorityOp::Ge => issue.priority >= value,
+                PriorityOp::Le => issue.priority <= value,
             }
         }
-        Ordering::Equal
-    });
+        FilterTerm::State(name) => issue.state.name.eq_ignore_ascii_case(name),
+        FilterTerm::Label(name) => issue
+            .labels
+            .nodes
+            .iter()
+            .any(|label| label.name.eq_ignore_ascii_case(name)),
+    }
 }
 
 #[cfg(test)]
@@ -920,5 +956,129 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["Z", "Y"]
         );
+    }
+
+    #[test]
+    fn compare_issues_matches_sort_issues_ordering() {
+        // TF-617: compare_issues is sort_issues' comparator extracted so the /-filter
+        // can sort a filtered *subset* of indices — confirm the extraction changed
+        // nothing by driving both through the same tiebreaker chain.
+        let a = sample_issue("A", 2, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z");
+        let b = sample_issue("B", 1, "2026-01-02T00:00:00Z", "2026-01-02T00:00:00Z");
+        let keys = [SortKey {
+            field: SortField::Priority,
+            ascending: true,
+        }];
+
+        let mut issues = vec![a.clone(), b.clone()];
+        sort_issues(&mut issues, &keys);
+
+        assert_eq!(compare_issues(&a, &b, &keys), Ordering::Greater);
+        assert_eq!(
+            issues
+                .iter()
+                .map(|i| i.identifier.as_str())
+                .collect::<Vec<_>>(),
+            vec!["B", "A"]
+        );
+    }
+
+    #[test]
+    fn matches_filter_term_priority_uses_the_declared_comparator() {
+        let issue = sample_issue("A", 2, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z");
+
+        assert!(matches_filter_term(
+            &issue,
+            &FilterTerm::Priority {
+                op: PriorityOp::Eq,
+                value: priority(2)
+            }
+        ));
+        assert!(!matches_filter_term(
+            &issue,
+            &FilterTerm::Priority {
+                op: PriorityOp::Eq,
+                value: priority(3)
+            }
+        ));
+        assert!(matches_filter_term(
+            &issue,
+            &FilterTerm::Priority {
+                op: PriorityOp::Ge,
+                value: priority(2)
+            }
+        ));
+        assert!(!matches_filter_term(
+            &issue,
+            &FilterTerm::Priority {
+                op: PriorityOp::Ge,
+                value: priority(3)
+            }
+        ));
+        assert!(matches_filter_term(
+            &issue,
+            &FilterTerm::Priority {
+                op: PriorityOp::Le,
+                value: priority(2)
+            }
+        ));
+        assert!(!matches_filter_term(
+            &issue,
+            &FilterTerm::Priority {
+                op: PriorityOp::Le,
+                value: priority(1)
+            }
+        ));
+    }
+
+    #[test]
+    fn matches_filter_term_state_matches_by_name_case_insensitively() {
+        let issue = sample_issue("A", 0, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z");
+        assert_eq!(issue.state.name, "In Progress");
+
+        assert!(matches_filter_term(
+            &issue,
+            &FilterTerm::State("in progress".to_string())
+        ));
+        assert!(!matches_filter_term(
+            &issue,
+            &FilterTerm::State("Done".to_string())
+        ));
+    }
+
+    #[test]
+    fn matches_filter_term_label_matches_any_label_case_insensitively() {
+        let mut issue = sample_issue("A", 0, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z");
+        issue.labels.nodes = vec![
+            crate::Label {
+                id: "l1".to_string(),
+                name: "Bug".to_string(),
+                color: "#fff".to_string(),
+                description: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+            },
+            crate::Label {
+                id: "l2".to_string(),
+                name: "Needs Design".to_string(),
+                color: "#fff".to_string(),
+                description: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+            },
+        ];
+
+        assert!(matches_filter_term(
+            &issue,
+            &FilterTerm::Label("bug".to_string())
+        ));
+        assert!(matches_filter_term(
+            &issue,
+            &FilterTerm::Label("needs design".to_string())
+        ));
+        assert!(!matches_filter_term(
+            &issue,
+            &FilterTerm::Label("urgent".to_string())
+        ));
     }
 }

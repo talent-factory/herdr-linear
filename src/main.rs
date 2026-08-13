@@ -98,27 +98,60 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
     result
 }
 
+/// `config.toml`'s `default_query` (TF-617), parsed once per [`load_issues`] call:
+/// [`plugin::query::ParsedQuery::filters`] narrows the fetch below server-side (the same
+/// `IssueFilter` merge TF-616 wired up via `filter_terms`), while
+/// [`plugin::query::ParsedQuery::sort_keys`] orders the fetched issues before they're
+/// shown (see [`apply_fetched_issues`]). `Err`/unset both collapse to
+/// `ParsedQuery::default()` — an empty query, i.e. no additional narrowing or ordering
+/// beyond a view's own base filter, same as before this feature existed. Treating a
+/// malformed `config.toml` (`Err`) this way rather than surfacing it as its own error is
+/// safe in practice: `ensure_loaded` already parses this same file successfully to build
+/// `client` before `load_issues` is ever called, so reaching this function with an
+/// unreadable `config.toml` would mean it changed underneath a still-running session —
+/// falling back to "no default query" for that one fetch is a reasonable degradation,
+/// not a silent swallow of a fetch-affecting error.
+fn resolved_default_query() -> plugin::query::ParsedQuery {
+    plugin::config::load_default_query()
+        .ok()
+        .flatten()
+        .map(|query| plugin::query::parse_query(&query))
+        .unwrap_or_default()
+}
+
+/// Sorts `issues` by `sort_keys` (a no-op for an empty slice) and hands them to
+/// [`plugin::app::App::set_issues`] — the shared tail of every `load_issues` fetch arm,
+/// so `default_query`'s `sort:` terms (TF-617) apply identically regardless of which
+/// view was entered.
+fn apply_fetched_issues(
+    app: &mut plugin::app::App,
+    mut issues: Vec<herdr_linear::Issue>,
+    sort_keys: &[plugin::query::SortKey],
+) {
+    plugin::query::sort_issues(&mut issues, sort_keys);
+    app.set_issues(issues);
+}
+
 async fn load_issues(app: &mut plugin::app::App, client: &herdr_linear::LinearClient) {
-    // No `/`-filter or `default_query` wiring yet (TF-617) — every fetch runs with the
-    // empty slice, which is a documented no-op reproducing pre-TF-616 behavior exactly.
-    let filter_terms: &[plugin::query::FilterTerm] = &[];
+    let default_query = resolved_default_query();
+    let filter_terms = &default_query.filters;
 
     match app.current_view() {
         Some(plugin::app::ViewKind::MyIssues) => {
             match plugin::data::fetch_my_issues(client, filter_terms).await {
-                Ok(issues) => app.set_issues(issues),
+                Ok(issues) => apply_fetched_issues(app, issues, &default_query.sort_keys),
                 Err(err) => app.set_error(err.to_string()),
             }
         }
         Some(plugin::app::ViewKind::ProjectIssues) => {
             match plugin::data::fetch_current_project_issues(client, filter_terms).await {
-                Ok(issues) => app.set_issues(issues),
+                Ok(issues) => apply_fetched_issues(app, issues, &default_query.sort_keys),
                 Err(err) => app.set_error(err.to_string()),
             }
         }
         Some(plugin::app::ViewKind::TeamIssues) => {
             match plugin::data::fetch_current_team_issues(client, filter_terms).await {
-                Ok(issues) => app.set_issues(issues),
+                Ok(issues) => apply_fetched_issues(app, issues, &default_query.sort_keys),
                 Err(err) => app.set_error(err.to_string()),
             }
         }
@@ -2084,6 +2117,56 @@ exit 1
             labels: herdr_linear::LabelConnection { nodes: vec![] },
             url: format!("https://linear.app/team/issue/{identifier}"),
         }
+    }
+
+    /// TF-617: `apply_fetched_issues` is `load_issues`'s shared post-fetch step —
+    /// confirms `default_query`'s `sort:` terms actually reorder what lands in `app`,
+    /// not just that `sort_issues`/`parse_query` are individually correct in isolation
+    /// (covered by their own unit tests in `plugin::query`).
+    #[test]
+    fn apply_fetched_issues_sorts_before_setting_them_on_app() {
+        let mut app = plugin::app::App::new();
+        app.enter_selected_menu_option();
+        let mut low = sample_issue("ENG-1");
+        low.priority = 1;
+        let mut high = sample_issue("ENG-2");
+        high.priority = 3;
+        let sort_keys = [plugin::query::SortKey {
+            field: plugin::query::SortField::Priority,
+            ascending: false,
+        }];
+
+        apply_fetched_issues(&mut app, vec![low, high], &sort_keys);
+
+        assert_eq!(app.selected_issue().unwrap().identifier, "ENG-2");
+    }
+
+    #[test]
+    fn apply_fetched_issues_with_no_sort_keys_preserves_fetch_order() {
+        let mut app = plugin::app::App::new();
+        app.enter_selected_menu_option();
+
+        apply_fetched_issues(
+            &mut app,
+            vec![sample_issue("ENG-2"), sample_issue("ENG-1")],
+            &[],
+        );
+
+        assert_eq!(app.selected_issue().unwrap().identifier, "ENG-2");
+    }
+
+    #[test]
+    fn resolved_default_query_is_empty_without_a_readable_default_query() {
+        // TF-617: deliberately doesn't set HERDR_PLUGIN_CONFIG_DIR itself — true whether
+        // it's unset or (as plugin::app's own tests transiently do, concurrently, in
+        // this same test binary) pointed at a directory with no config.toml of its own,
+        // since either way `resolve_default_query` resolves to `None`. See
+        // plugin::config's test suite for `resolve_default_query`/`load_default_query`
+        // coverage against a real config.toml, via the pure, env-free variant.
+        let parsed = resolved_default_query();
+
+        assert!(parsed.filters.is_empty());
+        assert!(parsed.sort_keys.is_empty());
     }
 
     /// A `herdr` fake script that dispatches on `$1 $2` so [`implement_one`]'s whole

@@ -105,10 +105,28 @@ pub struct FilterState {
     pub query: String,
 }
 
-/// Returns the indices into `issues` of every issue whose title or identifier contains
-/// `query` as a case-insensitive substring, in original order. An empty `query` matches
-/// everything — the no-filter case degenerates to `0..issues.len()` rather than an
-/// empty result, so callers don't need a separate branch for "no filter active".
+/// Returns the indices into `issues` matching `query`, in the order they should be
+/// displayed/navigated. An empty `query` matches everything, in `issues`' original order
+/// — the no-filter case degenerates to `0..issues.len()` rather than an empty result, so
+/// callers don't need a separate branch for "no filter active".
+///
+/// `query` is parsed through the same DSL `crate::plugin::query::parse_query` gives
+/// `config.toml`'s `default_query` (TF-617). A query with no recognized `key:value`
+/// tokens is treated exactly as before this feature: a case-insensitive substring match
+/// against title/identifier, against the raw `query` string byte-for-byte rather than
+/// `ParsedQuery::free_text` (which re-joins tokenized text, so isn't guaranteed
+/// byte-identical to `query` for e.g. irregular whitespace) — so nothing about TF-580's
+/// original behavior changes; see the `matching_issue_indices_*` tests below, which this
+/// path keeps passing unmodified. A query that *does* contain recognized
+/// `priority:`/`state:`/`label:` terms additionally narrows by those terms client-side
+/// (`crate::plugin::query::matches_filter_term`), against whatever `issues` already is —
+/// which may itself be narrower than "every open issue", since `default_query`'s own
+/// filter terms are applied server-side at fetch time (see `main.rs`'s `load_issues`).
+/// That fetch-time query plays no further part here: a `/`-filter query *overrides*
+/// `default_query` rather than merging with it, so this function's ordering and
+/// narrowing come entirely from what was actually typed, not from any interaction with
+/// how `issues` got here. `sort:` terms, if present, reorder the matches afterwards
+/// (`crate::plugin::query::compare_issues`).
 ///
 /// Pure and independent of `App`/`ViewState` so it's directly unit-testable, mirroring
 /// the `assignee_open_filter`/`project_open_filter` pattern in `data.rs`.
@@ -116,16 +134,44 @@ pub fn matching_issue_indices(issues: &[Issue], query: &str) -> Vec<usize> {
     if query.is_empty() {
         return (0..issues.len()).collect();
     }
-    let query = query.to_lowercase();
-    issues
+
+    let parsed = crate::plugin::query::parse_query(query);
+    if parsed.filters.is_empty() && parsed.sort_keys.is_empty() {
+        let query = query.to_lowercase();
+        return issues
+            .iter()
+            .enumerate()
+            .filter(|(_, issue)| {
+                issue.title.to_lowercase().contains(&query)
+                    || issue.identifier.to_lowercase().contains(&query)
+            })
+            .map(|(index, _)| index)
+            .collect();
+    }
+
+    let free_text = parsed.free_text.to_lowercase();
+    let mut matched: Vec<usize> = issues
         .iter()
         .enumerate()
         .filter(|(_, issue)| {
-            issue.title.to_lowercase().contains(&query)
-                || issue.identifier.to_lowercase().contains(&query)
+            (free_text.is_empty()
+                || issue.title.to_lowercase().contains(&free_text)
+                || issue.identifier.to_lowercase().contains(&free_text))
+                && parsed
+                    .filters
+                    .iter()
+                    .all(|term| crate::plugin::query::matches_filter_term(issue, term))
         })
         .map(|(index, _)| index)
-        .collect()
+        .collect();
+
+    if !parsed.sort_keys.is_empty() {
+        matched.sort_by(|&a, &b| {
+            crate::plugin::query::compare_issues(&issues[a], &issues[b], &parsed.sort_keys)
+        });
+    }
+
+    matched
 }
 
 /// What the UI should currently display: the view-selection menu, or an entered view.
@@ -1786,6 +1832,67 @@ mod tests {
         );
     }
 
+    // TF-617: `/`-filter DSL awareness. `matching_issue_indices` recognizes the same
+    // `priority:`/`state:`/`label:`/`sort:` tokens `default_query` does, narrowing and
+    // reordering the already-loaded `issues` client-side, while a query with none of
+    // those tokens still takes the exact legacy path exercised above.
+
+    #[test]
+    fn matching_issue_indices_filters_by_a_recognized_priority_term() {
+        let mut issues = vec![sample_issue("ENG-1"), sample_issue("ENG-2")];
+        issues[0].priority = 2;
+        issues[1].priority = 0;
+
+        assert_eq!(matching_issue_indices(&issues, "priority:>=2"), vec![0]);
+    }
+
+    #[test]
+    fn matching_issue_indices_filters_by_a_recognized_state_term() {
+        let mut issues = vec![sample_issue("ENG-1"), sample_issue("ENG-2")];
+        issues[0].state.name = "Done".to_string();
+        issues[1].state.name = "In Progress".to_string();
+
+        assert_eq!(matching_issue_indices(&issues, "state:done"), vec![0]);
+    }
+
+    #[test]
+    fn matching_issue_indices_combines_free_text_with_a_filter_term() {
+        let mut issues = vec![sample_issue("ENG-1"), sample_issue("ENG-2")];
+        issues[0].title = "Fix login bug".to_string();
+        issues[0].priority = 2;
+        issues[1].title = "Fix login redirect".to_string();
+        issues[1].priority = 0;
+
+        assert_eq!(
+            matching_issue_indices(&issues, "login priority:>=2"),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn matching_issue_indices_sorts_matches_by_a_recognized_sort_term() {
+        let mut issues = vec![sample_issue("ENG-1"), sample_issue("ENG-2")];
+        issues[0].priority = 1;
+        issues[1].priority = 3;
+
+        assert_eq!(
+            matching_issue_indices(&issues, "sort:-priority"),
+            vec![1, 0]
+        );
+    }
+
+    #[test]
+    fn matching_issue_indices_with_no_dsl_tokens_takes_the_exact_legacy_substring_path() {
+        // A trailing space is significant to the legacy substring match (it's part of
+        // the exact byte string being searched for) but would be dropped by re-joining
+        // `ParsedQuery::free_text`'s tokens — confirms the raw `query` string, not the
+        // parsed-and-rejoined one, still drives this path.
+        let mut issues = vec![sample_issue("ENG-1")];
+        issues[0].title = "Fix login bug ".to_string();
+
+        assert_eq!(matching_issue_indices(&issues, "bug "), vec![0]);
+    }
+
     #[test]
     fn slash_key_starts_filtering() {
         let mut app = app_in_my_issues_view();
@@ -1967,6 +2074,26 @@ mod tests {
         }
 
         assert_eq!(app.selected_issue(), None);
+    }
+
+    #[test]
+    fn typing_a_recognized_dsl_term_through_handle_key_narrows_the_view_end_to_end() {
+        // TF-617: end-to-end confirmation that `/`-filter editing (start_filtering via
+        // `/`, push_filter_char per character) feeds straight into the DSL-aware
+        // matching_issue_indices — not just a direct unit-test of that function.
+        let mut app = app_in_my_issues_view();
+        let mut low = sample_issue("ENG-1");
+        low.priority = 1;
+        let mut high = sample_issue("ENG-2");
+        high.priority = 2;
+        app.set_issues(vec![low, high]);
+
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        for c in "priority:>=2".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+
+        assert_eq!(app.selected_issue().unwrap().identifier, "ENG-2");
     }
 
     #[test]

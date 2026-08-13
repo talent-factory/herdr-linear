@@ -391,6 +391,31 @@ entering "Team Issues" shows an error naming every team (so you can see which id
 and pointing at `config.toml`; press `c` on that error screen to open it, same as for the
 project-matching errors above.
 
+Every view supports a small query DSL, both as a default applied on entry and as a live
+`/`-filter over whatever's currently loaded. Free text still does a plain
+case-insensitive substring match against title/identifier, exactly as before; alongside
+it, `priority:`/`state:`/`label:` narrow by those fields and `sort:` orders the result
+(prefix a field with `-` for descending — e.g. `sort:-priority,updated`):
+
+| Term | Matches |
+| --- | --- |
+| `priority:2`, `priority:high` | Exact priority (`0`=none, `1`=urgent, `2`=high, `3`=medium, `4`=low) |
+| `priority:>=2`, `priority:<=2` | Priority at least/at most the given level |
+| `state:"In Review"` | Workflow state, by name (case-insensitive; quote multi-word names) |
+| `label:bug` | Has a label with this name (case-insensitive) |
+| `sort:priority`, `sort:-updated` | Order by `priority`/`updated`/`created`/`identifier` |
+
+Set a default for every view with `default_query` in `config.toml`:
+
+```toml
+default_query = "priority:>=2 sort:-priority"
+```
+
+Pressing `/` on a loaded view opens its own filter, parsed through the same DSL — it
+fully replaces `default_query` for that view rather than narrowing further on top of it,
+matching how `/`-filter already worked before this DSL existed. `Enter` confirms,
+`Esc` clears it and restores `default_query`'s view.
+
 ### Use
 
 Bind keys to the plugin's actions in `~/.config/herdr/config.toml`:

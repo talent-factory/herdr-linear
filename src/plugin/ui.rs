@@ -877,6 +877,9 @@ fn settings_lines_from(
     let team_id_display = summary.team_id.as_deref().unwrap_or("Not set");
     lines.push(format!("team_id          = {team_id_display}"));
 
+    let default_query_display = summary.default_query.as_deref().unwrap_or("not set");
+    lines.push(format!("default_query    = {default_query_display}"));
+
     if summary.project_overrides.is_empty() {
         lines.push("project_overrides: (none)".to_string());
     } else {
@@ -2190,6 +2193,7 @@ mod tests {
             team_id: None,
             editor: None,
             project_overrides: std::collections::BTreeMap::new(),
+            default_query: None,
         };
 
         let lines = settings_lines_from(&summary, false).join("\n");
@@ -2197,6 +2201,7 @@ mod tests {
         assert!(lines.contains("no file found, using defaults"));
         assert!(lines.contains("✗ Not set"));
         assert!(lines.contains("(default)"));
+        assert!(lines.contains("default_query    = not set"));
     }
 
     /// Follow-up review fix (TF-585): `settings_lines()` used to collapse "LINEAR_API_KEY
@@ -2214,6 +2219,7 @@ mod tests {
             team_id: None,
             editor: None,
             project_overrides: std::collections::BTreeMap::new(),
+            default_query: None,
         };
 
         let unset = settings_lines_from(&summary, false).join("\n");
@@ -2237,6 +2243,7 @@ mod tests {
             team_id: Some("team-123".to_string()),
             editor: Some("vim".to_string()),
             project_overrides,
+            default_query: Some("priority:>=2".to_string()),
         };
 
         let lines = settings_lines_from(&summary, false).join("\n");
@@ -2247,6 +2254,7 @@ mod tests {
         assert!(lines.contains("my-agent"));
         assert!(lines.contains("editor           = vim"));
         assert!(lines.contains("team-123"));
+        assert!(lines.contains("default_query    = priority:>=2"));
         assert!(lines.contains("herdr-linear"));
         assert!(lines.contains("proj-1"));
     }
@@ -2261,6 +2269,7 @@ mod tests {
             team_id: None,
             editor: None,
             project_overrides: std::collections::BTreeMap::new(),
+            default_query: None,
         };
 
         let lines = settings_lines_from(&summary, false).join("\n");
