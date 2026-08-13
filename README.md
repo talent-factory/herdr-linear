@@ -369,13 +369,14 @@ was reversed: herdr's tab list can only report the underlying binary a pane runs
 one started bare. Under the old precedence, `agent_command = "hr"` could never actually take
 effect once any other Claude Code tab was open.)
 
-`c` tries to open `config.toml` in `nvim`, inside a herdr pane, so it's usable over SSH (e.g.
-herdr on an iPad) where there's no GUI to hand the file to. Set `editor` in the same
+`c` tries to open `config.toml` in `nvim`, right in herdr-linear's own pane — the plugin's TUI
+steps aside (leaving raw mode/the alternate screen) while the editor runs, then comes back once
+you quit it, so it's usable over SSH (e.g. herdr on an iPad) where there's no GUI to hand the
+file to, with no extra pane left behind to close afterward. Set `editor` in the same
 `config.toml` to use a different command instead (a bare binary name, no flags — e.g.
-`editor = "vim"`); it's launched the same way, inside a herdr pane. If neither `nvim` nor an
-`editor` override is available, or the herdr pane couldn't be opened, `c` falls back to your
-OS's default handler for `.toml` files — today's original behavior. Repeated `c` presses reuse
-the same editor pane rather than opening a new one each time.
+`editor = "vim"`); it's launched the same way. If neither `nvim` nor an `editor` override is
+available, or the editor exits before it can be launched, `c` falls back to your OS's default
+handler for `.toml` files — today's original behavior.
 
 "Team Issues" shows a Linear team's open issues. Unlike a project, a team has no
 repo-derived name to match, so it needs an explicit default: set `team_id` in the same
