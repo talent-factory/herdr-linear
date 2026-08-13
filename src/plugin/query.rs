@@ -91,9 +91,12 @@ use std::cmp::Ordering;
 pub struct ParsedQuery {
     /// Recognized `priority:`/`state:`/`label:` terms, in the order they appeared. A
     /// query may contain more than one term of the same kind (e.g. two `priority:`
-    /// terms) — whether repeated terms combine via AND or OR is TF-616's decision to
-    /// make when it wires these into Linear's `IssueFilter`, not something this module
-    /// picks on the caller's behalf.
+    /// terms); this module makes no attempt to dedupe or reject repeats. TF-616 settled
+    /// how repeats resolve once merged into Linear's `IssueFilter` (see
+    /// `merge_filter_terms` in `src/plugin/data.rs`): different-comparator `priority:`
+    /// repeats (`priority:>=2 priority:<=4`) combine into one range, but
+    /// same-comparator `priority:` repeats and same-kind `state:`/`label:` repeats
+    /// silently keep only the last one — ordinary last-write-wins, map-insert-style.
     pub filters: Vec<FilterTerm>,
     /// Recognized `sort:` fields, in the order they appeared. A single `sort:a,b` token
     /// expands to multiple entries here, still in left-to-right order.
@@ -113,20 +116,25 @@ pub struct ParsedQuery {
 }
 
 /// A single recognized filter constraint. Parsing only captures *what* was asked for —
-/// applying it against fetched issues (matching `state`/`label` names, wiring `priority`
-/// into Linear's `IssueFilter`) is TF-616's job.
+/// translating it into the `IssueFilter` JSON Linear's API expects, and merging it into
+/// the base filter, is TF-616's job (`filter_term_fragment`/`merge_filter_terms` in
+/// `src/plugin/data.rs`). All three variants are wired the same way: server-side,
+/// against Linear's own filter comparators — none of them match against already-fetched
+/// `Issue` structs client-side.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FilterTerm {
     /// `priority:<op><value>` — see [`Priority`] for the range this carries.
     Priority { op: PriorityOp, value: Priority },
     /// `state:<name>` — raw, un-normalized name text, exactly as typed (quotes stripped
-    /// if the token was quoted). TF-616 is expected to match this case-insensitively
-    /// against `Issue::state.name`; the actual comparison strategy is TF-616's call, not
-    /// this module's — normalizing here would just be guessing at it early.
+    /// if the token was quoted). TF-616 matches this server-side against Linear's own
+    /// state name via a case-insensitive `eqIgnoreCase` comparator (see
+    /// `filter_term_fragment` in `src/plugin/data.rs`) — not normalized here, since the
+    /// case-folding is Linear's to do, not this parser's.
     State(String),
     /// `label:<name>` — raw, un-normalized name text, exactly as typed (quotes stripped
-    /// if the token was quoted). TF-616 is expected to match this against `Issue::labels`
-    /// downstream; whether that comparison is case-sensitive is also TF-616's call.
+    /// if the token was quoted). TF-616 matches this server-side against a label's name
+    /// via the same case-insensitive `eqIgnoreCase` comparator [`FilterTerm::State`]
+    /// uses (see `filter_term_fragment` in `src/plugin/data.rs`).
     Label(String),
 }
 
