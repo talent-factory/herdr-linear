@@ -82,6 +82,13 @@ pub enum ViewState {
         marked: HashSet<usize>,
         /// Type-to-filter state for this view's list. See [`FilterState`].
         filter: FilterState,
+        /// Vertical scroll offset into the Detail pane's rendered lines for the
+        /// currently selected issue, in rows. Reset to `0` whenever `selected` changes
+        /// (a new issue's description has nothing to do with the old scroll position) —
+        /// see `move_selection_down`/`move_selection_up` and the filter mutators that
+        /// also reset `selected`. Mirrors `HelpOverlayState::scroll`'s same
+        /// reset-on-context-switch discipline.
+        detail_scroll: u16,
     },
     /// An error occurred.
     Error {
@@ -420,6 +427,7 @@ impl App {
                     selected: 0,
                     marked: HashSet::new(),
                     filter: FilterState::default(),
+                    detail_scroll: 0,
                 },
             );
         }
@@ -452,6 +460,7 @@ impl App {
                 issues,
                 selected,
                 filter,
+                detail_scroll,
                 ..
             },
         ) = &mut self.screen
@@ -459,6 +468,7 @@ impl App {
             let matched = matching_issue_indices(issues, &filter.query).len();
             if matched > 0 && *selected + 1 < matched {
                 *selected += 1;
+                *detail_scroll = 0;
             }
         }
     }
@@ -466,10 +476,47 @@ impl App {
     /// Moves the selection up one position within the filtered subset, if there are
     /// matching issues above. No-op outside a loaded view.
     pub fn move_selection_up(&mut self) {
-        if let Screen::View(_, ViewState::Loaded { selected, .. }) = &mut self.screen {
+        if let Screen::View(
+            _,
+            ViewState::Loaded {
+                selected,
+                detail_scroll,
+                ..
+            },
+        ) = &mut self.screen
+        {
             if *selected > 0 {
                 *selected -= 1;
+                *detail_scroll = 0;
             }
+        }
+    }
+
+    /// Scrolls the Detail pane's content down one row (`j`), clamped so the stored
+    /// offset can never advance past the last row of `content_line_count` (the selected
+    /// issue's rendered row count — see `ui::detail_line_count`, which callers must pass
+    /// since only `ui.rs` knows how the issue's header/Markdown body actually renders).
+    /// Mirrors `help_overlay_scroll_down`'s identical clamp-in-`App` rationale: leaving
+    /// this unbounded would let a held-down `j` drive the offset far past the content,
+    /// leaving the pane blank until an equal number of `k` presses recovered it. No-op
+    /// outside a loaded view.
+    pub fn detail_scroll_down(&mut self, content_line_count: usize) {
+        if let Screen::View(_, ViewState::Loaded { detail_scroll, .. }) = &mut self.screen {
+            // `.min(u16::MAX as usize)` before the cast, mirroring `ui::status_banner_
+            // height`'s identical guard: an implausibly long description (needing more
+            // than 65,535 rendered rows) would otherwise wrap `as u16` around to a small
+            // number and *under*-clamp, letting `detail_scroll` advance far past the real
+            // content instead of stopping at its true end.
+            let max_scroll = content_line_count.saturating_sub(1).min(u16::MAX as usize) as u16;
+            *detail_scroll = detail_scroll.saturating_add(1).min(max_scroll);
+        }
+    }
+
+    /// Scrolls the Detail pane's content up one row (`k`), clamped at the top. No-op
+    /// outside a loaded view.
+    pub fn detail_scroll_up(&mut self) {
+        if let Screen::View(_, ViewState::Loaded { detail_scroll, .. }) = &mut self.screen {
+            *detail_scroll = detail_scroll.saturating_sub(1);
         }
     }
 
@@ -510,6 +557,7 @@ impl App {
                 selected,
                 marked,
                 filter,
+                ..
             },
         ) = &mut self.screen
         {
@@ -581,13 +629,17 @@ impl App {
         if let Screen::View(
             _,
             ViewState::Loaded {
-                filter, selected, ..
+                filter,
+                selected,
+                detail_scroll,
+                ..
             },
         ) = &mut self.screen
         {
             if filter.editing {
                 filter.query.push(c);
                 *selected = 0;
+                *detail_scroll = 0;
             }
         }
     }
@@ -598,13 +650,17 @@ impl App {
         if let Screen::View(
             _,
             ViewState::Loaded {
-                filter, selected, ..
+                filter,
+                selected,
+                detail_scroll,
+                ..
             },
         ) = &mut self.screen
         {
             if filter.editing {
                 filter.query.pop();
                 *selected = 0;
+                *detail_scroll = 0;
             }
         }
     }
@@ -625,7 +681,10 @@ impl App {
         if let Screen::View(
             _,
             ViewState::Loaded {
-                filter, selected, ..
+                filter,
+                selected,
+                detail_scroll,
+                ..
             },
         ) = &mut self.screen
         {
@@ -633,6 +692,7 @@ impl App {
                 filter.editing = false;
                 filter.query.clear();
                 *selected = 0;
+                *detail_scroll = 0;
             }
         }
     }
@@ -887,6 +947,24 @@ pub fn handle_key(
             app.move_selection_up();
             None
         }
+        KeyCode::Char('j') => {
+            // `detail_scroll_down` needs `&mut self` to clamp against the selected
+            // issue's rendered row count, so that count is computed into a local first
+            // (immutable borrow of `app` via `selected_issue`) rather than held across
+            // the mutating call — same pattern `handle_help_overlay_key` uses for
+            // `help_overlay_scroll_down`'s `HelpTab` lookup.
+            let content_line_count = app
+                .selected_issue()
+                .map(crate::plugin::ui::detail_line_count);
+            if let Some(content_line_count) = content_line_count {
+                app.detail_scroll_down(content_line_count);
+            }
+            None
+        }
+        KeyCode::Char('k') => {
+            app.detail_scroll_up();
+            None
+        }
         KeyCode::Char('o') => app
             .selected_issue()
             .map(|issue| Action::OpenInBrowser(issue.url.clone())),
@@ -912,6 +990,82 @@ pub fn handle_key(
             }
         }
         _ => None,
+    }
+}
+
+/// Rows the Detail pane scrolls per wheel notch (`handle_mouse`) — a few lines per
+/// notch, matching the common terminal/OS wheel convention (herdr's own default for its
+/// native pane scrollback, `mouse_scroll_lines`, is also 3) rather than `j`/`k`'s
+/// single-row step, which would feel sluggish under a wheel.
+const DETAIL_WHEEL_STEP: usize = 3;
+
+/// Dispatches a mouse event. Mouse input is additive to the keyboard-first design —
+/// mirroring `herdr-file-viewer`'s own "keyboard-first, mouse additive" rationale for
+/// requesting capture at all (see `main.rs::run_tui`) — so only the wheel is handled
+/// here; every other kind (clicks, drags) is a deliberate no-op, since `App` has no
+/// click-target or divider-drag state to act on one with, and none was requested.
+///
+/// While the help overlay is open it owns the wheel too (mirrors `handle_help_overlay_key`'s
+/// identical rule for the keyboard — otherwise the wheel would silently scroll the `Loaded`
+/// view underneath, invisible behind the overlay). Otherwise the wheel scrolls whichever pane
+/// the pointer is over: the List (left half of `terminal_width`, matching `ui::draw_view`'s
+/// 50/50 horizontal split) moves `selected` one issue per notch — the same step `↑`/`↓` use,
+/// since the list has no independent scroll-viewport of its own (`ratatui::List` tracks that
+/// internally from `selected`) — and the Detail pane (right half) scrolls
+/// `DETAIL_WHEEL_STEP` rows per notch via the same clamped `detail_scroll_down`/
+/// `detail_scroll_up` the `j`/`k` keys use. A no-op outside a loaded view (menu, loading,
+/// error) — `move_selection_down`/`up`/`detail_scroll_down`/`up` are already no-ops there.
+pub fn handle_mouse(
+    app: &mut App,
+    kind: crossterm::event::MouseEventKind,
+    column: u16,
+    terminal_width: u16,
+) {
+    use crossterm::event::MouseEventKind;
+
+    // `HelpTab` is `Copy`, so it's read into a local first rather than holding an
+    // immutable borrow of `app` across the mutating scroll call below — same pattern
+    // `handle_help_overlay_key` uses for its own `content_line_count` lookup.
+    let overlay_tab = app.help_overlay().map(|state| state.tab);
+    if let Some(tab) = overlay_tab {
+        match kind {
+            MouseEventKind::ScrollDown => {
+                app.help_overlay_scroll_down(crate::plugin::ui::content_line_count(tab))
+            }
+            MouseEventKind::ScrollUp => app.help_overlay_scroll_up(),
+            _ => {}
+        }
+        return;
+    }
+
+    // `div_ceil`, not plain `/` (floor division): `ui::draw_view`'s two `Constraint::
+    // Percentage(50)` chunks split an odd `terminal_width` unevenly — ratatui gives the
+    // *first* (List) chunk `ceil(width / 2)` columns and the second (Detail) `floor(width
+    // / 2)`. A floor-division boundary here would misclassify the List pane's own last
+    // column (index `width / 2`) as Detail on every odd width — verified against the
+    // pinned `ratatui` version's actual split behavior (PR #44 review).
+    let over_list = column < terminal_width.div_ceil(2);
+    match kind {
+        MouseEventKind::ScrollDown if over_list => app.move_selection_down(),
+        MouseEventKind::ScrollUp if over_list => app.move_selection_up(),
+        MouseEventKind::ScrollDown => {
+            // Same borrow-timing reason as the overlay branch above: resolve the
+            // selected issue's row count into an owned `usize` first.
+            let content_line_count = app
+                .selected_issue()
+                .map(crate::plugin::ui::detail_line_count);
+            if let Some(content_line_count) = content_line_count {
+                for _ in 0..DETAIL_WHEEL_STEP {
+                    app.detail_scroll_down(content_line_count);
+                }
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            for _ in 0..DETAIL_WHEEL_STEP {
+                app.detail_scroll_up();
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1010,6 +1164,14 @@ mod tests {
         let mut app = App::new();
         app.enter_selected_menu_option();
         app
+    }
+
+    /// The current view's Detail-pane scroll offset, or `None` outside a loaded view.
+    fn detail_scroll_of(app: &App) -> Option<u16> {
+        match &app.screen {
+            Screen::View(_, ViewState::Loaded { detail_scroll, .. }) => Some(*detail_scroll),
+            _ => None,
+        }
     }
 
     #[test]
@@ -1164,6 +1326,82 @@ mod tests {
     }
 
     #[test]
+    fn detail_scroll_down_increases_offset_and_clamps_at_content_end() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+
+        app.detail_scroll_down(3); // 3 rows of content: offsets 0..=2 are valid
+        assert_eq!(detail_scroll_of(&app), Some(1));
+
+        app.detail_scroll_down(3);
+        assert_eq!(detail_scroll_of(&app), Some(2));
+
+        app.detail_scroll_down(3); // already at the last row — must not overshoot
+        assert_eq!(detail_scroll_of(&app), Some(2));
+    }
+
+    #[test]
+    fn detail_scroll_up_decreases_offset_and_clamps_at_zero() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        app.detail_scroll_down(3);
+        app.detail_scroll_down(3);
+        assert_eq!(detail_scroll_of(&app), Some(2));
+
+        app.detail_scroll_up();
+        assert_eq!(detail_scroll_of(&app), Some(1));
+
+        app.detail_scroll_up();
+        assert_eq!(detail_scroll_of(&app), Some(0));
+
+        app.detail_scroll_up(); // already at 0 — must not underflow/panic
+        assert_eq!(detail_scroll_of(&app), Some(0));
+    }
+
+    #[test]
+    fn detail_scroll_is_a_no_op_outside_a_loaded_view() {
+        let mut app = App::new(); // still on the menu
+
+        app.detail_scroll_down(10);
+        app.detail_scroll_up();
+
+        assert_eq!(detail_scroll_of(&app), None);
+    }
+
+    #[test]
+    fn moving_selection_resets_detail_scroll_to_zero() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
+        app.detail_scroll_down(10);
+        assert_eq!(detail_scroll_of(&app), Some(1));
+
+        app.move_selection_down();
+        assert_eq!(
+            detail_scroll_of(&app),
+            Some(0),
+            "a newly selected issue's description has nothing to do with the old scroll position"
+        );
+
+        app.detail_scroll_down(10);
+        app.move_selection_up();
+        assert_eq!(detail_scroll_of(&app), Some(0));
+    }
+
+    #[test]
+    fn a_clamped_no_op_selection_move_does_not_disturb_detail_scroll() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]); // single issue: selection can't move
+        app.detail_scroll_down(10);
+        assert_eq!(detail_scroll_of(&app), Some(1));
+
+        app.move_selection_down(); // no-op: already at the only issue
+        assert_eq!(detail_scroll_of(&app), Some(1));
+
+        app.move_selection_up(); // no-op: already at the first issue
+        assert_eq!(detail_scroll_of(&app), Some(1));
+    }
+
+    #[test]
     fn navigation_on_an_empty_list_does_not_panic() {
         let mut app = app_in_my_issues_view();
         app.set_issues(vec![]);
@@ -1221,6 +1459,281 @@ mod tests {
 
         assert_eq!(action, None);
         assert_eq!(app.selected_issue().unwrap().identifier, "ENG-1");
+    }
+
+    #[test]
+    fn j_key_scrolls_detail_down_and_clamps_at_the_end() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+
+        let action = handle_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(action, None);
+        assert_eq!(detail_scroll_of(&app), Some(1));
+
+        // Enough presses to run well past any real content length — the clamp (via
+        // `ui::detail_line_count`, computed from the real selected issue) must hold
+        // instead of running away or panicking, mirroring the help overlay's identical
+        // TF-585 clamp-in-`App` guard.
+        for _ in 0..50 {
+            handle_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        }
+        let clamped = detail_scroll_of(&app).unwrap();
+
+        handle_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(
+            detail_scroll_of(&app),
+            Some(clamped),
+            "scroll offset must stay clamped at the content's last row"
+        );
+    }
+
+    #[test]
+    fn k_key_scrolls_detail_up_and_clamps_at_zero() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        handle_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(detail_scroll_of(&app), Some(2));
+
+        let action = handle_key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+        assert_eq!(action, None);
+        assert_eq!(detail_scroll_of(&app), Some(1));
+
+        handle_key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE); // already at 0
+        assert_eq!(detail_scroll_of(&app), Some(0));
+    }
+
+    use crossterm::event::{MouseButton, MouseEventKind};
+
+    /// A wheel notch over the left half of an 80-column terminal — the List pane, per
+    /// `handle_mouse`'s 50/50 split (matching `ui::draw_view`'s `chunks`).
+    const LIST_COLUMN: u16 = 5;
+    /// A wheel notch over the right half of the same 80-column terminal — the Detail pane.
+    const DETAIL_COLUMN: u16 = 70;
+    const TERMINAL_WIDTH: u16 = 80;
+
+    #[test]
+    fn mouse_scroll_down_over_the_list_moves_selection() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
+
+        handle_mouse(
+            &mut app,
+            MouseEventKind::ScrollDown,
+            LIST_COLUMN,
+            TERMINAL_WIDTH,
+        );
+
+        assert_eq!(app.selected_issue().unwrap().identifier, "ENG-2");
+    }
+
+    #[test]
+    fn mouse_scroll_up_over_the_list_moves_selection_back() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
+        app.move_selection_down();
+
+        handle_mouse(
+            &mut app,
+            MouseEventKind::ScrollUp,
+            LIST_COLUMN,
+            TERMINAL_WIDTH,
+        );
+
+        assert_eq!(app.selected_issue().unwrap().identifier, "ENG-1");
+    }
+
+    #[test]
+    fn mouse_scroll_over_the_lists_own_last_column_moves_selection_on_an_odd_width() {
+        // Regression test (PR #44 review): `ratatui`'s two `Constraint::Percentage(50)`
+        // chunks split an odd width unevenly — the List pane (first chunk) gets
+        // `ceil(width / 2)` columns, the Detail pane (second chunk) gets `floor(width /
+        // 2)`. At width 79 that's List columns 0..=39 (40 columns) and Detail 40..=78. A
+        // floor-division boundary (`column < width / 2` = `column < 39`) would
+        // misclassify column 39 — the List pane's own last column — as Detail. This must
+        // route to the List instead.
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
+        const ODD_TERMINAL_WIDTH: u16 = 79;
+        const LISTS_LAST_COLUMN: u16 = 39;
+
+        handle_mouse(
+            &mut app,
+            MouseEventKind::ScrollDown,
+            LISTS_LAST_COLUMN,
+            ODD_TERMINAL_WIDTH,
+        );
+
+        assert_eq!(app.selected_issue().unwrap().identifier, "ENG-2");
+        assert_eq!(
+            detail_scroll_of(&app),
+            Some(0),
+            "must not have been misrouted to the Detail pane"
+        );
+    }
+
+    #[test]
+    fn mouse_scroll_down_over_the_detail_pane_scrolls_detail_by_the_wheel_step() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+
+        handle_mouse(
+            &mut app,
+            MouseEventKind::ScrollDown,
+            DETAIL_COLUMN,
+            TERMINAL_WIDTH,
+        );
+
+        assert_eq!(detail_scroll_of(&app), Some(DETAIL_WHEEL_STEP as u16));
+        // Selection itself must be untouched — the wheel over the Detail pane scrolls
+        // text, it never re-targets which issue is selected.
+        assert_eq!(app.selected_issue().unwrap().identifier, "ENG-1");
+    }
+
+    #[test]
+    fn mouse_scroll_up_over_the_detail_pane_scrolls_detail_back_and_clamps_at_zero() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        handle_mouse(
+            &mut app,
+            MouseEventKind::ScrollDown,
+            DETAIL_COLUMN,
+            TERMINAL_WIDTH,
+        );
+        assert_eq!(detail_scroll_of(&app), Some(DETAIL_WHEEL_STEP as u16));
+
+        handle_mouse(
+            &mut app,
+            MouseEventKind::ScrollUp,
+            DETAIL_COLUMN,
+            TERMINAL_WIDTH,
+        );
+        assert_eq!(detail_scroll_of(&app), Some(0));
+
+        // Already at 0 — must not underflow/panic.
+        handle_mouse(
+            &mut app,
+            MouseEventKind::ScrollUp,
+            DETAIL_COLUMN,
+            TERMINAL_WIDTH,
+        );
+        assert_eq!(detail_scroll_of(&app), Some(0));
+    }
+
+    #[test]
+    fn mouse_wheel_is_a_no_op_outside_a_loaded_view() {
+        let mut app = App::new(); // still on the menu
+
+        handle_mouse(
+            &mut app,
+            MouseEventKind::ScrollDown,
+            LIST_COLUMN,
+            TERMINAL_WIDTH,
+        );
+        handle_mouse(
+            &mut app,
+            MouseEventKind::ScrollDown,
+            DETAIL_COLUMN,
+            TERMINAL_WIDTH,
+        );
+
+        assert!(matches!(app.screen, Screen::Menu { selected: 0 }));
+    }
+
+    #[test]
+    fn mouse_wheel_is_a_no_op_while_loading_or_on_the_error_screen() {
+        // The test above only exercises `Screen::Menu` — this covers the other two
+        // "outside a loaded view" screens, reached via a different `Screen::View` arm.
+        let mut loading = app_in_my_issues_view(); // Screen::View(_, ViewState::Loading)
+        handle_mouse(
+            &mut loading,
+            MouseEventKind::ScrollDown,
+            LIST_COLUMN,
+            TERMINAL_WIDTH,
+        );
+        handle_mouse(
+            &mut loading,
+            MouseEventKind::ScrollDown,
+            DETAIL_COLUMN,
+            TERMINAL_WIDTH,
+        );
+        assert!(matches!(
+            loading.screen,
+            Screen::View(ViewKind::MyIssues, ViewState::Loading)
+        ));
+
+        let mut error = app_in_my_issues_view();
+        error.set_error("boom".to_string());
+        handle_mouse(
+            &mut error,
+            MouseEventKind::ScrollDown,
+            LIST_COLUMN,
+            TERMINAL_WIDTH,
+        );
+        handle_mouse(
+            &mut error,
+            MouseEventKind::ScrollDown,
+            DETAIL_COLUMN,
+            TERMINAL_WIDTH,
+        );
+        assert!(matches!(
+            error.screen,
+            Screen::View(ViewKind::MyIssues, ViewState::Error { .. })
+        ));
+    }
+
+    #[test]
+    fn mouse_click_is_a_deliberate_no_op() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
+
+        // No click/drag support yet (not requested) — every one of these falls through
+        // `handle_mouse`'s final `_ => {}` arm, so selection and scroll stay untouched
+        // regardless of which specific kind arrives.
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Moved,
+        ] {
+            handle_mouse(&mut app, kind, LIST_COLUMN, TERMINAL_WIDTH);
+        }
+
+        assert_eq!(app.selected_issue().unwrap().identifier, "ENG-1");
+        assert_eq!(detail_scroll_of(&app), Some(0));
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_the_help_overlay_when_open_regardless_of_column() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
+        app.open_help_overlay();
+
+        // Over what would be the List half were the overlay closed — it must still hit
+        // the overlay, not fall through to the Loaded view underneath.
+        handle_mouse(
+            &mut app,
+            MouseEventKind::ScrollDown,
+            LIST_COLUMN,
+            TERMINAL_WIDTH,
+        );
+        assert_eq!(app.help_overlay().unwrap().scroll, 1);
+
+        // Over what would be the Detail half — must hit the same overlay, not the Detail
+        // pane's own scroll. If the column check ever leaked into this branch, this would
+        // land on `detail_scroll` instead of continuing to advance `help_overlay().scroll`.
+        handle_mouse(
+            &mut app,
+            MouseEventKind::ScrollDown,
+            DETAIL_COLUMN,
+            TERMINAL_WIDTH,
+        );
+        assert_eq!(app.help_overlay().unwrap().scroll, 2);
+
+        // The hidden Loaded view underneath must be untouched throughout.
+        assert_eq!(app.selected_issue().unwrap().identifier, "ENG-1");
+        assert_eq!(detail_scroll_of(&app), Some(0));
     }
 
     #[test]
@@ -1341,6 +1854,23 @@ mod tests {
 
         assert!(app.marked_issues().is_empty());
         assert!(!app.is_marked(0));
+    }
+
+    #[test]
+    fn set_issues_resets_detail_scroll_left_over_from_a_previous_list() {
+        // Mirrors `set_issues_clears_marks_left_over_from_a_previous_list`: a second
+        // `set_issues` call (retry/re-fetch) must reset `detail_scroll` alongside
+        // `issues`/`selected`/`marked`, not just on first entry into the view — otherwise a
+        // stale scroll offset would open the newly-fetched first issue's description
+        // mid-scroll instead of at the top.
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
+        app.detail_scroll_down(10);
+        assert_eq!(detail_scroll_of(&app), Some(1));
+
+        app.set_issues(vec![sample_issue("ENG-3")]);
+
+        assert_eq!(detail_scroll_of(&app), Some(0));
     }
 
     #[test]
@@ -2032,6 +2562,19 @@ mod tests {
     }
 
     #[test]
+    fn typing_a_filter_character_resets_detail_scroll_to_zero() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
+        app.detail_scroll_down(10);
+        assert_eq!(detail_scroll_of(&app), Some(1));
+
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+
+        assert_eq!(detail_scroll_of(&app), Some(0));
+    }
+
+    #[test]
     fn backspace_while_filtering_removes_the_last_character() {
         let mut app = app_in_my_issues_view();
         app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
@@ -2044,6 +2587,24 @@ mod tests {
 
         // Query is empty again — everything matches, same as no filter at all.
         assert_eq!(app.selected_issue().unwrap().identifier, "ENG-1");
+    }
+
+    #[test]
+    fn backspace_while_filtering_resets_detail_scroll_to_zero() {
+        // Mirrors `typing_a_filter_character_resets_detail_scroll_to_zero` — `pop_filter_char`
+        // resets `selected` exactly like `push_filter_char` does, so it must reset
+        // `detail_scroll` alongside it too, for the same reason: the narrowed-then-widened
+        // match set can land `selected` on a different issue than before.
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        app.detail_scroll_down(10);
+        assert_eq!(detail_scroll_of(&app), Some(1));
+
+        handle_key(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+
+        assert_eq!(detail_scroll_of(&app), Some(0));
     }
 
     #[test]
@@ -2111,6 +2672,19 @@ mod tests {
         app.move_selection_down();
         assert_eq!(app.selected_issue().unwrap().identifier, "ENG-2");
         assert_eq!(app.current_view(), Some(ViewKind::MyIssues));
+    }
+
+    #[test]
+    fn esc_while_filtering_resets_detail_scroll_to_zero() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
+        app.detail_scroll_down(10);
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        assert_eq!(detail_scroll_of(&app), Some(1));
+
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+        assert_eq!(detail_scroll_of(&app), Some(0));
     }
 
     #[test]

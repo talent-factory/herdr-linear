@@ -5,6 +5,7 @@ use crate::plugin::app::{
     matching_issue_indices, App, HelpOverlayState, HelpTab, Screen, Status, ViewKind, ViewState,
     MENU_OPTIONS,
 };
+use crate::Issue;
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
@@ -125,6 +126,7 @@ fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState, status: 
             selected,
             marked,
             filter,
+            detail_scroll,
         } => {
             let area = if let Some(status) = status {
                 let banner_height = status_banner_height(status.text(), frame.area().width);
@@ -240,36 +242,7 @@ fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState, status: 
                 // without depending on ratatui's unstable line-counting API.
                 // A single scrollable block sidesteps that entirely: nothing
                 // downstream of the title can be clipped by it.
-                let assignee = issue
-                    .assignee
-                    .as_ref()
-                    .map(|user| user.name.as_str())
-                    .unwrap_or("Unassigned");
-                let project = issue
-                    .project
-                    .as_ref()
-                    .map(|project| project.name.as_str())
-                    .unwrap_or("None");
-
-                let mut lines = vec![
-                    Line::from(issue.identifier.as_str()),
-                    Line::from(""),
-                    Line::from(issue.title.as_str()),
-                    Line::from(""),
-                    Line::from(format!("Status: {}", issue.state.name)),
-                    Line::from(format!("Assignee: {assignee}")),
-                    Line::from(format!("Project: {project}")),
-                    Line::from(""),
-                ];
-
-                let description = issue.description.as_deref().unwrap_or_default();
-                let options = tui_markdown::Options::new(MarkdownStyleSheet);
-                let markdown_lines =
-                    tui_markdown::from_str_with_options(description, &options).lines;
-                lines.extend(harden_list_item_wrapping(
-                    &markdown_lines,
-                    detail_area.width as usize,
-                ));
+                let lines = build_detail_lines(issue, detail_area.width as usize);
 
                 let sections = Layout::default()
                     .direction(Direction::Vertical)
@@ -281,7 +254,13 @@ fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState, status: 
                 // indented code — `trim: true` would strip it and flatten that
                 // structure away. The header lines above have no leading
                 // whitespace to begin with, so this is harmless for them.
-                let body = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+                // `.scroll` applies `App::detail_scroll` — moved by the `j`/`k`
+                // keybindings in `handle_key` — so a description too long for
+                // `sections[0]` is reachable instead of being silently clipped
+                // past the bottom.
+                let body = Paragraph::new(Text::from(lines))
+                    .wrap(Wrap { trim: false })
+                    .scroll((*detail_scroll, 0));
                 frame.render_widget(body, sections[0]);
 
                 let footer = Paragraph::new(format!("URL: {}", issue.url));
@@ -289,6 +268,87 @@ fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState, status: 
             }
         }
     }
+}
+
+/// Builds the Detail pane's full line list for `issue` — header fields
+/// (identifier, title, Status/Assignee/Project) followed by its Markdown
+/// description, rewrapped for `width` columns (see
+/// [`harden_list_item_wrapping`]). Shared by `draw_view`'s real render (called
+/// with the pane's actual, dynamic width) and [`detail_line_count`] (called with
+/// [`DETAIL_CONSERVATIVE_WRAP_WIDTH`] instead), so the two can never drift out
+/// of sync with each other — see `detail_line_count`'s own doc for why a
+/// narrower-than-real assumed width there is the safe direction.
+fn build_detail_lines(issue: &Issue, width: usize) -> Vec<Line<'static>> {
+    let assignee = issue
+        .assignee
+        .as_ref()
+        .map(|user| user.name.as_str())
+        .unwrap_or("Unassigned");
+    let project = issue
+        .project
+        .as_ref()
+        .map(|project| project.name.as_str())
+        .unwrap_or("None");
+
+    let mut lines = vec![
+        Line::from(issue.identifier.clone()),
+        Line::from(""),
+        Line::from(issue.title.clone()),
+        Line::from(""),
+        Line::from(format!("Status: {}", issue.state.name)),
+        Line::from(format!("Assignee: {assignee}")),
+        Line::from(format!("Project: {project}")),
+        Line::from(""),
+    ];
+
+    let description = issue.description.as_deref().unwrap_or_default();
+    let options = tui_markdown::Options::new(MarkdownStyleSheet);
+    let markdown_lines = tui_markdown::from_str_with_options(description, &options).lines;
+    lines.extend(harden_list_item_wrapping(&markdown_lines, width));
+    lines
+}
+
+/// The *rendered* row count of the Detail pane's content for `issue` — the number of
+/// terminal rows [`build_detail_lines`]'s output will actually occupy once `draw_view`
+/// wraps it with `Wrap { trim: false }`, not just the number of logical lines. Lets
+/// `App::detail_scroll_down` clamp the stored scroll offset against what will really be
+/// on screen, mirroring [`content_line_count`]'s identical role for the help overlay —
+/// see that function's doc for the full "narrower-than-real is the safe over-counting
+/// direction" rationale, which applies here unchanged. `App` stays deliberately unaware
+/// of terminal size, so this uses [`DETAIL_CONSERVATIVE_WRAP_WIDTH`] rather than the
+/// Detail pane's real, dynamic width.
+pub(crate) fn detail_line_count(issue: &Issue) -> usize {
+    build_detail_lines(issue, DETAIL_CONSERVATIVE_WRAP_WIDTH)
+        .iter()
+        .map(|line| word_wrapped_row_count(&line_plain_text(line), DETAIL_CONSERVATIVE_WRAP_WIDTH))
+        .sum()
+}
+
+/// Assumed content width (columns) used only to keep [`detail_line_count`]'s scroll-clamp
+/// ceiling from running out ahead of the real, wrapped render — see that function's doc
+/// for why a narrower-than-real assumption is the safe direction. The Detail pane is the
+/// right half of a 50/50 horizontal split (`draw_view`'s `chunks`), minus 2 columns for
+/// its bordered `Block`; even an unusually narrow 44-column terminal still leaves
+/// `44 / 2 - 2 = 20` columns of real content width. Review fix (PR #44): the first cut of
+/// this constant was set to exactly `20` — equal to, not below, that floor, so it carried
+/// *zero* actual margin despite its own doc claiming one; any terminal narrower than 44
+/// columns would silently violate the "narrower-than-real is safe" invariant
+/// `detail_line_count` depends on. `18` restores a genuine 2-column buffer below the
+/// 44-column floor (down to a 40-column terminal), mirroring the sibling
+/// `CONSERVATIVE_WRAP_WIDTH`'s own real 2-column margin (`30` real vs. `28` assumed) —
+/// see the `detail_line_count_estimate_stays_at_or_below_the_real_wrapped_row_count_at_a_
+/// narrow_width` test below, which pins the margin down directly rather than relying on
+/// this comment's arithmetic staying honest on its own.
+const DETAIL_CONSERVATIVE_WRAP_WIDTH: usize = 18;
+
+/// The plain text of `line`, ignoring styling — its spans' `content` concatenated in
+/// order. [`word_wrapped_row_count`] only needs the text, not [`build_detail_lines`]'s
+/// per-span styling (bold headings, code, etc. from [`MarkdownStyleSheet`]).
+fn line_plain_text(line: &Line) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
 }
 
 /// Bullet substituted for `tui-markdown`'s literal `-` unordered-list marker
@@ -1084,7 +1144,6 @@ fn centered_rect(
 mod tests {
     use super::*;
     use crate::plugin::app::{handle_key, App};
-    use crate::Issue;
     use crossterm::event::{KeyCode, KeyModifiers};
     use ratatui::{backend::TestBackend, layout::Alignment, Terminal};
     use serde_json::json;
@@ -2043,6 +2102,122 @@ mod tests {
         assert!(
             wrapped_rows > 1,
             "expected wrapping to inflate the row count beyond the raw entry count of 1"
+        );
+    }
+
+    /// Mirrors [`content_line_count_accounts_for_wrapping_of_a_long_line`]'s guard, for
+    /// the Detail pane: a single long description paragraph must inflate
+    /// [`detail_line_count`]'s estimate well beyond a short one, not just contribute the
+    /// same one row regardless of length.
+    #[test]
+    fn detail_line_count_accounts_for_wrapping_of_a_long_description() {
+        let short = sample_issue_with_description("ENG-1", "short");
+        let long_description = "word ".repeat(80); // far wider than any realistic pane width
+        let long = sample_issue_with_description("ENG-1", &long_description);
+
+        assert!(
+            detail_line_count(&long) > detail_line_count(&short),
+            "a long description must inflate the row count beyond a short one"
+        );
+    }
+
+    #[test]
+    fn detail_line_count_counts_the_fixed_header_lines_even_with_an_empty_description() {
+        let issue = sample_issue("ENG-1");
+
+        // identifier, blank, title, blank, Status, Assignee, Project, blank — 8 header
+        // lines, each contributing at least one row even before any description content.
+        assert!(detail_line_count(&issue) >= 8);
+    }
+
+    /// Regression test (PR #44 review): pins down `DETAIL_CONSERVATIVE_WRAP_WIDTH`'s own
+    /// "narrower-than-real is safe" margin directly, rather than trusting its doc comment's
+    /// arithmetic to stay honest on its own — which is exactly how the original `20`
+    /// (zero margin below its claimed 44-column/20-column floor) shipped unnoticed. At a
+    /// 40-column terminal (real Detail-pane content width `40 / 2 - 2 = 18`, narrower than
+    /// the 44-column terminal the doc calls out), `detail_line_count`'s estimate — built
+    /// from the fixed conservative width, oblivious to the real one — must still be at
+    /// least as large as what a real render at that narrower width actually needs. A
+    /// constant equal to or wider than the real floor would under-count here instead,
+    /// exactly the "`j`/wheel clamps short of the true end" failure this invariant exists
+    /// to prevent.
+    #[test]
+    fn detail_line_count_estimate_stays_at_or_above_the_real_wrapped_row_count_at_a_narrow_width() {
+        const NARROWEST_SUPPORTED_REAL_WIDTH: usize = 18; // a 40-column terminal's Detail pane
+
+        let long_description = "word ".repeat(80); // forces real wrapping at either width
+        let issue = sample_issue_with_description("ENG-1", &long_description);
+
+        let estimate = detail_line_count(&issue);
+        let real_rows: usize = build_detail_lines(&issue, NARROWEST_SUPPORTED_REAL_WIDTH)
+            .iter()
+            .map(|line| {
+                word_wrapped_row_count(&line_plain_text(line), NARROWEST_SUPPORTED_REAL_WIDTH)
+            })
+            .sum();
+
+        assert!(
+            estimate >= real_rows,
+            "estimate ({estimate}) must stay at or above the real render's row count \
+             ({real_rows}) at the narrowest supported terminal width"
+        );
+    }
+
+    /// Regression test (PR #44 review): every other `App::detail_scroll` test asserts on
+    /// `App` state alone, never on what actually reaches the screen — so a wiring break in
+    /// `draw_view` (a swapped `.scroll((0, *detail_scroll))` instead of
+    /// `.scroll((*detail_scroll, 0))`, or the `.scroll(...)` call dropped entirely) would
+    /// pass every one of them undetected despite the Detail pane silently never actually
+    /// scrolling for the user. Renders a description long enough that its first and last
+    /// paragraphs can't both fit on screen at once, and confirms scrolling to the real
+    /// rendered end moves the *rendered* content, not just the stored offset.
+    ///
+    /// Scrolls by the *real* row count at the render's actual width (60 columns → a
+    /// 28-column Detail pane), not `detail_line_count`'s conservative estimate (built for
+    /// a narrower, unrelated assumed width — see `detail_line_count_estimate_stays_at_or_
+    /// above_the_real_wrapped_row_count_at_a_narrow_width` for that invariant on its own).
+    /// Scrolling to the *estimate*'s max here would overshoot past this test's real,
+    /// wider-than-assumed content, landing on blank space past the end rather than on the
+    /// last real line — `Paragraph::scroll` doesn't clamp an offset past its own content,
+    /// it just renders nothing.
+    #[test]
+    fn detail_scroll_offset_reaches_the_rendered_detail_pane() {
+        let mut app = app_in_my_issues_view();
+        let filler = "filler paragraph\n\n".repeat(28);
+        let description = format!("ALPHA-TOP-MARKER\n\n{filler}ZULU-BOTTOM-MARKER");
+        app.set_issues(vec![sample_issue_with_description("ENG-1", &description)]);
+
+        let before = rendered_text_with_size(&app, 60, 15);
+        assert!(
+            before.contains("ALPHA-TOP-MARKER"),
+            "the first description paragraph must be visible before any scrolling"
+        );
+        assert!(
+            !before.contains("ZULU-BOTTOM-MARKER"),
+            "the last description paragraph must not already be visible before scrolling"
+        );
+
+        // The Detail pane's real content width at a 60-column terminal: half the frame
+        // (a 50/50 split, even so no ceil/floor asymmetry) minus 2 columns for its
+        // bordered `Block` — mirrors `DETAIL_CONSERVATIVE_WRAP_WIDTH`'s own formula.
+        const REAL_DETAIL_WIDTH: usize = 60 / 2 - 2;
+        let issue = app.selected_issue().unwrap();
+        let real_row_count: usize = build_detail_lines(issue, REAL_DETAIL_WIDTH)
+            .iter()
+            .map(|line| word_wrapped_row_count(&line_plain_text(line), REAL_DETAIL_WIDTH))
+            .sum();
+        for _ in 0..real_row_count {
+            app.detail_scroll_down(real_row_count);
+        }
+
+        let after = rendered_text_with_size(&app, 60, 15);
+        assert!(
+            !after.contains("ALPHA-TOP-MARKER"),
+            "the first description paragraph must have scrolled out of view"
+        );
+        assert!(
+            after.contains("ZULU-BOTTOM-MARKER"),
+            "scrolling to the clamped end must bring the last description paragraph into view"
         );
     }
 
