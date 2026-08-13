@@ -77,7 +77,7 @@ pub static KEYBINDINGS: &[KeyBinding] = &[
     },
     KeyBinding {
         keys: "/",
-        action: "Filter issues by title/identifier",
+        action: "Filter/sort issues (text, or priority:/state:/label:/sort:)",
         context: BindingContext::View,
     },
     KeyBinding {

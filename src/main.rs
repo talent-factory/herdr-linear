@@ -98,27 +98,111 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
     result
 }
 
+/// `config.toml`'s `default_query` (TF-617), parsed once per [`load_issues`] call:
+/// [`plugin::query::ParsedQuery::filters`] narrows the fetch below server-side (the same
+/// `IssueFilter` merge TF-616 wired up via `filter_terms`), while
+/// [`plugin::query::ParsedQuery::sort_keys`] orders the fetched issues before they're
+/// shown (see [`apply_fetched_issues`]). Unset (`Ok(None)`) collapses to
+/// `ParsedQuery::default()` — an empty query, i.e. no additional narrowing or ordering
+/// beyond a view's own base filter, same as before this feature existed.
+///
+/// A malformed `config.toml` (`Err`), or a `default_query` string containing
+/// recognized-but-unparseable terms (`ParsedQuery::rejected`), also falls back to
+/// `ParsedQuery::default()` for *this* fetch — review fix: an earlier version of this
+/// function swallowed both outright with no signal to the user at all. That's a real gap
+/// this function is specifically exposed to, not a hypothetical: `load_issues` is only
+/// ever called from `ensure_loaded`, which only re-resolves `client` — and so only
+/// re-validates `config.toml` — on the *first* call of a session (`client.is_none()`);
+/// every subsequent view entry or `r`-retry re-reads `config.toml` fresh right here,
+/// with no revalidation elsewhere. Editing `default_query` via the `c` keybinding and
+/// hitting `r` is the intended workflow for this feature, so a typo introduced there is
+/// an expected occurrence, not an edge case. Both failure modes are now surfaced via
+/// [`plugin::app::App::set_status`] rather than [`plugin::app::App::set_error`]: unlike
+/// `ensure_loaded`'s own config/client failure (which prevents any fetch at all, so
+/// replacing the view with an error is correct), a bad `default_query` doesn't stop the
+/// fetch — the view still loads, just without the filter/sort it couldn't apply — so a
+/// `Status` banner shown under the loaded list (see `ui.rs`) fits better, the same way
+/// the `Action::Implement` flow already reports non-fatal outcomes without discarding
+/// whatever's currently on screen. Deliberately never calls `clear_status()` on the
+/// success path: every caller of `load_issues` (`Action::Retry`/`Action::EnterView` in
+/// the event loop) already clears status before triggering a fetch, so a stale banner
+/// from a previous failed load never lingers past the next retry/view-entry.
+///
+/// Thin wrapper around [`resolved_default_query_for`], which takes `config_dir` as a
+/// parameter instead of reading `$HERDR_PLUGIN_CONFIG_DIR` here — the same pure-core/
+/// real-env-wrapper split `plugin::config::resolve_default_query`/`load_default_query`
+/// already use, and for the same reason `plugin::app::open_config_action` is split from
+/// its real-environment caller: it lets tests exercise this function's actual
+/// filters/sort/status-banner decisions against a real (tempdir) `config.toml` without
+/// mutating process-global environment state that every other test in this binary runs
+/// concurrently against.
+fn resolved_default_query(app: &mut plugin::app::App) -> plugin::query::ParsedQuery {
+    let config_dir = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR").map(std::path::PathBuf::from);
+    resolved_default_query_for(app, config_dir.as_deref())
+}
+
+/// The pure core of [`resolved_default_query`] — see its doc for the full behavior and
+/// rationale; this just takes `config_dir` as a parameter rather than reading the real
+/// environment.
+fn resolved_default_query_for(
+    app: &mut plugin::app::App,
+    config_dir: Option<&std::path::Path>,
+) -> plugin::query::ParsedQuery {
+    match plugin::config::resolve_default_query(config_dir) {
+        Ok(Some(query)) => {
+            let parsed = plugin::query::parse_query(&query);
+            if !parsed.rejected.is_empty() {
+                app.set_status(plugin::app::Status::Error(format!(
+                    "default_query in config.toml: {} term(s) not recognized, ignored: {}",
+                    parsed.rejected.len(),
+                    parsed.rejected.join(", ")
+                )));
+            }
+            parsed
+        }
+        Ok(None) => plugin::query::ParsedQuery::default(),
+        Err(err) => {
+            app.set_status(plugin::app::Status::Error(format!(
+                "default_query in config.toml could not be applied: {err}"
+            )));
+            plugin::query::ParsedQuery::default()
+        }
+    }
+}
+
+/// Sorts `issues` by `sort_keys` (a no-op for an empty slice) and hands them to
+/// [`plugin::app::App::set_issues`] — the shared tail of every `load_issues` fetch arm,
+/// so `default_query`'s `sort:` terms (TF-617) apply identically regardless of which
+/// view was entered.
+fn apply_fetched_issues(
+    app: &mut plugin::app::App,
+    mut issues: Vec<herdr_linear::Issue>,
+    sort_keys: &[plugin::query::SortKey],
+) {
+    plugin::query::sort_issues(&mut issues, sort_keys);
+    app.set_issues(issues);
+}
+
 async fn load_issues(app: &mut plugin::app::App, client: &herdr_linear::LinearClient) {
-    // No `/`-filter or `default_query` wiring yet (TF-617) — every fetch runs with the
-    // empty slice, which is a documented no-op reproducing pre-TF-616 behavior exactly.
-    let filter_terms: &[plugin::query::FilterTerm] = &[];
+    let default_query = resolved_default_query(app);
+    let filter_terms = &default_query.filters;
 
     match app.current_view() {
         Some(plugin::app::ViewKind::MyIssues) => {
             match plugin::data::fetch_my_issues(client, filter_terms).await {
-                Ok(issues) => app.set_issues(issues),
+                Ok(issues) => apply_fetched_issues(app, issues, &default_query.sort_keys),
                 Err(err) => app.set_error(err.to_string()),
             }
         }
         Some(plugin::app::ViewKind::ProjectIssues) => {
             match plugin::data::fetch_current_project_issues(client, filter_terms).await {
-                Ok(issues) => app.set_issues(issues),
+                Ok(issues) => apply_fetched_issues(app, issues, &default_query.sort_keys),
                 Err(err) => app.set_error(err.to_string()),
             }
         }
         Some(plugin::app::ViewKind::TeamIssues) => {
             match plugin::data::fetch_current_team_issues(client, filter_terms).await {
-                Ok(issues) => app.set_issues(issues),
+                Ok(issues) => apply_fetched_issues(app, issues, &default_query.sort_keys),
                 Err(err) => app.set_error(err.to_string()),
             }
         }
@@ -2084,6 +2168,162 @@ exit 1
             labels: herdr_linear::LabelConnection { nodes: vec![] },
             url: format!("https://linear.app/team/issue/{identifier}"),
         }
+    }
+
+    /// TF-617: `apply_fetched_issues` is `load_issues`'s shared post-fetch step —
+    /// confirms `default_query`'s `sort:` terms actually reorder what lands in `app`,
+    /// not just that `sort_issues`/`parse_query` are individually correct in isolation
+    /// (covered by their own unit tests in `plugin::query`).
+    #[test]
+    fn apply_fetched_issues_sorts_before_setting_them_on_app() {
+        let mut app = plugin::app::App::new();
+        app.enter_selected_menu_option();
+        let mut low = sample_issue("ENG-1");
+        low.priority = 1;
+        let mut high = sample_issue("ENG-2");
+        high.priority = 3;
+        let sort_keys = [plugin::query::SortKey {
+            field: plugin::query::SortField::Priority,
+            ascending: false,
+        }];
+
+        apply_fetched_issues(&mut app, vec![low, high], &sort_keys);
+
+        assert_eq!(app.selected_issue().unwrap().identifier, "ENG-2");
+    }
+
+    #[test]
+    fn apply_fetched_issues_with_no_sort_keys_preserves_fetch_order() {
+        let mut app = plugin::app::App::new();
+        app.enter_selected_menu_option();
+
+        apply_fetched_issues(
+            &mut app,
+            vec![sample_issue("ENG-2"), sample_issue("ENG-1")],
+            &[],
+        );
+
+        assert_eq!(app.selected_issue().unwrap().identifier, "ENG-2");
+    }
+
+    #[test]
+    fn resolved_default_query_is_empty_without_a_readable_default_query() {
+        // TF-617: deliberately doesn't set HERDR_PLUGIN_CONFIG_DIR itself — true whether
+        // it's unset, or (as plugin::app's own tests transiently do, concurrently, in
+        // this same test binary) pointed at the nonexistent literal path
+        // "/fake/config/dir" — since either way `resolve_default_query` hits a
+        // `NotFound` reading the file and resolves to `None`, exactly like a real
+        // missing config.toml would. See plugin::config's test suite for
+        // `resolve_default_query`/`load_default_query` coverage against a real
+        // config.toml, via the pure, env-free variant `resolved_default_query_for`
+        // (tested directly below) also uses.
+        let mut app = plugin::app::App::new();
+        app.enter_selected_menu_option();
+
+        let parsed = resolved_default_query(&mut app);
+
+        assert!(parsed.filters.is_empty());
+        assert!(parsed.sort_keys.is_empty());
+        assert!(app.status().is_none());
+    }
+
+    // TF-617 review fixes: `resolved_default_query_for` (the pure core of
+    // `resolved_default_query`, taking `config_dir` directly so these tests never touch
+    // the process-global `HERDR_PLUGIN_CONFIG_DIR` every other test in this binary runs
+    // concurrently against) — covering the composition this function exists for (one
+    // `default_query` string populating both filters *and* sort_keys) and the two
+    // previously-silent failure modes it now surfaces via `app.set_status`.
+
+    #[test]
+    fn resolved_default_query_for_populates_both_filters_and_sort_from_one_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "default_query = \"priority:>=2 sort:-priority\"\n",
+        )
+        .unwrap();
+        let mut app = plugin::app::App::new();
+        app.enter_selected_menu_option();
+
+        let parsed = resolved_default_query_for(&mut app, Some(dir.path()));
+
+        assert_eq!(
+            parsed.filters,
+            vec![plugin::query::FilterTerm::Priority {
+                op: plugin::query::PriorityOp::Ge,
+                value: plugin::query::Priority::new(2).unwrap(),
+            }]
+        );
+        assert_eq!(
+            parsed.sort_keys,
+            vec![plugin::query::SortKey {
+                field: plugin::query::SortField::Priority,
+                ascending: false,
+            }]
+        );
+        assert!(app.status().is_none());
+    }
+
+    #[test]
+    fn resolved_default_query_for_treats_plain_non_dsl_text_as_an_inert_no_op() {
+        // A `default_query` that's syntactically valid TOML but not DSL syntax (no
+        // recognized `key:value` tokens — just prose) is a different failure mode than
+        // malformed TOML: `parse_query` never errors, so this degrades silently and
+        // correctly to "no filter/sort, just free text nothing will use" rather than
+        // surfacing as a status banner — confirms that degradation actually happens
+        // through the full chain, not just at the `parse_query` unit level.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "default_query = \"please filter my tickets\"\n",
+        )
+        .unwrap();
+        let mut app = plugin::app::App::new();
+        app.enter_selected_menu_option();
+
+        let parsed = resolved_default_query_for(&mut app, Some(dir.path()));
+
+        assert!(parsed.filters.is_empty());
+        assert!(parsed.sort_keys.is_empty());
+        assert_eq!(parsed.free_text, "please filter my tickets");
+        assert!(app.status().is_none());
+    }
+
+    #[test]
+    fn resolved_default_query_for_surfaces_unrecognized_terms_as_a_status_banner() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "default_query = \"priority:notanumber\"\n",
+        )
+        .unwrap();
+        let mut app = plugin::app::App::new();
+        app.enter_selected_menu_option();
+
+        let parsed = resolved_default_query_for(&mut app, Some(dir.path()));
+
+        assert!(parsed.filters.is_empty());
+        let status = app.status().expect("a rejected term should set a status");
+        assert!(status.is_error());
+        assert!(status.text().contains("priority:notanumber"));
+    }
+
+    #[test]
+    fn resolved_default_query_for_surfaces_malformed_toml_as_a_status_banner() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), "this is [invalid toml\n").unwrap();
+        let mut app = plugin::app::App::new();
+        app.enter_selected_menu_option();
+
+        let parsed = resolved_default_query_for(&mut app, Some(dir.path()));
+
+        assert!(parsed.filters.is_empty());
+        assert!(parsed.sort_keys.is_empty());
+        let status = app
+            .status()
+            .expect("malformed config.toml should set a status");
+        assert!(status.is_error());
+        assert!(status.text().contains("default_query"));
     }
 
     /// A `herdr` fake script that dispatches on `$1 $2` so [`implement_one`]'s whole

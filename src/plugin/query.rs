@@ -89,14 +89,20 @@ use std::cmp::Ordering;
 /// malformed value (as opposed to a key this module has simply never heard of).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct ParsedQuery {
-    /// Recognized `priority:`/`state:`/`label:` terms, in the order they appeared. A
-    /// query may contain more than one term of the same kind (e.g. two `priority:`
-    /// terms); this module makes no attempt to dedupe or reject repeats. TF-616 settled
-    /// how repeats resolve once merged into Linear's `IssueFilter` (see
-    /// `merge_filter_terms` in `src/plugin/data.rs`): different-comparator `priority:`
-    /// repeats (`priority:>=2 priority:<=4`) combine into one range, but
-    /// same-comparator `priority:` repeats and same-kind `state:`/`label:` repeats
-    /// silently keep only the last one — ordinary last-write-wins, map-insert-style.
+    /// Recognized `priority:`/`state:`/`label:` terms, in the order they appeared, with
+    /// same-leaf-key repeats already resolved (TF-617, see `push_filter_term`): a
+    /// query may still contain more than one term of the same *kind* — e.g.
+    /// `priority:>=2 priority:<=4`, which combine into one range downstream — but two
+    /// terms that would land on the very same leaf key once merged into Linear's
+    /// `IssueFilter` (two same-comparator `priority:` terms, two `state:` terms, two
+    /// `label:` terms) collapse to just the most recently parsed one *here*, before this
+    /// ever reaches a consumer. TF-616's `merge_filter_terms` (`src/plugin/data.rs`)
+    /// already implements last-write-wins for exactly this collision as a defensive
+    /// fallback for a caller that builds `FilterTerm`s directly — deduping here as well
+    /// means `default_query`'s server-side fetch and the `/`-filter's client-side
+    /// `crate::plugin::app::matching_issue_indices` (which ANDs every surviving term)
+    /// can never observe a different result for the same typed query: with at most one
+    /// term per leaf key, "keep the last" and "require all" agree by construction.
     pub filters: Vec<FilterTerm>,
     /// Recognized `sort:` fields, in the order they appeared. A single `sort:a,b` token
     /// expands to multiple entries here, still in left-to-right order.
@@ -206,21 +212,21 @@ pub fn parse_query(input: &str) -> ParsedQuery {
     for token in tokenize(input) {
         match token.split_once(':') {
             Some(("priority", value)) => match parse_priority_term(value) {
-                Some(term) => filters.push(term),
+                Some(term) => push_filter_term(&mut filters, term),
                 None => reject(&mut rejected, &mut free_text_tokens, token),
             },
             Some(("state", value)) => {
                 if value.is_empty() {
                     reject(&mut rejected, &mut free_text_tokens, token);
                 } else {
-                    filters.push(FilterTerm::State(value.to_string()));
+                    push_filter_term(&mut filters, FilterTerm::State(value.to_string()));
                 }
             }
             Some(("label", value)) => {
                 if value.is_empty() {
                     reject(&mut rejected, &mut free_text_tokens, token);
                 } else {
-                    filters.push(FilterTerm::Label(value.to_string()));
+                    push_filter_term(&mut filters, FilterTerm::Label(value.to_string()));
                 }
             }
             Some(("sort", value)) => {
@@ -250,6 +256,39 @@ pub fn parse_query(input: &str) -> ParsedQuery {
 fn reject(rejected: &mut Vec<String>, free_text_tokens: &mut Vec<String>, token: String) {
     rejected.push(token.clone());
     free_text_tokens.push(token);
+}
+
+/// Pushes `term` onto `filters`, first removing any existing entry that
+/// [`filter_terms_collide`] with it (TF-617) — so a repeated `state:`/`label:` term, or
+/// two `priority:` terms sharing an operator, keep only the most recently parsed one,
+/// matching `merge_filter_terms`' (`src/plugin/data.rs`) own last-write-wins collision
+/// behavior exactly rather than leaving the two to disagree (see
+/// [`ParsedQuery::filters`]'s doc for why that mattered starting with TF-617's
+/// client-side `matches_filter_term`). Terms landing on *different* leaf keys — e.g.
+/// `priority:>=2`/`priority:<=4` — both survive and combine into a range downstream,
+/// exactly as before this function existed.
+fn push_filter_term(filters: &mut Vec<FilterTerm>, term: FilterTerm) {
+    filters.retain(|existing| !filter_terms_collide(existing, &term));
+    filters.push(term);
+}
+
+/// Whether `a` and `b` would land on the same JSON leaf key once merged into Linear's
+/// `IssueFilter` by `merge_filter_terms` (`src/plugin/data.rs`) — see
+/// [`push_filter_term`]. `Priority` terms collide only when they share an operator
+/// (different operators map to distinct comparator keys via
+/// `crate::plugin::data::filter_term_fragment` and combine into one range instead);
+/// `State`/`Label` terms always collide with another of their own kind, since either one
+/// always targets the single `state.name`/`labels.name` leaf regardless of which name is
+/// being compared against.
+fn filter_terms_collide(a: &FilterTerm, b: &FilterTerm) -> bool {
+    match (a, b) {
+        (FilterTerm::Priority { op: a_op, .. }, FilterTerm::Priority { op: b_op, .. }) => {
+            a_op == b_op
+        }
+        (FilterTerm::State(_), FilterTerm::State(_)) => true,
+        (FilterTerm::Label(_), FilterTerm::Label(_)) => true,
+        _ => false,
+    }
 }
 
 /// Splits `input` into tokens on whitespace, honoring double-quoted spans as a single
@@ -380,25 +419,65 @@ fn parse_sort_field(field: &str) -> Option<SortKey> {
 /// the module doc's "Priority ordering" section for what ascending/descending mean under
 /// Linear's lower-is-more-urgent scale.
 pub fn sort_issues(issues: &mut [Issue], sort_keys: &[SortKey]) {
-    issues.sort_by(|a, b| {
-        for key in sort_keys {
-            let ordering = match key.field {
-                SortField::Priority => a.priority.cmp(&b.priority),
-                SortField::Updated => a.updated_at.cmp(&b.updated_at),
-                SortField::Created => a.created_at.cmp(&b.created_at),
-                SortField::Identifier => a.identifier.cmp(&b.identifier),
-            };
-            let ordering = if key.ascending {
-                ordering
-            } else {
-                ordering.reverse()
-            };
-            if ordering != Ordering::Equal {
-                return ordering;
+    issues.sort_by(|a, b| compare_issues(a, b, sort_keys));
+}
+
+/// The comparator [`sort_issues`] sorts by, split out so TF-617's `/`-filter can apply
+/// the identical ordering to a filtered *subset* of issue indices (see
+/// `crate::plugin::app::matching_issue_indices`) without duplicating the tiebreaker
+/// logic or re-sorting the full `issues` slice in place. See [`sort_issues`]'s own doc
+/// for what each field/direction means; this function only extracts the comparison,
+/// the semantics are unchanged.
+pub fn compare_issues(a: &Issue, b: &Issue, sort_keys: &[SortKey]) -> Ordering {
+    for key in sort_keys {
+        let ordering = match key.field {
+            SortField::Priority => a.priority.cmp(&b.priority),
+            SortField::Updated => a.updated_at.cmp(&b.updated_at),
+            SortField::Created => a.created_at.cmp(&b.created_at),
+            SortField::Identifier => a.identifier.cmp(&b.identifier),
+        };
+        let ordering = if key.ascending {
+            ordering
+        } else {
+            ordering.reverse()
+        };
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    Ordering::Equal
+}
+
+/// Does `issue` satisfy `term`? The client-side counterpart to
+/// `crate::plugin::data::filter_term_fragment` (TF-616), which translates the same
+/// [`FilterTerm`] into Linear's server-side `IssueFilter` JSON instead. TF-617's `/`-filter
+/// needs this because it narrows an *already-fetched* issue list live as the user types,
+/// rather than re-querying Linear's API on every keystroke — so recognized `key:value`
+/// terms are matched here, against the `Issue` struct's own fields, using the same
+/// semantics `filter_term_fragment` documents for its server-side comparators
+/// (`state:`/`label:` case-insensitive name match, `priority:` against Linear's raw
+/// `0..=4` scale — see the module doc's "Priority ordering" section). The `state:`/
+/// `label:` comparisons use `str::to_lowercase` rather than `eq_ignore_ascii_case`
+/// deliberately: Linear's server-side `eqIgnoreCase` is Unicode-aware, and workspace
+/// state/label names aren't guaranteed to be ASCII, so an ASCII-only comparison here
+/// would silently disagree with the server for names like "Überprüfung".
+pub fn matches_filter_term(issue: &Issue, term: &FilterTerm) -> bool {
+    match term {
+        FilterTerm::Priority { op, value } => {
+            let value = value.value();
+            match op {
+                PriorityOp::Eq => issue.priority == value,
+                PriorityOp::Ge => issue.priority >= value,
+                PriorityOp::Le => issue.priority <= value,
             }
         }
-        Ordering::Equal
-    });
+        FilterTerm::State(name) => issue.state.name.to_lowercase() == name.to_lowercase(),
+        FilterTerm::Label(name) => issue
+            .labels
+            .nodes
+            .iter()
+            .any(|label| label.name.to_lowercase() == name.to_lowercase()),
+    }
 }
 
 #[cfg(test)]
@@ -473,36 +552,107 @@ mod tests {
 
     #[test]
     fn parse_query_priority_accepts_named_levels_and_bare_digit() {
-        let parsed = parse_query(
-            "priority:urgent priority:high priority:=3 priority:low priority:none priority:4",
+        // Each case parsed independently (rather than as one combined query) so this
+        // stays a pure atom-name-resolution test: every one of these is an `Eq`-op
+        // `priority:` term, and TF-617's `push_filter_term` dedup (see
+        // `parse_query_repeated_priority_terms_with_the_same_operator_keep_only_the_last`
+        // below) would otherwise collapse all but the last if they shared one query.
+        let cases = [
+            ("priority:urgent", 1),
+            ("priority:high", 2),
+            ("priority:=3", 3),
+            ("priority:low", 4),
+            ("priority:none", 0),
+            ("priority:4", 4),
+        ];
+        for (input, expected_value) in cases {
+            let parsed = parse_query(input);
+            assert_eq!(
+                parsed.filters,
+                vec![FilterTerm::Priority {
+                    op: PriorityOp::Eq,
+                    value: priority(expected_value)
+                }],
+                "input: {input:?}"
+            );
+        }
+    }
+
+    // TF-617: same-leaf-key filter-term dedup (`push_filter_term`/`filter_terms_collide`).
+    // A query can still contain more than one term of the same *kind* — see the range
+    // test below — but two terms that would land on the same JSON leaf key once merged
+    // into Linear's `IssueFilter` collapse to just the last one, matching
+    // `merge_filter_terms`' own last-write-wins behavior so the server-side fetch and
+    // the client-side `/`-filter (`matches_filter_term`'s AND-all) can't disagree.
+
+    #[test]
+    fn parse_query_repeated_priority_terms_with_the_same_operator_keep_only_the_last() {
+        let parsed = parse_query("priority:>=2 priority:>=4");
+
+        assert_eq!(
+            parsed.filters,
+            vec![FilterTerm::Priority {
+                op: PriorityOp::Ge,
+                value: priority(4)
+            }]
         );
+    }
+
+    #[test]
+    fn parse_query_priority_terms_with_different_operators_both_survive_as_a_range() {
+        let parsed = parse_query("priority:>=2 priority:<=4");
+
         assert_eq!(
             parsed.filters,
             vec![
                 FilterTerm::Priority {
-                    op: PriorityOp::Eq,
-                    value: priority(1)
-                },
-                FilterTerm::Priority {
-                    op: PriorityOp::Eq,
+                    op: PriorityOp::Ge,
                     value: priority(2)
                 },
                 FilterTerm::Priority {
-                    op: PriorityOp::Eq,
-                    value: priority(3)
-                },
-                FilterTerm::Priority {
-                    op: PriorityOp::Eq,
+                    op: PriorityOp::Le,
                     value: priority(4)
                 },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_query_repeated_state_terms_keep_only_the_last() {
+        let parsed = parse_query("state:Todo state:Backlog");
+
+        assert_eq!(
+            parsed.filters,
+            vec![FilterTerm::State("Backlog".to_string())]
+        );
+    }
+
+    #[test]
+    fn parse_query_repeated_label_terms_keep_only_the_last() {
+        let parsed = parse_query("label:bug label:urgent");
+
+        assert_eq!(
+            parsed.filters,
+            vec![FilterTerm::Label("urgent".to_string())]
+        );
+    }
+
+    #[test]
+    fn parse_query_dedup_keeps_the_surviving_terms_relative_order_by_last_occurrence() {
+        // The surviving `state:` term (a repeat, so it's positioned at its *last*
+        // occurrence) should still land after `priority:` and before `label:` in the
+        // output, since `label:bug` is the only label term and stays where it was typed.
+        let parsed = parse_query("state:Todo priority:>=2 state:Backlog label:bug");
+
+        assert_eq!(
+            parsed.filters,
+            vec![
                 FilterTerm::Priority {
-                    op: PriorityOp::Eq,
-                    value: priority(0)
+                    op: PriorityOp::Ge,
+                    value: priority(2)
                 },
-                FilterTerm::Priority {
-                    op: PriorityOp::Eq,
-                    value: priority(4)
-                },
+                FilterTerm::State("Backlog".to_string()),
+                FilterTerm::Label("bug".to_string()),
             ]
         );
     }
@@ -920,5 +1070,164 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["Z", "Y"]
         );
+    }
+
+    #[test]
+    fn compare_issues_matches_sort_issues_ordering() {
+        // TF-617: compare_issues is sort_issues' comparator extracted so the /-filter
+        // can sort a filtered *subset* of indices — confirm the extraction changed
+        // nothing by driving both through the same tiebreaker chain.
+        let a = sample_issue("A", 2, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z");
+        let b = sample_issue("B", 1, "2026-01-02T00:00:00Z", "2026-01-02T00:00:00Z");
+        let keys = [SortKey {
+            field: SortField::Priority,
+            ascending: true,
+        }];
+
+        let mut issues = vec![a.clone(), b.clone()];
+        sort_issues(&mut issues, &keys);
+
+        assert_eq!(compare_issues(&a, &b, &keys), Ordering::Greater);
+        assert_eq!(
+            issues
+                .iter()
+                .map(|i| i.identifier.as_str())
+                .collect::<Vec<_>>(),
+            vec!["B", "A"]
+        );
+    }
+
+    #[test]
+    fn matches_filter_term_priority_uses_the_declared_comparator() {
+        let issue = sample_issue("A", 2, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z");
+
+        assert!(matches_filter_term(
+            &issue,
+            &FilterTerm::Priority {
+                op: PriorityOp::Eq,
+                value: priority(2)
+            }
+        ));
+        assert!(!matches_filter_term(
+            &issue,
+            &FilterTerm::Priority {
+                op: PriorityOp::Eq,
+                value: priority(3)
+            }
+        ));
+        assert!(matches_filter_term(
+            &issue,
+            &FilterTerm::Priority {
+                op: PriorityOp::Ge,
+                value: priority(2)
+            }
+        ));
+        assert!(!matches_filter_term(
+            &issue,
+            &FilterTerm::Priority {
+                op: PriorityOp::Ge,
+                value: priority(3)
+            }
+        ));
+        assert!(matches_filter_term(
+            &issue,
+            &FilterTerm::Priority {
+                op: PriorityOp::Le,
+                value: priority(2)
+            }
+        ));
+        assert!(!matches_filter_term(
+            &issue,
+            &FilterTerm::Priority {
+                op: PriorityOp::Le,
+                value: priority(1)
+            }
+        ));
+    }
+
+    #[test]
+    fn matches_filter_term_state_matches_by_name_case_insensitively() {
+        let issue = sample_issue("A", 0, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z");
+        assert_eq!(issue.state.name, "In Progress");
+
+        assert!(matches_filter_term(
+            &issue,
+            &FilterTerm::State("in progress".to_string())
+        ));
+        assert!(!matches_filter_term(
+            &issue,
+            &FilterTerm::State("Done".to_string())
+        ));
+    }
+
+    #[test]
+    fn matches_filter_term_state_case_insensitivity_is_unicode_aware_not_ascii_only() {
+        // TF-617 review fix: `eq_ignore_ascii_case` would miss this — `Ü`/`ü` aren't
+        // ASCII, so an ASCII-only comparison would disagree with Linear's server-side
+        // `eqIgnoreCase` (Unicode-aware) for exactly this kind of name.
+        let mut issue = sample_issue("A", 0, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z");
+        issue.state.name = "Überprüfung".to_string();
+
+        assert!(matches_filter_term(
+            &issue,
+            &FilterTerm::State("überprüfung".to_string())
+        ));
+    }
+
+    #[test]
+    fn matches_filter_term_label_matches_any_label_case_insensitively() {
+        let mut issue = sample_issue("A", 0, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z");
+        issue.labels.nodes = vec![
+            crate::Label {
+                id: "l1".to_string(),
+                name: "Bug".to_string(),
+                color: "#fff".to_string(),
+                description: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+            },
+            crate::Label {
+                id: "l2".to_string(),
+                name: "Needs Design".to_string(),
+                color: "#fff".to_string(),
+                description: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+            },
+        ];
+
+        assert!(matches_filter_term(
+            &issue,
+            &FilterTerm::Label("bug".to_string())
+        ));
+        assert!(matches_filter_term(
+            &issue,
+            &FilterTerm::Label("needs design".to_string())
+        ));
+        assert!(!matches_filter_term(
+            &issue,
+            &FilterTerm::Label("urgent".to_string())
+        ));
+    }
+
+    #[test]
+    fn matches_filter_term_label_case_insensitivity_is_unicode_aware_not_ascii_only() {
+        // Same rationale as the `state:` variant above — avoids "ß", whose uppercase
+        // form ("SS") isn't a simple 1:1 case fold and would make a naive test flaky
+        // for the wrong reason.
+        let mut issue = sample_issue("A", 0, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z");
+        issue.labels.nodes = vec![crate::Label {
+            id: "l1".to_string(),
+            name: "Überprüfung".to_string(),
+            color: "#fff".to_string(),
+            description: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }];
+
+        assert!(matches_filter_term(
+            &issue,
+            &FilterTerm::Label("ÜBERPRÜFUNG".to_string())
+        ));
     }
 }

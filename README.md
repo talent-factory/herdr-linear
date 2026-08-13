@@ -391,6 +391,101 @@ entering "Team Issues" shows an error naming every team (so you can see which id
 and pointing at `config.toml`; press `c` on that error screen to open it, same as for the
 project-matching errors above.
 
+Every view supports a small query DSL, both as a default applied on entry and as a live
+`/`-filter over whatever's currently loaded. Free text still does a plain
+case-insensitive substring match against title/identifier, exactly as before; alongside
+it, `priority:`/`state:`/`label:` narrow by those fields and `sort:` orders the result
+(prefix a field with `-` for descending — e.g. `sort:-priority,updated`):
+
+| Term | Matches |
+| --- | --- |
+| `priority:2`, `priority:high` | Exact priority (`0`=none, `1`=urgent, `2`=high, `3`=medium, `4`=low) |
+| `priority:>=2`, `priority:<=2` | Priority at least/at most the given level |
+| `state:"In Review"` | Workflow state, by name (case-insensitive; quote multi-word names) |
+| `label:bug` | Has a label with this name (case-insensitive) |
+| `sort:priority`, `sort:-updated` | Order by `priority`/`updated`/`created`/`identifier` |
+
+`priority:`/`state:`/`label:`/`sort:` — the *keys* themselves, the `>=`/`<=` operators,
+the priority level names (`urgent`/`high`/…), and the sort field names
+(`priority`/`updated`/…) all have to be typed exactly as shown, lowercase: `Priority:2`,
+`SORT:priority`, and `priority:HIGH` are every bit as unrecognized as a plain typo like
+`prioroty:2`. This matters more than it sounds like it should, because it fails
+*differently* from a bad value on an otherwise-correct key: `priority:2` with a garbage
+*value* (`priority:notanumber`) is a recognized key that still gets flagged — you'll see
+`(⚠ not recognized: ...)` in the filter title, or a status message for `default_query` —
+but a wrong-case *key* like `Priority:2` isn't recognized as a key at all, so it's
+silently treated as two ordinary words of free text instead, with no warning either way.
+Free text itself can also be quoted — `"fix login"` is one search term rather than two —
+which mostly only matters if the phrase has irregular internal whitespace you want
+preserved exactly.
+
+Every view's own base filter only ever fetches non-terminal issues, so `state:Done`/
+`state:Canceled`/`state:Cancelled` never match anything — there's no way to bring a
+completed or canceled issue back into view with a `state:` term.
+
+Set a default for every view with `default_query` in `config.toml`. A few worked
+examples, each a single line to paste in as-is:
+
+```toml
+# Only what actually needs attention, most urgent first — good for a daily-driver view
+# that skips low-priority backlog noise entirely.
+default_query = "priority:>=2 sort:-priority"
+
+# See everything, most recently touched first — no filtering, just a sort default so a
+# freshly-opened view doesn't start in whatever order the API happened to return.
+default_query = "sort:-updated"
+
+# Only issues someone's actively reviewing, oldest first (so the longest-waiting review
+# surfaces at the top).
+default_query = "state:\"In Review\" sort:created"
+```
+
+(`config.toml` only reads one `default_query` value — these are three alternatives to
+pick from, not something you'd set all at once.)
+
+Filter terms in `default_query` narrow the fetch itself, so an excluded issue is never
+loaded in the first place; `sort:` in `default_query` orders the view as soon as it's
+loaded. Pressing `/` on a loaded view opens a second filter, parsed through the same
+DSL, but it composes *with* `default_query` rather than replacing it: it can only narrow
+further within whatever `default_query` already fetched (it can't bring back an issue
+`default_query` excluded), and if the typed query has no `sort:` of its own, the view
+keeps whatever order `default_query` put it in rather than reverting to fetch order. A
+`/`-filter with its own `priority:`/`state:`/`label:`/`sort:` terms does fully take over
+*those* aspects for as long as it's active, on top of whatever `default_query` already
+narrowed the fetch to. `Enter` confirms the `/`-filter, `Esc` clears it and returns to
+`default_query`'s own filtered-and-sorted view.
+
+If a `priority:`/`state:`/`label:`/`sort:` term isn't recognized — a typo like
+`priority:hihg`, or an out-of-range value — it's dropped and folded back into the
+free-text search instead of being applied; the currently-active filter's title bar shows
+`(⚠ not recognized: ...)` when that happens, and a `default_query` with the same problem
+shows a status message under the loaded list.
+
+Every key above lives in the one `config.toml`, so a real one ends up with several set at
+once. A minimal setup — just enough to get going, letting everything else fall back to
+its default:
+
+```toml
+api_key = "lin_api_your_key_here"
+default_query = "priority:>=2 sort:-priority"
+```
+
+A more filled-in one — multiple repos overridden to their Linear projects, a specific
+team picked for "Team Issues", a custom editor and agent, and a `default_query` that
+only shows what's actively being worked on:
+
+```toml
+api_key = "lin_api_your_key_here"
+team_id = "linear-team-id"
+editor = "vim"
+agent_command = "hr"
+default_query = "state:\"In Progress\" sort:-updated"
+
+[project_overrides]
+"herdr-linear" = "proj-abc123"
+"some-other-repo" = "proj-def456"
+```
+
 ### Use
 
 Bind keys to the plugin's actions in `~/.config/herdr/config.toml`:

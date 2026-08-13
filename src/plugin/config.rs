@@ -39,6 +39,17 @@ struct ConfigFile {
     /// [`crate::plugin::editor::resolve_editor_command`]. `None`/unset means default
     /// (`nvim`, `PATH`) resolution.
     editor: Option<String>,
+    /// A query DSL string (`crate::plugin::query::parse_query`'s grammar — free text
+    /// plus `priority:`/`state:`/`label:`/`sort:` terms), applied automatically every
+    /// time a view is entered (TF-617): filter terms narrow the fetch server-side (the
+    /// same `IssueFilter` merge TF-616 wired up), `sort:` terms order the result via
+    /// `crate::plugin::query::sort_issues`. `None`/unset means no default — a view loads
+    /// exactly as it did before this feature. `#[serde(default)]` isn't load-bearing
+    /// here the way it is on `project_overrides` above (an `Option<T>` field already
+    /// deserializes to `None` when absent) — kept purely for explicitness/documentation
+    /// symmetry with that field, not because it changes behavior.
+    #[serde(default)]
+    default_query: Option<String>,
 }
 
 /// Reads and parses `config_dir/config.toml`, if `config_dir` is given and the file
@@ -167,6 +178,19 @@ pub fn resolve_agent_command_override(config_dir: Option<&Path>) -> Result<Optio
     Ok(agent_command)
 }
 
+/// Resolve a `default_query` override (TF-617): `config_dir/config.toml`'s
+/// `default_query` field, if set and non-empty. `Ok(None)` means "no default query"
+/// (callers apply no extra filter/sort beyond whatever a view's own base filter already
+/// narrows to — see `crate::plugin::data`'s `fetch_*_issues` functions and `main.rs`'s
+/// `load_issues`). Pure function — callers own reading the real environment (see
+/// [`load_default_query`]).
+pub fn resolve_default_query(config_dir: Option<&Path>) -> Result<Option<String>> {
+    let default_query = read_config_file(config_dir)?
+        .and_then(|file| file.default_query)
+        .filter(|q| !q.trim().is_empty());
+    Ok(default_query)
+}
+
 /// Resolve a `team_id` default (TF-579): `config_dir/config.toml`'s `team_id` field, if
 /// set and non-empty. `Ok(None)` means "no default configured" (callers fall back to
 /// resolving the team from the workspace's team list — see
@@ -228,6 +252,8 @@ pub(crate) struct ResolvedConfigSummary {
     pub team_id: Option<String>,
     pub editor: Option<String>,
     pub project_overrides: BTreeMap<String, String>,
+    /// The resolved `default_query` (TF-617), or `None` if unset/empty.
+    pub default_query: Option<String>,
 }
 
 /// The `[start, end)` 0-based, end-exclusive line-index range that `contents`'s
@@ -349,6 +375,7 @@ pub(crate) fn resolved_summary(
             team_id: None,
             editor: None,
             project_overrides: BTreeMap::new(),
+            default_query: None,
         },
         Ok(Some(file)) => {
             let has_file_key = file.api_key.as_deref().is_some_and(|key| !key.is_empty());
@@ -363,6 +390,7 @@ pub(crate) fn resolved_summary(
                     .filter(|id| !id.is_empty()),
                 editor: file.editor.filter(|ed| !ed.trim().is_empty()),
                 project_overrides: file.project_overrides,
+                default_query: file.default_query.filter(|q| !q.trim().is_empty()),
             }
         }
         Err(e) => ResolvedConfigSummary {
@@ -373,6 +401,7 @@ pub(crate) fn resolved_summary(
             team_id: None,
             editor: None,
             project_overrides: BTreeMap::new(),
+            default_query: None,
         },
     }
 }
@@ -400,6 +429,14 @@ pub fn load_project_id_override(repo_name: &str) -> Result<Option<String>> {
 pub fn load_agent_command_override() -> Result<Option<String>> {
     let config_dir = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR").map(std::path::PathBuf::from);
     resolve_agent_command_override(config_dir.as_deref())
+}
+
+/// Resolve the `default_query` override from the real environment:
+/// `$HERDR_PLUGIN_CONFIG_DIR/config.toml`. Thin wrapper around [`resolve_default_query`];
+/// called from `main.rs`'s `load_issues` on every view entry (TF-617).
+pub fn load_default_query() -> Result<Option<String>> {
+    let config_dir = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR").map(std::path::PathBuf::from);
+    resolve_default_query(config_dir.as_deref())
 }
 
 /// Resolve the `team_id` default (TF-579) from the real environment:
@@ -433,8 +470,9 @@ pub fn current_config_path_hint() -> String {
 mod tests {
     use super::{
         api_key_value_line_range, config_path_hint, redact_api_key_value_lines,
-        resolve_agent_command_override, resolve_api_key, resolve_editor_override,
-        resolve_project_id_override, resolve_team_id_override, resolved_summary, ConfigFileStatus,
+        resolve_agent_command_override, resolve_api_key, resolve_default_query,
+        resolve_editor_override, resolve_project_id_override, resolve_team_id_override,
+        resolved_summary, ConfigFileStatus,
     };
     use std::fs;
 
@@ -795,6 +833,64 @@ mod tests {
     }
 
     #[test]
+    fn reads_default_query_from_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.toml"),
+            "default_query = \"priority:>=2 sort:-priority\"\n",
+        )
+        .unwrap();
+
+        let default_query = resolve_default_query(Some(dir.path())).unwrap();
+
+        assert_eq!(
+            default_query,
+            Some("priority:>=2 sort:-priority".to_string())
+        );
+    }
+
+    #[test]
+    fn returns_none_when_config_file_missing_for_default_query() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let default_query = resolve_default_query(Some(dir.path())).unwrap();
+
+        assert_eq!(default_query, None);
+    }
+
+    #[test]
+    fn returns_none_when_default_query_is_empty_or_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.toml"), "default_query = \"   \"\n").unwrap();
+
+        let default_query = resolve_default_query(Some(dir.path())).unwrap();
+
+        assert_eq!(default_query, None);
+    }
+
+    #[test]
+    fn returns_none_when_config_file_has_no_default_query() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.toml"), "api_key = \"lin_api_x\"\n").unwrap();
+
+        let default_query = resolve_default_query(Some(dir.path())).unwrap();
+
+        assert_eq!(default_query, None);
+    }
+
+    #[test]
+    fn errors_immediately_on_malformed_toml_for_default_query() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.toml"), "this is [invalid toml\n").unwrap();
+
+        let err = resolve_default_query(Some(dir.path())).unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("not valid TOML"));
+        assert!(message.contains(dir.path().to_str().unwrap()));
+    }
+
+    #[test]
     fn reads_team_id_from_config_file() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("config.toml"), "team_id = \"team-123\"\n").unwrap();
@@ -952,6 +1048,7 @@ mod tests {
         fs::write(
             dir.path().join("config.toml"),
             "api_key = \"lin_api_x\"\nagent_command = \"my-agent\"\nteam_id = \"team-123\"\neditor = \"nvim\"\n\
+             default_query = \"priority:>=2\"\n\
              [project_overrides]\n\"herdr-linear\" = \"proj-1\"\n",
         )
         .unwrap();
@@ -963,6 +1060,7 @@ mod tests {
         assert_eq!(summary.agent_command, Some("my-agent".to_string()));
         assert_eq!(summary.team_id, Some("team-123".to_string()));
         assert_eq!(summary.editor, Some("nvim".to_string()));
+        assert_eq!(summary.default_query, Some("priority:>=2".to_string()));
         assert_eq!(
             summary.project_overrides.get("herdr-linear"),
             Some(&"proj-1".to_string())
