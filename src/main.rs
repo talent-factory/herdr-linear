@@ -99,21 +99,25 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn load_issues(app: &mut plugin::app::App, client: &herdr_linear::LinearClient) {
+    // No `/`-filter or `default_query` wiring yet (TF-617) — every fetch runs with the
+    // empty slice, which is a documented no-op reproducing pre-TF-616 behavior exactly.
+    let filter_terms: &[plugin::query::FilterTerm] = &[];
+
     match app.current_view() {
         Some(plugin::app::ViewKind::MyIssues) => {
-            match plugin::data::fetch_my_issues(client).await {
+            match plugin::data::fetch_my_issues(client, filter_terms).await {
                 Ok(issues) => app.set_issues(issues),
                 Err(err) => app.set_error(err.to_string()),
             }
         }
         Some(plugin::app::ViewKind::ProjectIssues) => {
-            match plugin::data::fetch_current_project_issues(client).await {
+            match plugin::data::fetch_current_project_issues(client, filter_terms).await {
                 Ok(issues) => app.set_issues(issues),
                 Err(err) => app.set_error(err.to_string()),
             }
         }
         Some(plugin::app::ViewKind::TeamIssues) => {
-            match plugin::data::fetch_current_team_issues(client).await {
+            match plugin::data::fetch_current_team_issues(client, filter_terms).await {
                 Ok(issues) => app.set_issues(issues),
                 Err(err) => app.set_error(err.to_string()),
             }

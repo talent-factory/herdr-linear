@@ -2,6 +2,7 @@
 //! authenticated viewer's open assigned issues, the current project's open issues, and
 //! (TF-579) a resolved team's open issues.
 
+use crate::plugin::query::{FilterTerm, PriorityOp};
 use crate::plugin::{config, repo};
 use crate::{Error, Issue, LinearClient, Project, Result, Team};
 use serde_json::{json, Value};
@@ -27,40 +28,115 @@ const TEAM_PAGE_SIZE: i32 = 250;
 const MAX_PAGES: u32 = 20;
 
 /// A Linear issue filter matching open (not completed, not canceled) issues assigned to
-/// `user_id`. "Open" is expressed as an exclusion (`nin`) rather than an allowlist of the
-/// non-terminal state types (`triage`/`backlog`/`unstarted`/`started`), so it can't
-/// silently drop issues in a state type this code doesn't know about — mirrors
-/// [`project_open_filter`].
-pub fn assignee_open_filter(user_id: &str) -> Value {
-    json!({
+/// `user_id`, additionally narrowed by `filter_terms` (TF-615's parsed `priority:`/
+/// `state:`/`label:` terms — see [`merge_filter_terms`]). "Open" is expressed as an
+/// exclusion (`nin`) rather than an allowlist of the non-terminal state types
+/// (`triage`/`backlog`/`unstarted`/`started`), so it can't silently drop issues in a
+/// state type this code doesn't know about — mirrors [`project_open_filter`]. An empty
+/// `filter_terms` reproduces the exact JSON this function returned before TF-616 — no
+/// behavior change for callers that don't have a query.
+pub fn assignee_open_filter(user_id: &str, filter_terms: &[FilterTerm]) -> Value {
+    let base = json!({
         "assignee": { "id": { "eq": user_id } },
         "state": { "type": { "nin": ["completed", "canceled"] } }
-    })
+    });
+    merge_filter_terms(base, filter_terms)
 }
 
 /// A Linear issue filter matching open (not completed, not canceled) issues in
-/// `project_id`. "Open" is expressed as an exclusion (`nin`) rather than an allowlist
-/// of the non-terminal state types (`triage`/`backlog`/`unstarted`/`started`), so it
-/// can't silently drop issues in a state type this code doesn't know about — mirrors
-/// [`assignee_open_filter`].
-pub fn project_open_filter(project_id: &str) -> Value {
-    json!({
+/// `project_id`, additionally narrowed by `filter_terms` (see [`assignee_open_filter`]
+/// for the empty-slice/no-behavior-change guarantee). "Open" is expressed as an
+/// exclusion (`nin`) rather than an allowlist of the non-terminal state types
+/// (`triage`/`backlog`/`unstarted`/`started`), so it can't silently drop issues in a
+/// state type this code doesn't know about — mirrors [`assignee_open_filter`].
+pub fn project_open_filter(project_id: &str, filter_terms: &[FilterTerm]) -> Value {
+    let base = json!({
         "project": { "id": { "eq": project_id } },
         "state": { "type": { "nin": ["completed", "canceled"] } }
-    })
+    });
+    merge_filter_terms(base, filter_terms)
 }
 
 /// A Linear issue filter matching open (not completed, not canceled) issues in
-/// `team_id`. "Open" is expressed as an exclusion (`nin`) rather than an allowlist of
-/// the non-terminal state types (`triage`/`backlog`/`unstarted`/`started`), so it
-/// can't silently drop issues in a state type this code doesn't know about — mirrors
-/// [`assignee_open_filter`]/[`project_open_filter`]. See [`fetch_team_issues`] for why
-/// this is composed with `get_issues` instead of delegating to `get_team_issues`.
-pub fn team_open_filter(team_id: &str) -> Value {
-    json!({
+/// `team_id`, additionally narrowed by `filter_terms` (see [`assignee_open_filter`] for
+/// the empty-slice/no-behavior-change guarantee). "Open" is expressed as an exclusion
+/// (`nin`) rather than an allowlist of the non-terminal state types
+/// (`triage`/`backlog`/`unstarted`/`started`), so it can't silently drop issues in a
+/// state type this code doesn't know about — mirrors [`assignee_open_filter`]/
+/// [`project_open_filter`]. See [`fetch_team_issues`] for why this is composed with
+/// `get_issues` instead of delegating to `get_team_issues`.
+pub fn team_open_filter(team_id: &str, filter_terms: &[FilterTerm]) -> Value {
+    let base = json!({
         "team": { "id": { "eq": team_id } },
         "state": { "type": { "nin": ["completed", "canceled"] } }
-    })
+    });
+    merge_filter_terms(base, filter_terms)
+}
+
+/// Merges `filter_terms` into `base` one at a time via [`merge_json_object`], each term
+/// first translated to its `IssueFilter` JSON fragment by [`filter_term_fragment`]. An
+/// empty slice returns `base` completely unchanged — the guarantee
+/// [`assignee_open_filter`]/[`project_open_filter`]/[`team_open_filter`] each document,
+/// and what keeps every existing caller (none of which have a query yet) byte-identical
+/// to pre-TF-616 behavior.
+fn merge_filter_terms(mut base: Value, filter_terms: &[FilterTerm]) -> Value {
+    for term in filter_terms {
+        merge_json_object(&mut base, filter_term_fragment(term));
+    }
+    base
+}
+
+/// Translates a single [`FilterTerm`] into the `IssueFilter` JSON fragment it
+/// contributes, expressed the way Linear's API wants a filter comparator
+/// (`NumberComparator` for `priority`, `StringComparator` for `state.name`/
+/// `labels.name`): `priority:` maps its [`PriorityOp`] onto Linear's own `eq`/`gte`/
+/// `lte` keys operating on [`crate::plugin::query::Priority`]'s raw `0..=4` scale (see
+/// that module's "Priority ordering" doc for why no translation is needed); `state:`/
+/// `label:` match by exact name via `eq` — Linear resolves the comparison server-side,
+/// so no case-folding happens here, and a case mismatch simply matches nothing, like
+/// any other `eq` filter.
+fn filter_term_fragment(term: &FilterTerm) -> Value {
+    match term {
+        FilterTerm::Priority { op, value } => {
+            let comparator = match op {
+                PriorityOp::Eq => "eq",
+                PriorityOp::Ge => "gte",
+                PriorityOp::Le => "lte",
+            };
+            json!({ "priority": { (comparator): value.value() } })
+        }
+        FilterTerm::State(name) => json!({ "state": { "name": { "eq": name } } }),
+        FilterTerm::Label(name) => json!({ "labels": { "name": { "eq": name } } }),
+    }
+}
+
+/// Deep-merges `patch`'s object fields into `target` in place. Where both hold an
+/// object at the same key, their fields merge recursively rather than one replacing the
+/// other — e.g. a `state:` filter term's `{"name": {"eq": ...}}` fragment combines with
+/// the base filter's existing `{"type": {"nin": [...]}}` under the shared `"state"` key
+/// instead of clobbering it. Any other collision (scalar, array, or an object meeting a
+/// non-object) has `patch`'s value win, same as a plain map insert would. `patch` is
+/// expected to always be a JSON object (every [`filter_term_fragment`] result is); a
+/// non-object `patch` is a no-op rather than a panic, since there's no sensible way to
+/// "merge" a scalar into an object in place.
+fn merge_json_object(target: &mut Value, patch: Value) {
+    let Value::Object(patch_map) = patch else {
+        return;
+    };
+    let Value::Object(target_map) = target else {
+        return;
+    };
+
+    for (key, patch_value) in patch_map {
+        match target_map.get_mut(&key) {
+            Some(existing) if existing.is_object() && patch_value.is_object() => {
+                merge_json_object(existing, patch_value);
+            }
+            _ => {
+                target_map.insert(key, patch_value);
+            }
+        }
+    }
 }
 
 /// Fetch every issue matching `filter`, following `pageInfo.hasNextPage` past a single
@@ -111,9 +187,16 @@ async fn fetch_issues_paginated(
 /// to that id as assignee, excluding terminal-state issues so completed/canceled
 /// work doesn't clutter the daily list. `get_viewer()` is already covered by
 /// `LinearClient`'s own tests; this function is thin composition on top.
-pub async fn fetch_my_issues(client: &LinearClient) -> Result<Vec<Issue>> {
+///
+/// `filter_terms` (TF-615's parsed `priority:`/`state:`/`label:` terms) is threaded
+/// straight through to [`assignee_open_filter`] — pass `&[]` for today's unfiltered
+/// behavior; TF-617 wires a real slice in from the active query.
+pub async fn fetch_my_issues(
+    client: &LinearClient,
+    filter_terms: &[FilterTerm],
+) -> Result<Vec<Issue>> {
     let viewer = client.get_viewer().await?;
-    let filter = assignee_open_filter(&viewer.id);
+    let filter = assignee_open_filter(&viewer.id, filter_terms);
     fetch_issues_paginated(client, &filter, "Your assigned issues").await
 }
 
@@ -121,8 +204,15 @@ pub async fn fetch_my_issues(client: &LinearClient) -> Result<Vec<Issue>> {
 /// `get_issues` page via `fetch_issues_paginated` (a single page previously silently
 /// truncated an active project's backlog at 50 issues — see `MAX_PAGES` for the fetch's
 /// own upper bound).
-pub async fn fetch_project_issues(client: &LinearClient, project_id: &str) -> Result<Vec<Issue>> {
-    let filter = project_open_filter(project_id);
+///
+/// `filter_terms` is threaded straight through to [`project_open_filter`] — see
+/// [`fetch_my_issues`] for the `&[]`/TF-617 note.
+pub async fn fetch_project_issues(
+    client: &LinearClient,
+    project_id: &str,
+    filter_terms: &[FilterTerm],
+) -> Result<Vec<Issue>> {
+    let filter = project_open_filter(project_id, filter_terms);
     fetch_issues_paginated(client, &filter, &format!("Project {project_id}")).await
 }
 
@@ -181,7 +271,13 @@ async fn fetch_all_projects(client: &LinearClient) -> Result<Vec<Project>> {
 /// `fetch_project_issues`. Re-runs every step on each call — no caching — so a
 /// `config.toml` edit or a `git remote` change between calls (e.g. across a retry) is
 /// picked up rather than served stale.
-pub async fn fetch_current_project_issues(client: &LinearClient) -> Result<Vec<Issue>> {
+///
+/// `filter_terms` is threaded straight through to [`fetch_project_issues`] — see
+/// [`fetch_my_issues`] for the `&[]`/TF-617 note.
+pub async fn fetch_current_project_issues(
+    client: &LinearClient,
+    filter_terms: &[FilterTerm],
+) -> Result<Vec<Issue>> {
     let repo_name = repo::detect_repo_name();
     let project_id_override = config::load_project_id_override(&repo_name)?;
 
@@ -196,7 +292,7 @@ pub async fn fetch_current_project_issues(client: &LinearClient) -> Result<Vec<I
         }
     };
 
-    fetch_project_issues(client, &project_id).await
+    fetch_project_issues(client, &project_id, filter_terms).await
 }
 
 /// Fetch every team in the workspace, following `pageInfo.hasNextPage` past a single
@@ -301,8 +397,15 @@ async fn resolve_team_id(client: &LinearClient) -> Result<String> {
 /// every other pagination loop in this file). Filtering at the query and paginating
 /// via `fetch_issues_paginated` avoids all of that — the same way TF-577/578 fixed
 /// the equivalent gap for projects/my-issues.
-pub async fn fetch_team_issues(client: &LinearClient, team_id: &str) -> Result<Vec<Issue>> {
-    let filter = team_open_filter(team_id);
+///
+/// `filter_terms` is threaded straight through to [`team_open_filter`] — see
+/// [`fetch_my_issues`] for the `&[]`/TF-617 note.
+pub async fn fetch_team_issues(
+    client: &LinearClient,
+    team_id: &str,
+    filter_terms: &[FilterTerm],
+) -> Result<Vec<Issue>> {
+    let filter = team_open_filter(team_id, filter_terms);
     fetch_issues_paginated(client, &filter, &format!("Team {team_id}")).await
 }
 
@@ -310,18 +413,25 @@ pub async fn fetch_team_issues(client: &LinearClient, team_id: &str) -> Result<V
 /// Re-runs resolution on every call — no caching — matching
 /// [`fetch_current_project_issues`], so a `config.toml` edit between calls (e.g.
 /// across a retry) is picked up rather than served stale.
-pub async fn fetch_current_team_issues(client: &LinearClient) -> Result<Vec<Issue>> {
+///
+/// `filter_terms` is threaded straight through to [`fetch_team_issues`] — see
+/// [`fetch_my_issues`] for the `&[]`/TF-617 note.
+pub async fn fetch_current_team_issues(
+    client: &LinearClient,
+    filter_terms: &[FilterTerm],
+) -> Result<Vec<Issue>> {
     let team_id = resolve_team_id(client).await?;
-    fetch_team_issues(client, &team_id).await
+    fetch_team_issues(client, &team_id, filter_terms).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin::query::Priority;
 
     #[test]
     fn assignee_open_filter_matches_assignee_and_excludes_terminal_states() {
-        let filter = assignee_open_filter("user-123");
+        let filter = assignee_open_filter("user-123", &[]);
 
         assert_eq!(filter["assignee"]["id"]["eq"], "user-123");
         assert_eq!(
@@ -332,7 +442,7 @@ mod tests {
 
     #[test]
     fn project_open_filter_matches_project_and_excludes_terminal_states() {
-        let filter = project_open_filter("project-123");
+        let filter = project_open_filter("project-123", &[]);
 
         assert_eq!(filter["project"]["id"]["eq"], "project-123");
         assert_eq!(
@@ -343,13 +453,123 @@ mod tests {
 
     #[test]
     fn team_open_filter_matches_team_and_excludes_terminal_states() {
-        let filter = team_open_filter("team-123");
+        let filter = team_open_filter("team-123", &[]);
 
         assert_eq!(filter["team"]["id"]["eq"], "team-123");
         assert_eq!(
             filter["state"]["type"]["nin"],
             json!(["completed", "canceled"])
         );
+    }
+
+    #[test]
+    fn open_filter_with_no_filter_terms_reproduces_exact_pre_tf_616_json() {
+        // Empty `filter_terms` must be a true no-op: byte-identical to what these
+        // functions returned before TF-616 added the parameter, since every existing
+        // caller (none of which have a query yet) passes `&[]`.
+        assert_eq!(
+            assignee_open_filter("user-123", &[]),
+            json!({
+                "assignee": { "id": { "eq": "user-123" } },
+                "state": { "type": { "nin": ["completed", "canceled"] } }
+            })
+        );
+        assert_eq!(
+            project_open_filter("project-123", &[]),
+            json!({
+                "project": { "id": { "eq": "project-123" } },
+                "state": { "type": { "nin": ["completed", "canceled"] } }
+            })
+        );
+        assert_eq!(
+            team_open_filter("team-123", &[]),
+            json!({
+                "team": { "id": { "eq": "team-123" } },
+                "state": { "type": { "nin": ["completed", "canceled"] } }
+            })
+        );
+    }
+
+    #[test]
+    fn assignee_open_filter_merges_a_single_priority_term() {
+        let term = FilterTerm::Priority {
+            op: PriorityOp::Ge,
+            value: Priority::new(2).unwrap(),
+        };
+        let filter = assignee_open_filter("user-123", &[term]);
+
+        assert_eq!(filter["assignee"]["id"]["eq"], "user-123");
+        assert_eq!(
+            filter["state"]["type"]["nin"],
+            json!(["completed", "canceled"])
+        );
+        assert_eq!(filter["priority"]["gte"], 2);
+    }
+
+    #[test]
+    fn assignee_open_filter_priority_eq_and_le_map_to_eq_and_lte() {
+        let eq_term = FilterTerm::Priority {
+            op: PriorityOp::Eq,
+            value: Priority::new(1).unwrap(),
+        };
+        assert_eq!(
+            assignee_open_filter("user-123", &[eq_term])["priority"]["eq"],
+            1
+        );
+
+        let le_term = FilterTerm::Priority {
+            op: PriorityOp::Le,
+            value: Priority::new(3).unwrap(),
+        };
+        assert_eq!(
+            assignee_open_filter("user-123", &[le_term])["priority"]["lte"],
+            3
+        );
+    }
+
+    #[test]
+    fn project_open_filter_merges_a_single_state_term_alongside_the_base_state_filter() {
+        // The base filter already has a `"state"` key (`type: { nin: [...] }`); a
+        // `state:` term must merge its `name` constraint into that same object rather
+        // than replacing it.
+        let filter = project_open_filter("project-123", &[FilterTerm::State("In Review".into())]);
+
+        assert_eq!(filter["project"]["id"]["eq"], "project-123");
+        assert_eq!(
+            filter["state"]["type"]["nin"],
+            json!(["completed", "canceled"])
+        );
+        assert_eq!(filter["state"]["name"]["eq"], "In Review");
+    }
+
+    #[test]
+    fn team_open_filter_merges_a_single_label_term() {
+        let filter = team_open_filter("team-123", &[FilterTerm::Label("urgent-fix".into())]);
+
+        assert_eq!(filter["team"]["id"]["eq"], "team-123");
+        assert_eq!(filter["labels"]["name"]["eq"], "urgent-fix");
+    }
+
+    #[test]
+    fn open_filter_merges_multiple_filter_terms_together_with_the_base_filter() {
+        let terms = [
+            FilterTerm::Priority {
+                op: PriorityOp::Ge,
+                value: Priority::new(2).unwrap(),
+            },
+            FilterTerm::State("In Review".into()),
+            FilterTerm::Label("urgent-fix".into()),
+        ];
+        let filter = assignee_open_filter("user-123", &terms);
+
+        assert_eq!(filter["assignee"]["id"]["eq"], "user-123");
+        assert_eq!(
+            filter["state"]["type"]["nin"],
+            json!(["completed", "canceled"])
+        );
+        assert_eq!(filter["state"]["name"]["eq"], "In Review");
+        assert_eq!(filter["priority"]["gte"], 2);
+        assert_eq!(filter["labels"]["name"]["eq"], "urgent-fix");
     }
 
     fn sample_team(id: &str, key: &str, name: &str) -> Team {

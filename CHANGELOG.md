@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `src/plugin/query.rs` — a hand-rolled parser for the plugin's query DSL: `priority:`/`state:`/`label:` filter terms (with `=`/`>=`/`<=` comparisons and named priority levels) and `sort:field,...` sort keys (with `-` for descending), plus a stable multi-key `sort_issues` helper. Double-quoted values (`state:"In Review"`) support multi-word names. Parsing never errors — unrecognized or malformed terms fall back to free text for the existing substring matcher (TF-580), with recognized-but-malformed terms additionally recorded in `ParsedQuery::rejected` for a future caller to surface as a hint. Not yet wired into the running plugin — server-side filter application is TF-616, `default_query`/`/`-filter integration is TF-617 (TF-615)
 
+### Changed
+
+- `assignee_open_filter`/`project_open_filter`/`team_open_filter` (`src/plugin/data.rs`) now accept a `&[FilterTerm]` (TF-615's parsed `priority:`/`state:`/`label:` terms) and deep-merge each into the base `IssueFilter` JSON server-side, alongside the existing open/not-completed/not-canceled constraint — e.g. a `state:` term merges its `name` comparator into the same `"state"` key the base filter's `type: { nin: [...] }` already occupies, rather than replacing it. `fetch_my_issues`/`fetch_project_issues`/`fetch_current_project_issues`/`fetch_team_issues`/`fetch_current_team_issues` and their `main.rs` call sites now thread a `filter_terms` slice through to the same effect; every current call site passes `&[]`, which is a documented no-op reproducing the exact pre-TF-616 filter JSON — `default_query`/`/`-filter integration (TF-617) is what will start passing real terms (TF-616)
+
 ## [0.2.1] - 2026-08-12
 
 ### Added
