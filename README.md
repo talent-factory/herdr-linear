@@ -513,10 +513,16 @@ Reload the config, then press the bound key to open the plugin. The panel opens 
 menu with three options — "My Issues", "Project Issues", and "Team Issues" — all
 available. From the menu, use `↑`/`↓` to navigate options,
 `Enter` to open the highlighted view, and `q` or `Esc` to quit. Once inside a view,
-use `↑`/`↓` to navigate the issue list, `/` to filter it by title or identifier (type to
-narrow, `↑`/`↓` still navigate the narrowed list live, `<Enter>` confirms and keeps the
-filter applied, `Esc` cancels and restores the full list), `o` to open the selected issue
-in your browser, `<Space>` to mark/unmark the selected issue (shown with a `[x]`/`[ ]`
+use `↑`/`↓` to navigate the issue list, `j`/`k` to scroll the Detail pane once its
+description runs past the bottom of the panel, or the mouse wheel over either pane —
+whichever half of the terminal it's over, moving the highlight in the list or scrolling
+the text in Detail (mouse is additive to the keyboard, best-effort depending on your
+terminal and herdr's `mouse_capture` config), `/` to filter it — free text matches title/
+identifier, or use the same `priority:`/`state:`/`label:`/`sort:` query DSL described
+under "Configure" above (type to narrow, `↑`/`↓` still navigate the narrowed list live,
+`<Enter>` confirms and keeps the filter applied, `Esc` cancels and restores the full
+list), `o` to open the selected issue in your browser, `<Space>` to mark/unmark the
+selected issue (shown with a `[x]`/`[ ]`
 checkbox prefix — independent of the active filter, so a mark survives narrowing and
 clearing the filter), `<Enter>` to implement it — with no issues marked, implements just
 the selected one; with one or more marked, implements every marked issue in list order,

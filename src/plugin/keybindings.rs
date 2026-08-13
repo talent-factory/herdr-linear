@@ -76,6 +76,11 @@ pub static KEYBINDINGS: &[KeyBinding] = &[
         context: BindingContext::View,
     },
     KeyBinding {
+        keys: "j / k",
+        action: "Scroll issue detail",
+        context: BindingContext::View,
+    },
+    KeyBinding {
         keys: "/",
         action: "Filter/sort issues (text, or priority:/state:/label:/sort:)",
         context: BindingContext::View,

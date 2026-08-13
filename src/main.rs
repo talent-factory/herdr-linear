@@ -66,6 +66,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn install_panic_hook() {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
+        // Mouse capture must come off before the other two — same ordering as the
+        // matching teardown in `run_tui` below, and for the same reason: crossterm/
+        // ratatui's own panic-safety doesn't know we ever enabled it, so a panic that
+        // skipped this would leave the host terminal stuck in mouse-reporting mode.
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
         let _ = crossterm::terminal::disable_raw_mode();
         let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
         original_hook(panic_info);
@@ -78,6 +83,12 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
+    // Mouse is additive to the keyboard-first design (mirrors `herdr-file-viewer`'s own
+    // rationale, which requests capture for the identical reason): herdr forwards mouse
+    // events to a pane that requests capture, while reserving Shift+mouse for the
+    // terminal's own selection/copy — see `plugin::app::handle_mouse` for what this
+    // plugin does with them. Best-effort so a terminal without mouse support still runs.
+    let _ = crossterm::execute!(stdout, crossterm::event::EnableMouseCapture);
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
 
@@ -87,7 +98,12 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
 
     // Always attempt full teardown, even if an earlier step in it failed, so a
     // panic-free error path never leaves the terminal in raw mode / alternate
-    // screen / hidden-cursor. The event loop's actual `Result` is still returned.
+    // screen / hidden-cursor / mouse-reporting mode. The event loop's actual `Result`
+    // is still returned.
+    let _ = crossterm::execute!(
+        terminal.backend_mut(),
+        crossterm::event::DisableMouseCapture
+    );
     let _ = crossterm::terminal::disable_raw_mode();
     let _ = crossterm::execute!(
         terminal.backend_mut(),
@@ -1208,148 +1224,161 @@ async fn event_loop(
         terminal.draw(|frame| plugin::ui::draw(frame, app))?;
 
         if crossterm::event::poll(std::time::Duration::from_millis(200))? {
-            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
-                if let Some(action) = plugin::app::handle_key(app, key.code, key.modifiers) {
-                    match action {
-                        plugin::app::Action::Quit => break,
-                        plugin::app::Action::OpenInBrowser(url) => {
-                            let _ = open::that(url);
-                        }
-                        plugin::app::Action::OpenConfig(path) => {
-                            // Unlike `OpenInBrowser` above, this chains filesystem writes and
-                            // (possibly) a herdr round-trip in front of the final "open it"
-                            // step — each with real, user-hittable failure modes (permission
-                            // denied, disk full, herdr unreachable) — and it's one of the
-                            // recovery actions offered on the error screen. Silently doing
-                            // nothing here would leave the user stuck with no indication that
-                            // pressing `c` didn't work, so unlike `OpenInBrowser` this surfaces a
-                            // failure via `set_status` rather than discarding it. See
-                            // docs/superpowers/specs/2026-08-11-editor-handling-design.md.
-                            let ensure_result: Result<(), String> = (|| {
-                                if let Some(parent) = path.parent() {
-                                    std::fs::create_dir_all(parent).map_err(|e| {
-                                        format!("Couldn't create {}: {e}", parent.display())
-                                    })?;
-                                }
-                                if !path.exists() {
-                                    std::fs::write(&path, CONFIG_TEMPLATE).map_err(|e| {
-                                        format!("Couldn't write {}: {e}", path.display())
-                                    })?;
-                                }
-                                Ok(())
-                            })(
-                            );
+            match crossterm::event::read()? {
+                crossterm::event::Event::Mouse(mouse) => {
+                    // Real-time, not cached from the last `terminal.draw` — cheap (a single
+                    // ioctl) and always current, unlike a size captured at draw time, which
+                    // could be stale by the time a mouse event arrives after a resize.
+                    let (width, _height) = crossterm::terminal::size()?;
+                    plugin::app::handle_mouse(app, mouse.kind, mouse.column, width);
+                }
+                crossterm::event::Event::Key(key) => {
+                    if let Some(action) = plugin::app::handle_key(app, key.code, key.modifiers) {
+                        match action {
+                            plugin::app::Action::Quit => break,
+                            plugin::app::Action::OpenInBrowser(url) => {
+                                let _ = open::that(url);
+                            }
+                            plugin::app::Action::OpenConfig(path) => {
+                                // Unlike `OpenInBrowser` above, this chains filesystem writes and
+                                // (possibly) a herdr round-trip in front of the final "open it"
+                                // step — each with real, user-hittable failure modes (permission
+                                // denied, disk full, herdr unreachable) — and it's one of the
+                                // recovery actions offered on the error screen. Silently doing
+                                // nothing here would leave the user stuck with no indication that
+                                // pressing `c` didn't work, so unlike `OpenInBrowser` this surfaces a
+                                // failure via `set_status` rather than discarding it. See
+                                // docs/superpowers/specs/2026-08-11-editor-handling-design.md.
+                                let ensure_result: Result<(), String> = (|| {
+                                    if let Some(parent) = path.parent() {
+                                        std::fs::create_dir_all(parent).map_err(|e| {
+                                            format!("Couldn't create {}: {e}", parent.display())
+                                        })?;
+                                    }
+                                    if !path.exists() {
+                                        std::fs::write(&path, CONFIG_TEMPLATE).map_err(|e| {
+                                            format!("Couldn't write {}: {e}", path.display())
+                                        })?;
+                                    }
+                                    Ok(())
+                                })(
+                                );
 
-                            match ensure_result {
-                                Err(message) => {
-                                    app.set_status(plugin::app::Status::Error(format!(
-                                        "{message}. Edit it manually."
-                                    )));
-                                }
-                                Ok(()) => {
-                                    let editor_cmd = resolve_editor_command_from_env();
-                                    // Shown unconditionally, not gated on `editor_cmd.is_some()`
-                                    // — see `open_config_result_status`'s doc for why: it keeps
-                                    // this set symmetric with the unconditional `clear`/`set`
-                                    // below on every tier, including the OS-opener-only one.
-                                    app.set_status(plugin::app::Status::Ok(
-                                        "Opening config.toml…".to_string(),
-                                    ));
-                                    terminal.draw(|frame| plugin::ui::draw(frame, app))?;
+                                match ensure_result {
+                                    Err(message) => {
+                                        app.set_status(plugin::app::Status::Error(format!(
+                                            "{message}. Edit it manually."
+                                        )));
+                                    }
+                                    Ok(()) => {
+                                        let editor_cmd = resolve_editor_command_from_env();
+                                        // Shown unconditionally, not gated on `editor_cmd.is_some()`
+                                        // — see `open_config_result_status`'s doc for why: it keeps
+                                        // this set symmetric with the unconditional `clear`/`set`
+                                        // below on every tier, including the OS-opener-only one.
+                                        app.set_status(plugin::app::Status::Ok(
+                                            "Opening config.toml…".to_string(),
+                                        ));
+                                        terminal.draw(|frame| plugin::ui::draw(frame, app))?;
 
-                                    let herdr_bin = plugin::herdr_cli::herdr_bin();
-                                    let result =
-                                        open_config_editor(&path, editor_cmd, &herdr_bin, |p| {
-                                            open::that(p)
-                                        })
+                                        let herdr_bin = plugin::herdr_cli::herdr_bin();
+                                        let result = open_config_editor(
+                                            &path,
+                                            editor_cmd,
+                                            &herdr_bin,
+                                            |p| open::that(p),
+                                        )
                                         .await;
 
-                                    match open_config_result_status(&result) {
-                                        Some(status) => app.set_status(status),
-                                        None => app.clear_status(),
+                                        match open_config_result_status(&result) {
+                                            Some(status) => app.set_status(status),
+                                            None => app.clear_status(),
+                                        }
                                     }
                                 }
-                            }
 
-                            if flush_buffered_quit()? {
-                                break;
+                                if flush_buffered_quit()? {
+                                    break;
+                                }
                             }
-                        }
-                        plugin::app::Action::Retry | plugin::app::Action::EnterView => {
-                            // `handle_key` already moved `app` into `Loading` — either
-                            // retrying the current view or entering a newly selected
-                            // one; draw that before the fetch's own round-trip so
-                            // it's visible instead of leaving the stale previous frame.
-                            terminal.draw(|frame| plugin::ui::draw(frame, app))?;
-                            // `ensure_loaded` can block for up to ~2 minutes riding out
-                            // TF-610's rate-limit retry (up to 3 attempts, each waiting up
-                            // to 60s on the server's Retry-After) with no visible progress —
-                            // during that window keys the user presses, including quit, just
-                            // buffer up in the terminal instead of being handled. Drain them
-                            // the same way the Implement/ImplementMany arms below do, so a
-                            // quit pressed while this was stuck actually takes effect instead
-                            // of leaving the app looking hung. But only once the load actually
-                            // took long enough to justify it (see
-                            // `RETRY_OR_ENTER_VIEW_STALE_LOAD_THRESHOLD`) — on the common fast
-                            // round-trip, draining unconditionally would silently eat a
-                            // legitimate follow-up keypress that the loop's normal poll would
-                            // otherwise have picked up next iteration.
-                            let load_started = std::time::Instant::now();
-                            ensure_loaded(app, client).await;
+                            plugin::app::Action::Retry | plugin::app::Action::EnterView => {
+                                // `handle_key` already moved `app` into `Loading` — either
+                                // retrying the current view or entering a newly selected
+                                // one; draw that before the fetch's own round-trip so
+                                // it's visible instead of leaving the stale previous frame.
+                                terminal.draw(|frame| plugin::ui::draw(frame, app))?;
+                                // `ensure_loaded` can block for up to ~2 minutes riding out
+                                // TF-610's rate-limit retry (up to 3 attempts, each waiting up
+                                // to 60s on the server's Retry-After) with no visible progress —
+                                // during that window keys the user presses, including quit, just
+                                // buffer up in the terminal instead of being handled. Drain them
+                                // the same way the Implement/ImplementMany arms below do, so a
+                                // quit pressed while this was stuck actually takes effect instead
+                                // of leaving the app looking hung. But only once the load actually
+                                // took long enough to justify it (see
+                                // `RETRY_OR_ENTER_VIEW_STALE_LOAD_THRESHOLD`) — on the common fast
+                                // round-trip, draining unconditionally would silently eat a
+                                // legitimate follow-up keypress that the loop's normal poll would
+                                // otherwise have picked up next iteration.
+                                let load_started = std::time::Instant::now();
+                                ensure_loaded(app, client).await;
 
-                            if load_started.elapsed() >= RETRY_OR_ENTER_VIEW_STALE_LOAD_THRESHOLD
-                                && flush_buffered_quit()?
-                            {
-                                break;
+                                if load_started.elapsed()
+                                    >= RETRY_OR_ENTER_VIEW_STALE_LOAD_THRESHOLD
+                                    && flush_buffered_quit()?
+                                {
+                                    break;
+                                }
                             }
-                        }
-                        plugin::app::Action::Implement(issue) => {
-                            app.set_status(plugin::app::Status::Ok(format!(
-                                "Starting implementation for {}…",
-                                issue.identifier
-                            )));
-                            terminal.draw(|frame| plugin::ui::draw(frame, app))?;
-                            match client.as_ref() {
-                                Some(c) => start_implementation(app, c, issue).await,
-                                None => app.set_status(plugin::app::Status::Error(format!(
-                                    "{}: not connected to Linear yet — try again.",
+                            plugin::app::Action::Implement(issue) => {
+                                app.set_status(plugin::app::Status::Ok(format!(
+                                    "Starting implementation for {}…",
                                     issue.identifier
-                                ))),
-                            }
-
-                            if flush_buffered_quit()? {
-                                break;
-                            }
-                        }
-                        plugin::app::Action::ImplementMany(issues) => {
-                            app.set_status(plugin::app::Status::Ok(format!(
-                                "Starting implementation for {} issues…",
-                                issues.len()
-                            )));
-                            terminal.draw(|frame| plugin::ui::draw(frame, app))?;
-                            // Only clear the marked-issue selection once every issue actually
-                            // started — not connected (nothing attempted) and a partial/total
-                            // failure both leave the marks in place, so the user can retry
-                            // without re-marking everything (TF-590).
-                            match client.as_ref() {
-                                Some(c) => {
-                                    let all_started =
-                                        start_implementation_many(app, c, issues).await;
-                                    if should_clear_marks_after_implementing_many(all_started) {
-                                        app.clear_marks();
-                                    }
+                                )));
+                                terminal.draw(|frame| plugin::ui::draw(frame, app))?;
+                                match client.as_ref() {
+                                    Some(c) => start_implementation(app, c, issue).await,
+                                    None => app.set_status(plugin::app::Status::Error(format!(
+                                        "{}: not connected to Linear yet — try again.",
+                                        issue.identifier
+                                    ))),
                                 }
-                                None => app.set_status(plugin::app::Status::Error(
-                                    "not connected to Linear yet — try again.".to_string(),
-                                )),
-                            }
 
-                            if flush_buffered_quit()? {
-                                break;
+                                if flush_buffered_quit()? {
+                                    break;
+                                }
+                            }
+                            plugin::app::Action::ImplementMany(issues) => {
+                                app.set_status(plugin::app::Status::Ok(format!(
+                                    "Starting implementation for {} issues…",
+                                    issues.len()
+                                )));
+                                terminal.draw(|frame| plugin::ui::draw(frame, app))?;
+                                // Only clear the marked-issue selection once every issue actually
+                                // started — not connected (nothing attempted) and a partial/total
+                                // failure both leave the marks in place, so the user can retry
+                                // without re-marking everything (TF-590).
+                                match client.as_ref() {
+                                    Some(c) => {
+                                        let all_started =
+                                            start_implementation_many(app, c, issues).await;
+                                        if should_clear_marks_after_implementing_many(all_started) {
+                                            app.clear_marks();
+                                        }
+                                    }
+                                    None => app.set_status(plugin::app::Status::Error(
+                                        "not connected to Linear yet — try again.".to_string(),
+                                    )),
+                                }
+
+                                if flush_buffered_quit()? {
+                                    break;
+                                }
                             }
                         }
                     }
                 }
+                _ => {}
             }
         }
     }
