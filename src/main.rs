@@ -1227,8 +1227,9 @@ async fn event_loop(
             match crossterm::event::read()? {
                 crossterm::event::Event::Mouse(mouse) => {
                     // Real-time, not cached from the last `terminal.draw` — cheap (a single
-                    // ioctl) and always current, unlike a size captured at draw time, which
-                    // could be stale by the time a mouse event arrives after a resize.
+                    // terminal-size query, an ioctl on Unix) and always current, unlike a
+                    // size captured at draw time, which could be stale by the time a mouse
+                    // event arrives after a resize.
                     let (width, _height) = crossterm::terminal::size()?;
                     plugin::app::handle_mouse(app, mouse.kind, mouse.column, width);
                 }

@@ -329,9 +329,17 @@ pub(crate) fn detail_line_count(issue: &Issue) -> usize {
 /// for why a narrower-than-real assumption is the safe direction. The Detail pane is the
 /// right half of a 50/50 horizontal split (`draw_view`'s `chunks`), minus 2 columns for
 /// its bordered `Block`; even an unusually narrow 44-column terminal still leaves
-/// `44 / 2 - 2 = 20` columns of real content width, so this stays at or below that for a
-/// comfortable margin without the estimate ballooning needlessly.
-const DETAIL_CONSERVATIVE_WRAP_WIDTH: usize = 20;
+/// `44 / 2 - 2 = 20` columns of real content width. Review fix (PR #44): the first cut of
+/// this constant was set to exactly `20` — equal to, not below, that floor, so it carried
+/// *zero* actual margin despite its own doc claiming one; any terminal narrower than 44
+/// columns would silently violate the "narrower-than-real is safe" invariant
+/// `detail_line_count` depends on. `18` restores a genuine 2-column buffer below the
+/// 44-column floor (down to a 40-column terminal), mirroring the sibling
+/// `CONSERVATIVE_WRAP_WIDTH`'s own real 2-column margin (`30` real vs. `28` assumed) —
+/// see the `detail_line_count_estimate_stays_at_or_below_the_real_wrapped_row_count_at_a_
+/// narrow_width` test below, which pins the margin down directly rather than relying on
+/// this comment's arithmetic staying honest on its own.
+const DETAIL_CONSERVATIVE_WRAP_WIDTH: usize = 18;
 
 /// The plain text of `line`, ignoring styling — its spans' `content` concatenated in
 /// order. [`word_wrapped_row_count`] only needs the text, not [`build_detail_lines`]'s
@@ -2120,6 +2128,97 @@ mod tests {
         // identifier, blank, title, blank, Status, Assignee, Project, blank — 8 header
         // lines, each contributing at least one row even before any description content.
         assert!(detail_line_count(&issue) >= 8);
+    }
+
+    /// Regression test (PR #44 review): pins down `DETAIL_CONSERVATIVE_WRAP_WIDTH`'s own
+    /// "narrower-than-real is safe" margin directly, rather than trusting its doc comment's
+    /// arithmetic to stay honest on its own — which is exactly how the original `20`
+    /// (zero margin below its claimed 44-column/20-column floor) shipped unnoticed. At a
+    /// 40-column terminal (real Detail-pane content width `40 / 2 - 2 = 18`, narrower than
+    /// the 44-column terminal the doc calls out), `detail_line_count`'s estimate — built
+    /// from the fixed conservative width, oblivious to the real one — must still be at
+    /// least as large as what a real render at that narrower width actually needs. A
+    /// constant equal to or wider than the real floor would under-count here instead,
+    /// exactly the "`j`/wheel clamps short of the true end" failure this invariant exists
+    /// to prevent.
+    #[test]
+    fn detail_line_count_estimate_stays_at_or_above_the_real_wrapped_row_count_at_a_narrow_width() {
+        const NARROWEST_SUPPORTED_REAL_WIDTH: usize = 18; // a 40-column terminal's Detail pane
+
+        let long_description = "word ".repeat(80); // forces real wrapping at either width
+        let issue = sample_issue_with_description("ENG-1", &long_description);
+
+        let estimate = detail_line_count(&issue);
+        let real_rows: usize = build_detail_lines(&issue, NARROWEST_SUPPORTED_REAL_WIDTH)
+            .iter()
+            .map(|line| {
+                word_wrapped_row_count(&line_plain_text(line), NARROWEST_SUPPORTED_REAL_WIDTH)
+            })
+            .sum();
+
+        assert!(
+            estimate >= real_rows,
+            "estimate ({estimate}) must stay at or above the real render's row count \
+             ({real_rows}) at the narrowest supported terminal width"
+        );
+    }
+
+    /// Regression test (PR #44 review): every other `App::detail_scroll` test asserts on
+    /// `App` state alone, never on what actually reaches the screen — so a wiring break in
+    /// `draw_view` (a swapped `.scroll((0, *detail_scroll))` instead of
+    /// `.scroll((*detail_scroll, 0))`, or the `.scroll(...)` call dropped entirely) would
+    /// pass every one of them undetected despite the Detail pane silently never actually
+    /// scrolling for the user. Renders a description long enough that its first and last
+    /// paragraphs can't both fit on screen at once, and confirms scrolling to the real
+    /// rendered end moves the *rendered* content, not just the stored offset.
+    ///
+    /// Scrolls by the *real* row count at the render's actual width (60 columns → a
+    /// 28-column Detail pane), not `detail_line_count`'s conservative estimate (built for
+    /// a narrower, unrelated assumed width — see `detail_line_count_estimate_stays_at_or_
+    /// above_the_real_wrapped_row_count_at_a_narrow_width` for that invariant on its own).
+    /// Scrolling to the *estimate*'s max here would overshoot past this test's real,
+    /// wider-than-assumed content, landing on blank space past the end rather than on the
+    /// last real line — `Paragraph::scroll` doesn't clamp an offset past its own content,
+    /// it just renders nothing.
+    #[test]
+    fn detail_scroll_offset_reaches_the_rendered_detail_pane() {
+        let mut app = app_in_my_issues_view();
+        let filler = "filler paragraph\n\n".repeat(28);
+        let description = format!("ALPHA-TOP-MARKER\n\n{filler}ZULU-BOTTOM-MARKER");
+        app.set_issues(vec![sample_issue_with_description("ENG-1", &description)]);
+
+        let before = rendered_text_with_size(&app, 60, 15);
+        assert!(
+            before.contains("ALPHA-TOP-MARKER"),
+            "the first description paragraph must be visible before any scrolling"
+        );
+        assert!(
+            !before.contains("ZULU-BOTTOM-MARKER"),
+            "the last description paragraph must not already be visible before scrolling"
+        );
+
+        // The Detail pane's real content width at a 60-column terminal: half the frame
+        // (a 50/50 split, even so no ceil/floor asymmetry) minus 2 columns for its
+        // bordered `Block` — mirrors `DETAIL_CONSERVATIVE_WRAP_WIDTH`'s own formula.
+        const REAL_DETAIL_WIDTH: usize = 60 / 2 - 2;
+        let issue = app.selected_issue().unwrap();
+        let real_row_count: usize = build_detail_lines(issue, REAL_DETAIL_WIDTH)
+            .iter()
+            .map(|line| word_wrapped_row_count(&line_plain_text(line), REAL_DETAIL_WIDTH))
+            .sum();
+        for _ in 0..real_row_count {
+            app.detail_scroll_down(real_row_count);
+        }
+
+        let after = rendered_text_with_size(&app, 60, 15);
+        assert!(
+            !after.contains("ALPHA-TOP-MARKER"),
+            "the first description paragraph must have scrolled out of view"
+        );
+        assert!(
+            after.contains("ZULU-BOTTOM-MARKER"),
+            "scrolling to the clamped end must bring the last description paragraph into view"
+        );
     }
 
     #[test]

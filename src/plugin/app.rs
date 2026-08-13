@@ -502,7 +502,12 @@ impl App {
     /// outside a loaded view.
     pub fn detail_scroll_down(&mut self, content_line_count: usize) {
         if let Screen::View(_, ViewState::Loaded { detail_scroll, .. }) = &mut self.screen {
-            let max_scroll = content_line_count.saturating_sub(1) as u16;
+            // `.min(u16::MAX as usize)` before the cast, mirroring `ui::status_banner_
+            // height`'s identical guard: an implausibly long description (needing more
+            // than 65,535 rendered rows) would otherwise wrap `as u16` around to a small
+            // number and *under*-clamp, letting `detail_scroll` advance far past the real
+            // content instead of stopping at its true end.
+            let max_scroll = content_line_count.saturating_sub(1).min(u16::MAX as usize) as u16;
             *detail_scroll = detail_scroll.saturating_add(1).min(max_scroll);
         }
     }
@@ -1033,7 +1038,13 @@ pub fn handle_mouse(
         return;
     }
 
-    let over_list = column < terminal_width / 2;
+    // `div_ceil`, not plain `/` (floor division): `ui::draw_view`'s two `Constraint::
+    // Percentage(50)` chunks split an odd `terminal_width` unevenly — ratatui gives the
+    // *first* (List) chunk `ceil(width / 2)` columns and the second (Detail) `floor(width
+    // / 2)`. A floor-division boundary here would misclassify the List pane's own last
+    // column (index `width / 2`) as Detail on every odd width — verified against the
+    // pinned `ratatui` version's actual split behavior (PR #44 review).
+    let over_list = column < terminal_width.div_ceil(2);
     match kind {
         MouseEventKind::ScrollDown if over_list => app.move_selection_down(),
         MouseEventKind::ScrollUp if over_list => app.move_selection_up(),
@@ -1534,6 +1545,35 @@ mod tests {
     }
 
     #[test]
+    fn mouse_scroll_over_the_lists_own_last_column_moves_selection_on_an_odd_width() {
+        // Regression test (PR #44 review): `ratatui`'s two `Constraint::Percentage(50)`
+        // chunks split an odd width unevenly — the List pane (first chunk) gets
+        // `ceil(width / 2)` columns, the Detail pane (second chunk) gets `floor(width /
+        // 2)`. At width 79 that's List columns 0..=39 (40 columns) and Detail 40..=78. A
+        // floor-division boundary (`column < width / 2` = `column < 39`) would
+        // misclassify column 39 — the List pane's own last column — as Detail. This must
+        // route to the List instead.
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
+        const ODD_TERMINAL_WIDTH: u16 = 79;
+        const LISTS_LAST_COLUMN: u16 = 39;
+
+        handle_mouse(
+            &mut app,
+            MouseEventKind::ScrollDown,
+            LISTS_LAST_COLUMN,
+            ODD_TERMINAL_WIDTH,
+        );
+
+        assert_eq!(app.selected_issue().unwrap().identifier, "ENG-2");
+        assert_eq!(
+            detail_scroll_of(&app),
+            Some(0),
+            "must not have been misrouted to the Detail pane"
+        );
+    }
+
+    #[test]
     fn mouse_scroll_down_over_the_detail_pane_scrolls_detail_by_the_wheel_step() {
         let mut app = app_in_my_issues_view();
         app.set_issues(vec![sample_issue("ENG-1")]);
@@ -1602,19 +1642,66 @@ mod tests {
     }
 
     #[test]
+    fn mouse_wheel_is_a_no_op_while_loading_or_on_the_error_screen() {
+        // The test above only exercises `Screen::Menu` — this covers the other two
+        // "outside a loaded view" screens, reached via a different `Screen::View` arm.
+        let mut loading = app_in_my_issues_view(); // Screen::View(_, ViewState::Loading)
+        handle_mouse(
+            &mut loading,
+            MouseEventKind::ScrollDown,
+            LIST_COLUMN,
+            TERMINAL_WIDTH,
+        );
+        handle_mouse(
+            &mut loading,
+            MouseEventKind::ScrollDown,
+            DETAIL_COLUMN,
+            TERMINAL_WIDTH,
+        );
+        assert!(matches!(
+            loading.screen,
+            Screen::View(ViewKind::MyIssues, ViewState::Loading)
+        ));
+
+        let mut error = app_in_my_issues_view();
+        error.set_error("boom".to_string());
+        handle_mouse(
+            &mut error,
+            MouseEventKind::ScrollDown,
+            LIST_COLUMN,
+            TERMINAL_WIDTH,
+        );
+        handle_mouse(
+            &mut error,
+            MouseEventKind::ScrollDown,
+            DETAIL_COLUMN,
+            TERMINAL_WIDTH,
+        );
+        assert!(matches!(
+            error.screen,
+            Screen::View(ViewKind::MyIssues, ViewState::Error { .. })
+        ));
+    }
+
+    #[test]
     fn mouse_click_is_a_deliberate_no_op() {
         let mut app = app_in_my_issues_view();
         app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
 
-        handle_mouse(
-            &mut app,
+        // No click/drag support yet (not requested) — every one of these falls through
+        // `handle_mouse`'s final `_ => {}` arm, so selection and scroll stay untouched
+        // regardless of which specific kind arrives.
+        for kind in [
             MouseEventKind::Down(MouseButton::Left),
-            LIST_COLUMN,
-            TERMINAL_WIDTH,
-        );
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Moved,
+        ] {
+            handle_mouse(&mut app, kind, LIST_COLUMN, TERMINAL_WIDTH);
+        }
 
-        // No click-to-select support yet (not requested) — selection is untouched.
         assert_eq!(app.selected_issue().unwrap().identifier, "ENG-1");
+        assert_eq!(detail_scroll_of(&app), Some(0));
     }
 
     #[test]
@@ -1631,9 +1718,20 @@ mod tests {
             LIST_COLUMN,
             TERMINAL_WIDTH,
         );
-
         assert_eq!(app.help_overlay().unwrap().scroll, 1);
-        // The hidden Loaded view underneath must be untouched.
+
+        // Over what would be the Detail half — must hit the same overlay, not the Detail
+        // pane's own scroll. If the column check ever leaked into this branch, this would
+        // land on `detail_scroll` instead of continuing to advance `help_overlay().scroll`.
+        handle_mouse(
+            &mut app,
+            MouseEventKind::ScrollDown,
+            DETAIL_COLUMN,
+            TERMINAL_WIDTH,
+        );
+        assert_eq!(app.help_overlay().unwrap().scroll, 2);
+
+        // The hidden Loaded view underneath must be untouched throughout.
         assert_eq!(app.selected_issue().unwrap().identifier, "ENG-1");
         assert_eq!(detail_scroll_of(&app), Some(0));
     }
@@ -1756,6 +1854,23 @@ mod tests {
 
         assert!(app.marked_issues().is_empty());
         assert!(!app.is_marked(0));
+    }
+
+    #[test]
+    fn set_issues_resets_detail_scroll_left_over_from_a_previous_list() {
+        // Mirrors `set_issues_clears_marks_left_over_from_a_previous_list`: a second
+        // `set_issues` call (retry/re-fetch) must reset `detail_scroll` alongside
+        // `issues`/`selected`/`marked`, not just on first entry into the view — otherwise a
+        // stale scroll offset would open the newly-fetched first issue's description
+        // mid-scroll instead of at the top.
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
+        app.detail_scroll_down(10);
+        assert_eq!(detail_scroll_of(&app), Some(1));
+
+        app.set_issues(vec![sample_issue("ENG-3")]);
+
+        assert_eq!(detail_scroll_of(&app), Some(0));
     }
 
     #[test]
@@ -2472,6 +2587,24 @@ mod tests {
 
         // Query is empty again — everything matches, same as no filter at all.
         assert_eq!(app.selected_issue().unwrap().identifier, "ENG-1");
+    }
+
+    #[test]
+    fn backspace_while_filtering_resets_detail_scroll_to_zero() {
+        // Mirrors `typing_a_filter_character_resets_detail_scroll_to_zero` — `pop_filter_char`
+        // resets `selected` exactly like `push_filter_char` does, so it must reset
+        // `detail_scroll` alongside it too, for the same reason: the narrowed-then-widened
+        // match set can land `selected` on a different issue than before.
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        app.detail_scroll_down(10);
+        assert_eq!(detail_scroll_of(&app), Some(1));
+
+        handle_key(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+
+        assert_eq!(detail_scroll_of(&app), Some(0));
     }
 
     #[test]
