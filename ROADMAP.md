@@ -80,7 +80,7 @@ dropped from this phase's original scope; benchmarks move to Phase 2a below.
 The one loose end this phase left — `execute_batch` (TF-611) not yet wired
 into `main.rs`'s multi-issue implement flow — closed via TF-622 (Phase 2a).
 
-### Phase 2a: Filtering, Batching & Performance Foundations
+### Phase 2a: Filtering, Batching & Performance Foundations ✅ Complete
 
 **Target**: 2026-08-14. Tracked as issues in the
 [herdr-linear Linear project](https://linear.app/talent-factory/project/herdr-linear-10dca51ea35b/overview)
@@ -89,7 +89,7 @@ first slice of Phase 2's "Filtering & Search".
 
 - [x] Wire `execute_batch` (TF-611) into `main.rs`'s multi-issue implement
       flow, replacing its still-sequential per-issue loop (TF-622)
-- [ ] Performance benchmarks (`criterion`) for pagination, batch execution,
+- [x] Performance benchmarks (`criterion`) for pagination, batch execution,
       and rate-limit retry (TF-623)
 - [x] Query DSL parser: filter terms (`priority:`, `state:`, `label:`) + sort
       keys (TF-615)
@@ -101,6 +101,27 @@ first slice of Phase 2's "Filtering & Search".
 
 TF-622/TF-623 are independent and can run in parallel with, or ahead of,
 TF-615→616→617's dependency chain.
+
+### Plugin Polish (ongoing, not Linear-tracked)
+
+Small UX fixes and additions that came directly from live user testing
+rather than a planned milestone — landed alongside Phase 2a rather than
+deferred to a dedicated phase.
+
+- [x] Keyboard scrolling (`j`/`k`) for the Detail pane, previously unscrollable
+      once a long issue description ran past the bottom of the panel — clamped
+      against an estimated wrapped-row count, mirroring the help overlay's own
+      scroll design (TF-585)
+- [x] Real mouse support: wheel scroll for the List/Detail panes and the help
+      overlay (`EnableMouseCapture` on startup), matching `herdr-file-viewer`'s
+      "keyboard-first, mouse additive" design — clicks/drags remain a
+      deliberate no-op
+- [x] `c` (open `config.toml`) now hands the editor the terminal in-place
+      (suspends/resumes the plugin's own TUI around a direct child process)
+      instead of opening a separate herdr tab — fixes a leftover shell pane
+      left behind after quitting the editor, and removes the herdr-CLI-pane
+      machinery (`open_config_in_herdr_pane` and friends) that TF-614
+      originally added for it
 
 ### Phase 2: Advanced Features
 
@@ -230,7 +251,7 @@ Have ideas? Please:
 | Aug 2026  | Plugin v1 ("My Issues") Complete | Done      |
 | Aug 2026  | Phase 1.6 (Smart Issue Selection)| Done      |
 | Aug 2026  | Phase 1.7 (Polish & Stability)   | Done      |
-| 2026-08-14| Phase 2a (Filtering/Batching/Perf)| In Progress |
+| 2026-08-14| Phase 2a (Filtering/Batching/Perf)| Done      |
 | Oct 2026  | Phase 2 (Advanced Features)     | Planned   |
 | Nov 2026  | Phase 3 (Herdr Integration)     | Planned   |
 | Dec 2026  | Phase 4 (Production)            | Planned   |
@@ -243,4 +264,4 @@ Have ideas? Please:
 
 ---
 
-Last updated: 2026-08-11
+Last updated: 2026-08-13
