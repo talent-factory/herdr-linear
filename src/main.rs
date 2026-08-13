@@ -701,163 +701,164 @@ async fn implement_one(
     }
 }
 
-/// Failure modes for [`open_config_in_herdr_pane`]. The two variants matter to
-/// [`open_config_editor`]: an `Unavailable` failure means nothing was created and the OS-opener
-/// fallback is safe; an `Ambiguous` failure means a tab may already exist with the editor
-/// running in it, so falling back would risk opening `config.toml` a second time — see
-/// `pane_run`'s handling above and [`implement_one`]'s identical `run_with_timeout` caveat
-/// for why a herdr-call `Err` doesn't mean the call didn't actually take effect.
+/// Outcome of [`run_editor_command`]/[`run_editor_in_terminal_with`] — the actual "launch the
+/// editor and wait for it" attempt. Distinguishes "never ran" (safe for [`open_config_editor`]
+/// to fall back to the OS opener) from "ran, and already had the terminal" (a fallback next
+/// would risk a second, confusing "open" for a file the user just closed) — loosely mirrors
+/// `herdr-file-viewer`'s own `NotLaunched`/`NonZeroExit` distinction for the identical
+/// spawn-and-wait hand-off (that project splits the concern across two types, `SpawnError` at
+/// its `Spawner` layer and a 4-variant `EditorOutcome` at its `EditorHandoff` layer, including a
+/// `TookOver`/`NoTakeover` split this one has no equivalent of — the two aren't a 1:1 match).
 #[derive(Debug, PartialEq, Eq)]
-enum HerdrPaneError {
-    /// No tab was created — either an existing tab was found but `tab_focus` failed, or no
-    /// existing tab was found and `tab_create` failed; either way the caller's OS-opener
-    /// fallback is safe.
-    Unavailable(String),
-    /// A tab was created but `pane_run`'s outcome is unknown (the editor may have started
-    /// despite the error). The caller must not fall back to the OS opener here.
-    Ambiguous(String),
+enum EditorOutcome {
+    /// The editor ran, exited successfully, and the terminal was restored afterward.
+    Ok,
+    /// The editor could not be launched at all — e.g. removed from disk in the gap between
+    /// [`resolve_editor_command_from_env`] resolving it and this call. Nothing happened, so
+    /// the OS-opener fallback is safe.
+    NotLaunched(String),
+    /// The editor launched and ran, but exited with a non-zero status (`:cq` in nvim, or a
+    /// real crash). It already took over the terminal, so the caller must not also try the OS
+    /// opener.
+    NonZeroExit(String),
+    /// The editor itself ran fine (or already failed to launch/exited non-zero — see
+    /// [`run_editor_in_terminal_with`]), but restoring herdr-linear's own TUI afterward failed.
+    /// Treated like `NonZeroExit` by [`open_config_editor`] (the terminal was already handed
+    /// over, so no OS-opener fallback) but kept as its own variant so the message can point at
+    /// the *terminal*, not the editor, as what needs attention — and, critically, so this
+    /// failure is never silently dropped the way it used to be: previously a `resume_tui`
+    /// failure after a successful edit left `run_editor_in_terminal` returning a bare `Ok`,
+    /// which `open_config_editor`/`open_config_result_status` turn into *clearing* the status
+    /// bar — zero on-screen indication that the terminal might now be broken (PR #46 review).
+    TerminalNotRestored(String),
 }
 
-impl std::fmt::Display for HerdrPaneError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            HerdrPaneError::Unavailable(message) | HerdrPaneError::Ambiguous(message) => {
-                write!(f, "{message}")
-            }
-        }
-    }
-}
-
-/// True if the herdr tab `tab_id` (an existing config-editor tab) currently has a non-shell
-/// foreground process running in its root pane. Used by [`open_config_in_herdr_pane`] to avoid
-/// reusing a dead editor tab. Falls back to `false` on any I/O or parsing error — a tab whose
-/// liveness can't be verified is treated as dead, and a fresh tab is created instead.
-async fn editor_tab_is_alive(herdr_bin: &str, tab_id: &plugin::herdr_cli::TabId) -> bool {
-    let panes_json = match plugin::herdr_cli::pane_list(herdr_bin).await {
-        Ok(json) => json,
-        Err(err) => {
-            tracing::debug!(
-                "couldn't list panes to check liveness of existing '{}' tab ({err}) — assuming \
-                 dead",
-                plugin::editor::EDITOR_AGENT_NAME
-            );
-            return false;
-        }
-    };
-
-    let pane_id = match plugin::herdr_cli::find_root_pane_for_tab(&panes_json, tab_id) {
-        Some(pane_id) => pane_id,
-        None => {
-            tracing::debug!(
-                "couldn't find root pane for existing '{}' tab — assuming dead",
-                plugin::editor::EDITOR_AGENT_NAME
-            );
-            return false;
-        }
-    };
-
-    match plugin::herdr_cli::pane_process_info(herdr_bin, &pane_id).await {
-        Ok(info) => plugin::herdr_cli::is_pane_alive(&info),
-        Err(err) => {
-            tracing::debug!(
-                "couldn't read process info for existing '{}' tab ({err}) — assuming dead",
-                plugin::editor::EDITOR_AGENT_NAME
-            );
-            false
-        }
-    }
-}
-
-/// Runs `editor_cmd` on `config_path` inside a herdr pane, for the `c` keybinding: reuses an
-/// already-open editor tab from a previous `c` press if a `herdr tab list` label lookup
-/// ([`plugin::herdr_cli::find_existing_editor_tab`]) finds one *and* [`editor_tab_is_alive`]
-/// confirms the editor process is still running, switching to it via
-/// [`plugin::herdr_cli::tab_focus`]; otherwise opens a fresh tab and types the editor command
-/// into its root pane via [`plugin::herdr_cli::tab_create`] + [`plugin::herdr_cli::pane_run`].
-/// The tab label is always [`plugin::editor::EDITOR_AGENT_NAME`] — deliberately global, not
-/// derived from repo or issue; see that constant's own doc for why a single shared tab across
-/// every herdr-linear instance is correct here, unlike `implement_one`'s per-issue names.
-///
-/// `nvim` can never become a herdr-recognized "agent" — it isn't in herdr's fixed `--kind` enum,
-/// and herdr only auto-detects/tracks recognized coding-agent binaries (verified live against
-/// herdr 0.8.0, TF-624) — so the old `agent focus`/`agent start` reuse-and-launch model is
-/// unusable for it; a tab-label lookup plus a plain `pane run` is the only mechanism that still
-/// works for an arbitrary editor command. The editor therefore runs directly in the tab's own
-/// root pane — exactly like `implement_one`'s agent does — so, unlike the pre-TF-624
-/// implementation, there is no separate agent pane split in alongside it and no redundant root
-/// pane to close afterward.
-///
-/// `pane_run`'s `Err` is treated as [`HerdrPaneError::Ambiguous`], not a plain failure: per
-/// `implement_one`'s doc on the same `herdr_cli` call pattern, a timed-out `run_with_timeout` (no
-/// `kill_on_drop` on the underlying subprocess) doesn't mean the editor never started — it may
-/// well be up in the tab that was just created. Reporting this as `Unavailable` would make
-/// [`open_config_editor`] fall back to the OS opener, opening `config.toml` a second time
-/// whenever the herdr call actually succeeded despite the client-side timeout. See
-/// docs/superpowers/specs/2026-08-11-editor-handling-design.md.
-async fn open_config_in_herdr_pane(
-    herdr_bin: &str,
+/// Runs `editor_cmd` on `config_path` as a blocking child process and waits for it to exit, via
+/// the injected `spawn` (`std::process::Command::new(editor_cmd).arg(config_path).status()` in
+/// production — see [`run_editor_in_terminal_with`]) — kept as a parameter so this stays
+/// unit-testable without really launching anything, the same reason [`open_config_editor`]
+/// takes its own `opener` as a parameter rather than calling `open::that` directly. Never
+/// returns [`EditorOutcome::TerminalNotRestored`] — that variant only exists to report a
+/// terminal-resume failure, which is [`run_editor_in_terminal_with`]'s concern, layered on top
+/// of whatever this function already decided.
+fn run_editor_command(
     editor_cmd: &str,
     config_path: &std::path::Path,
-) -> std::result::Result<(), HerdrPaneError> {
-    // Reuse an already-open editor tab from a previous `c` press, if any — see this function's
-    // own doc for why a tab-label lookup is the only reuse mechanism that still works for `nvim`.
-    // Guard against reusing a dead tab: a tab with the right label but no running editor process
-    // (e.g. the user quit nvim inside it) would otherwise strand the user on an empty shell pane.
-    match plugin::herdr_cli::tab_list(herdr_bin).await {
-        Ok(json) => {
-            if let Some(tab_id) = plugin::herdr_cli::find_existing_editor_tab(&json) {
-                if editor_tab_is_alive(herdr_bin, &tab_id).await {
-                    return plugin::herdr_cli::tab_focus(herdr_bin, &tab_id)
-                        .await
-                        .map_err(|err| {
-                            HerdrPaneError::Unavailable(format!(
-                                "found an existing '{}' tab but failed to focus it: {err}",
-                                plugin::editor::EDITOR_AGENT_NAME
-                            ))
-                        });
-                }
-                tracing::debug!(
-                    "existing '{}' tab has no running editor process — creating a new tab",
-                    plugin::editor::EDITOR_AGENT_NAME
-                );
-            }
+    spawn: impl FnOnce(&str, &std::path::Path) -> std::io::Result<std::process::ExitStatus>,
+) -> EditorOutcome {
+    match spawn(editor_cmd, config_path) {
+        Ok(status) if status.success() => EditorOutcome::Ok,
+        Ok(status) => EditorOutcome::NonZeroExit(format!("{editor_cmd} exited with {status}")),
+        Err(err) => EditorOutcome::NotLaunched(format!("couldn't launch {editor_cmd}: {err}")),
+    }
+}
+
+/// Leaves raw mode and the alternate screen — and drops mouse capture, which would otherwise
+/// leak raw escape sequences into the editor's own input — so `editor_cmd` gets a clean
+/// terminal to draw into. Real terminal I/O, so — like `run_tui`'s own raw-mode setup —
+/// deliberately untested.
+///
+/// Every step is attempted regardless of whether an earlier one failed — mirrors `run_tui`'s
+/// own teardown discipline (its doc: "Always attempt full teardown, even if an earlier step in
+/// it failed"), which the first cut of this function *didn't* follow (PR #46 review): it used
+/// `?` after the mouse-capture step, so a `disable_raw_mode` failure skipped `LeaveAlternateScreen`
+/// entirely, leaving a worse, more inconsistent partial state than attempting it too would have.
+/// Mouse-capture failure is still swallowed outright (`let _ = ...`), matching `run_tui`'s own
+/// identical treatment of it elsewhere — not every terminal supports mouse reporting, and that's
+/// an accepted, best-effort-only case, unlike raw mode / the alternate screen.
+fn suspend_tui() -> std::io::Result<()> {
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+    let raw_mode_result = crossterm::terminal::disable_raw_mode();
+    let alt_screen_result =
+        crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+    raw_mode_result.and(alt_screen_result)
+}
+
+/// Re-enters raw mode and the alternate screen, and re-arms mouse capture, after the editor
+/// exits. Every step is attempted regardless of an earlier one's outcome, for the same reason
+/// [`suspend_tui`]'s doc gives.
+fn resume_tui() -> std::io::Result<()> {
+    let raw_mode_result = crossterm::terminal::enable_raw_mode();
+    let alt_screen_result =
+        crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen);
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+    raw_mode_result.and(alt_screen_result)
+}
+
+/// Pure core of [`run_editor_in_terminal`]: `suspend`/`spawn`/`resume` as injected closures, so
+/// the *composition* around them — the suspend-failure branch, and the "resume is always
+/// attempted, and its failure is never silently dropped" invariant — is unit-testable without
+/// touching a real terminal or process. Mirrors [`run_editor_command`]'s/[`open_config_editor`]'s
+/// own pure-core/real-wrapper split; this function was the one place in the original PR #46 that
+/// skipped it, which is exactly where the review found its two real bugs (PR #46 review).
+///
+/// `resume` runs unconditionally — even when `suspend` itself failed (best-effort: whatever
+/// `suspend` may have partially changed before failing still deserves an attempt at restoring)
+/// and even when the editor never ran or exited non-zero — mirroring `run_tui`'s "always attempt
+/// full teardown" discipline extended to this suspend/resume pair. A `resume` failure folds into
+/// the returned [`EditorOutcome`] rather than being dropped: paired with an editor that already
+/// took over the terminal (`Ok`/`NonZeroExit`), it becomes `TerminalNotRestored`, which
+/// `open_config_editor` treats like `NonZeroExit` — no OS-opener fallback, since the terminal
+/// was already handed over. Paired with `NotLaunched` (the editor never ran at all — nothing
+/// touched the display), the resume failure is folded into that same `NotLaunched` message
+/// instead: the OS-opener fallback is still safe there regardless of whether this specific
+/// recovery attempt succeeded, so reclassifying it as `TerminalNotRestored` would incorrectly
+/// block a fallback that's still fine to try.
+fn run_editor_in_terminal_with(
+    editor_cmd: &str,
+    config_path: &std::path::Path,
+    suspend: impl FnOnce() -> std::io::Result<()>,
+    spawn: impl FnOnce(&str, &std::path::Path) -> std::io::Result<std::process::ExitStatus>,
+    resume: impl FnOnce() -> std::io::Result<()>,
+) -> EditorOutcome {
+    if let Err(suspend_err) = suspend() {
+        if let Err(resume_err) = resume() {
+            return EditorOutcome::NotLaunched(format!(
+                "couldn't suspend the terminal ({suspend_err}); it also failed to restore \
+                 afterward: {resume_err}"
+            ));
         }
-        Err(err) => {
-            tracing::debug!(
-                "couldn't list tabs to check for an existing '{}' pane ({err}) — creating a new \
-                 tab",
-                plugin::editor::EDITOR_AGENT_NAME
-            );
-        }
+        return EditorOutcome::NotLaunched(format!("couldn't suspend the terminal: {suspend_err}"));
     }
 
-    let cwd = config_path
-        .parent()
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(plugin::host::resolve_cwd);
-    let command = plugin::editor::build_editor_command(editor_cmd, config_path);
+    let outcome = run_editor_command(editor_cmd, config_path, spawn);
 
-    let created_tab =
-        plugin::herdr_cli::tab_create(herdr_bin, &cwd, plugin::editor::EDITOR_AGENT_NAME)
-            .await
-            .map_err(|err| HerdrPaneError::Unavailable(format!("failed to create a tab: {err}")))?;
+    if let Err(resume_err) = resume() {
+        return match outcome {
+            EditorOutcome::NotLaunched(editor_err) => EditorOutcome::NotLaunched(format!(
+                "{editor_err}; the terminal also failed to restore afterward: {resume_err}"
+            )),
+            EditorOutcome::Ok => EditorOutcome::TerminalNotRestored(resume_err.to_string()),
+            EditorOutcome::NonZeroExit(editor_err) => EditorOutcome::TerminalNotRestored(format!(
+                "{editor_err}; the terminal also failed to restore afterward: {resume_err}"
+            )),
+            EditorOutcome::TerminalNotRestored(_) => unreachable!(
+                "run_editor_command (the only source of `outcome` here) never returns \
+                 TerminalNotRestored — see its own doc"
+            ),
+        };
+    }
 
-    // A `pane_run` `Err` doesn't necessarily mean the editor never launched — the same
-    // `run_with_timeout`-without-`kill_on_drop` caveat `implement_one`'s own `pane_run` call
-    // documents applies here too (a client-side timeout on a `herdr` call that's still running
-    // in the background).
-    // Report `Ambiguous`, not `Unavailable`, so the caller doesn't fall back to the OS opener and
-    // risk opening the file a second time.
-    plugin::herdr_cli::pane_run(herdr_bin, &created_tab.root_pane_id, &command)
-        .await
-        .map_err(|err| {
-            HerdrPaneError::Ambiguous(format!(
-                "tab created but launching the editor failed ({err}) — check the '{}' tab: it \
-                 may be empty (safe to close) or the editor may have started anyway despite the \
-                 error, so verify before closing it",
-                plugin::editor::EDITOR_AGENT_NAME
-            ))
-        })
+    outcome
+}
+
+/// The real, real-environment editor hand-off for the `c` keybinding: suspends herdr-linear's
+/// own TUI, runs `editor_cmd` on `config_path` as a blocking child process that takes over the
+/// terminal directly — no separate herdr pane, mirroring `herdr-file-viewer`'s own hand-off —
+/// and restores the TUI afterward regardless of outcome. Unlike the old
+/// `open_config_in_herdr_pane` (which typed the launch command into a fresh herdr tab's shell
+/// via `tab_create`/`pane_run`), there's no separate pane at all here, so nothing is left
+/// behind to close manually once the editor exits — quitting the editor returns straight to
+/// herdr-linear's own screen. Real terminal I/O plus a real subprocess, so deliberately
+/// untested itself; [`run_editor_in_terminal_with`] is its tested, injectable core.
+fn run_editor_in_terminal(editor_cmd: &str, config_path: &std::path::Path) -> EditorOutcome {
+    run_editor_in_terminal_with(
+        editor_cmd,
+        config_path,
+        suspend_tui,
+        |cmd, path| std::process::Command::new(cmd).arg(path).status(),
+        resume_tui,
+    )
 }
 
 /// Resolves which editor `c` should use from the real environment: `config.toml`'s `editor`
@@ -878,31 +879,33 @@ fn resolve_editor_command_from_env() -> Option<String> {
 }
 
 /// Opens `config.toml` for the `c` keybinding: if `editor_cmd` resolved to something (see
-/// [`resolve_editor_command_from_env`]), tries [`open_config_in_herdr_pane`] first; on success,
-/// `opener` is never called — the file must never be opened twice. Otherwise (`editor_cmd` is
-/// `None`, or the herdr-pane attempt failed) calls `opener(path)` — `open::that` in production,
-/// today's unchanged OS-default-opener fallback. `herdr_bin` and `opener` are both explicit
-/// parameters (rather than resolved internally via `plugin::herdr_cli::herdr_bin()`/`open::that`
-/// directly) so this whole function stays testable against a fake `herdr` script and a fake
-/// opener — mirrors how `implement_one` takes `herdr_bin: &str` while only its real-environment
-/// caller (`start_implementation`) is left untested. See
-/// docs/superpowers/specs/2026-08-11-editor-handling-design.md.
-async fn open_config_editor(
+/// [`resolve_editor_command_from_env`]), runs it via `run_editor` (`run_editor_in_terminal` in
+/// production — suspends the TUI, runs the editor in-place, resumes the TUI). On
+/// [`EditorOutcome::Ok`], `opener` is never called — the file must never be opened twice. Both
+/// [`EditorOutcome::NonZeroExit`] and [`EditorOutcome::TerminalNotRestored`] are reported
+/// straight to the caller instead of falling back — the editor already had the terminal (one
+/// way or another), so trying the OS opener next would risk a second, confusing "open" for a
+/// file the user just closed. Only [`EditorOutcome::NotLaunched`] (or no `editor_cmd` at all)
+/// falls through to `opener(path)` — `open::that` in production, today's unchanged
+/// OS-default-opener fallback. `run_editor` and `opener` are both explicit parameters so this
+/// whole function stays testable against fakes for both, mirroring how `implement_one` takes
+/// `herdr_bin: &str` while only its real-environment caller (`start_implementation`) is left
+/// untested.
+fn open_config_editor(
     path: &std::path::Path,
     editor_cmd: Option<String>,
-    herdr_bin: &str,
+    run_editor: impl FnOnce(&str, &std::path::Path) -> EditorOutcome,
     opener: impl Fn(&std::path::Path) -> std::io::Result<()>,
 ) -> std::result::Result<(), String> {
     if let Some(cmd) = &editor_cmd {
-        match open_config_in_herdr_pane(herdr_bin, cmd, path).await {
-            Ok(()) => return Ok(()),
-            // The tab may already exist with the editor running in it — falling back to the
-            // OS opener here would risk opening the file a second time, so this is reported
-            // straight to the caller instead of being retried. See `HerdrPaneError`'s doc.
-            Err(HerdrPaneError::Ambiguous(message)) => return Err(message),
-            Err(HerdrPaneError::Unavailable(err)) => {
+        match run_editor(cmd, path) {
+            EditorOutcome::Ok => return Ok(()),
+            EditorOutcome::NonZeroExit(message) | EditorOutcome::TerminalNotRestored(message) => {
+                return Err(message);
+            }
+            EditorOutcome::NotLaunched(message) => {
                 tracing::warn!(
-                    "herdr editor pane unavailable, falling back to the OS opener: {err}"
+                    "editor could not be launched, falling back to the OS opener: {message}"
                 );
             }
         }
@@ -1242,14 +1245,14 @@ async fn event_loop(
                             }
                             plugin::app::Action::OpenConfig(path) => {
                                 // Unlike `OpenInBrowser` above, this chains filesystem writes and
-                                // (possibly) a herdr round-trip in front of the final "open it"
-                                // step — each with real, user-hittable failure modes (permission
-                                // denied, disk full, herdr unreachable) — and it's one of the
-                                // recovery actions offered on the error screen. Silently doing
-                                // nothing here would leave the user stuck with no indication that
-                                // pressing `c` didn't work, so unlike `OpenInBrowser` this surfaces a
-                                // failure via `set_status` rather than discarding it. See
-                                // docs/superpowers/specs/2026-08-11-editor-handling-design.md.
+                                // a blocking editor hand-off (`run_editor_in_terminal`) in front
+                                // of the final "open it" step — each with real, user-hittable
+                                // failure modes (permission denied, disk full, editor not found)
+                                // — and it's one of the recovery actions offered on the error
+                                // screen. Silently doing nothing here would leave the user stuck
+                                // with no indication that pressing `c` didn't work, so unlike
+                                // `OpenInBrowser` this surfaces a failure via `set_status` rather
+                                // than discarding it.
                                 let ensure_result: Result<(), String> = (|| {
                                     if let Some(parent) = path.parent() {
                                         std::fs::create_dir_all(parent).map_err(|e| {
@@ -1282,14 +1285,22 @@ async fn event_loop(
                                         ));
                                         terminal.draw(|frame| plugin::ui::draw(frame, app))?;
 
-                                        let herdr_bin = plugin::herdr_cli::herdr_bin();
                                         let result = open_config_editor(
                                             &path,
                                             editor_cmd,
-                                            &herdr_bin,
+                                            run_editor_in_terminal,
                                             |p| open::that(p),
-                                        )
-                                        .await;
+                                        );
+
+                                        // `run_editor_in_terminal` may have suspended and resumed
+                                        // the real terminal (raw mode / alternate screen) around
+                                        // the editor — ratatui's own back buffer has no idea that
+                                        // happened, so the next `draw` would otherwise only diff
+                                        // against stale, pre-editor content. `clear` resets that
+                                        // buffer, forcing a full repaint. Harmless (just a slightly
+                                        // less efficient repaint) on the OS-opener-only path, where
+                                        // nothing actually touched the terminal.
+                                        terminal.clear()?;
 
                                         match open_config_result_status(&result) {
                                             Some(status) => app.set_status(status),
@@ -1417,260 +1428,236 @@ mod tests {
         (dir, script)
     }
 
-    /// Fake `herdr` script dispatching `tab list`, `tab create`, and `pane run` calls to canned
-    /// bodies — the three subcommands `open_config_in_herdr_pane` can issue after TF-624's
-    /// redesign. `tab focus` is not parameterized: it always succeeds (`{"result":{}}`), since
-    /// none of this fixture's callers need to simulate a `tab focus` failure — the one test that
-    /// reaches it (`..._focuses_an_existing_tab_without_creating_a_new_one`) only needs to prove
-    /// reuse short-circuits `tab create`/`pane run`, not exercise `tab focus`'s own error path.
-    /// `pane list`/`pane process-info` default to "no pane / dead pane" so callers that don't
-    /// expect to reach reuse don't need to supply them.
-    fn write_editor_herdr_script(
-        tab_list: &str,
-        tab_create: &str,
-        pane_run: &str,
-        pane_list: Option<&str>,
-        pane_process_info: Option<&str>,
-    ) -> (tempfile::TempDir, std::path::PathBuf) {
-        let pane_list = pane_list.unwrap_or(r#"echo '{"result":{"panes":[]}}'; exit 0"#);
-        let pane_process_info = pane_process_info.unwrap_or(
-            r#"echo '{"result":{"process_info":{"shell_pid":1,"foreground_processes":[]}}}'; exit 0"#,
+    #[cfg(unix)]
+    #[test]
+    fn run_editor_command_is_ok_when_the_spawned_process_exits_successfully() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let outcome = run_editor_command(
+            "nvim",
+            std::path::Path::new("/fake/config.toml"),
+            |_cmd, _path| Ok(std::process::ExitStatus::from_raw(0)),
         );
-        write_fake_herdr_script(&format!(
-            r#"
-case "$1 $2" in
-  "tab list") {tab_list} ;;
-  "tab create") {tab_create} ;;
-  "pane run") {pane_run} ;;
-  "tab focus") echo '{{"result":{{}}}}'; exit 0 ;;
-  "pane list") {pane_list} ;;
-  "pane process-info") {pane_process_info} ;;
-  *)
-    echo '{{"error":{{"message":"unexpected herdr call: $1 $2"}}}}'
-    exit 1
-    ;;
-esac
-"#
-        ))
+
+        assert_eq!(outcome, EditorOutcome::Ok);
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn open_config_in_herdr_pane_focuses_an_existing_tab_without_creating_a_new_one() {
-        let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"result":{"tabs":[{"tab_id":"w1:t2","label":"herdr-linear-config"}]}}'; exit 0"#,
-            r#"echo 'tab create should not run'; exit 1"#,
-            r#"echo 'pane run should not run'; exit 1"#,
-            Some(r#"echo '{"result":{"panes":[{"pane_id":"w1:p2","tab_id":"w1:t2"}]}}'; exit 0"#),
-            Some(
-                r#"echo '{"result":{"process_info":{"shell_pid":1000,"foreground_processes":[{"pid":2000,"name":"nvim"}]}}}'; exit 0"#,
-            ),
+    #[test]
+    fn run_editor_command_reports_a_non_zero_exit_without_falling_back() {
+        use std::os::unix::process::ExitStatusExt;
+
+        // `1 << 8` is the raw wait-status encoding for a normal exit with code 1 (see
+        // `ExitStatusExt::from_raw`'s doc) — a real, if artificial, non-zero exit.
+        let outcome = run_editor_command(
+            "nvim",
+            std::path::Path::new("/fake/config.toml"),
+            |_cmd, _path| Ok(std::process::ExitStatus::from_raw(1 << 8)),
         );
 
-        let result = open_config_in_herdr_pane(
-            script.to_str().unwrap(),
-            "nvim",
-            std::path::Path::new("/fake/config/dir/config.toml"),
-        )
-        .await;
-
-        assert_eq!(result, Ok(()));
+        let EditorOutcome::NonZeroExit(message) = outcome else {
+            panic!("expected NonZeroExit, got {outcome:?}");
+        };
+        assert!(message.contains("nvim"), "unexpected message: {message}");
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn open_config_in_herdr_pane_creates_a_tab_when_no_existing_one_is_found() {
-        let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"result":{"tabs":[]}}'; exit 0"#,
-            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"herdr-linear-config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
-            r#"echo '{"result":{}}'; exit 0"#,
-            None,
-            None,
+    #[test]
+    fn run_editor_command_reports_not_launched_when_spawn_fails() {
+        let outcome = run_editor_command(
+            "nvim",
+            std::path::Path::new("/fake/config.toml"),
+            |_cmd, _path| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no such file",
+                ))
+            },
         );
 
-        let result = open_config_in_herdr_pane(
-            script.to_str().unwrap(),
-            "nvim",
-            std::path::Path::new("/fake/config/dir/config.toml"),
-        )
-        .await;
-
-        assert_eq!(result, Ok(()));
+        let EditorOutcome::NotLaunched(message) = outcome else {
+            panic!("expected NotLaunched, got {outcome:?}");
+        };
+        assert!(
+            message.contains("nvim") && message.contains("no such file"),
+            "unexpected message: {message}"
+        );
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn open_config_in_herdr_pane_creates_a_new_tab_when_the_existing_editor_tab_is_dead() {
-        // The tab exists with the right label, but the editor process has exited and the pane
-        // is back at the shell prompt. Reusing it via `tab focus` would strand the user on a
-        // dead pane, so we must create a fresh tab instead.
-        let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"result":{"tabs":[{"tab_id":"w1:t2","label":"herdr-linear-config"}]}}'; exit 0"#,
-            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"herdr-linear-config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
-            r#"echo '{"result":{}}'; exit 0"#,
-            Some(r#"echo '{"result":{"panes":[{"pane_id":"w1:p2","tab_id":"w1:t2"}]}}'; exit 0"#),
-            Some(
-                r#"echo '{"result":{"process_info":{"shell_pid":1000,"foreground_processes":[{"pid":1000,"name":"zsh"}]}}}'; exit 0"#,
-            ),
+    #[test]
+    fn run_editor_command_passes_the_editor_command_and_config_path_to_spawn() {
+        let mut captured = None;
+        let _ = run_editor_command(
+            "nvim",
+            std::path::Path::new("/fake/config/dir/config.toml"),
+            |cmd, path| {
+                captured = Some((cmd.to_string(), path.to_path_buf()));
+                Err(std::io::Error::new(std::io::ErrorKind::NotFound, "boom"))
+            },
         );
 
-        let result = open_config_in_herdr_pane(
-            script.to_str().unwrap(),
-            "nvim",
-            std::path::Path::new("/fake/config/dir/config.toml"),
-        )
-        .await;
-
-        assert_eq!(result, Ok(()));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn open_config_in_herdr_pane_threads_the_editor_cmd_and_cwd_into_the_cli_calls() {
-        // `write_editor_herdr_script`'s tests above only prove the right subcommand runs in the
-        // right order — none of them inspect the argv beyond `$1 $2`. A regression that hardcoded
-        // the wrong editor, dropped/swapped `cwd`/`config_path`, or built the wrong shell-quoted
-        // command would pass every one of them. This captures every call's full argv instead.
-        let capture_dir = tempfile::tempdir().unwrap();
-        let args_file = capture_dir.path().join("args.txt");
-        let (_dir, script) = write_fake_herdr_script(&format!(
-            r#"
-printf 'CALL: %s\n' "$*" >> "{args_file}"
-case "$1 $2" in
-  "tab list")
-    echo '{{"result":{{"tabs":[]}}}}'
-    exit 0
-    ;;
-  "tab create")
-    echo '{{"result":{{"tab":{{"tab_id":"t2","label":"herdr-linear-config"}},"root_pane":{{"pane_id":"p9"}}}}}}'
-    exit 0
-    ;;
-  "pane run")
-    echo '{{"result":{{}}}}'
-    exit 0
-    ;;
-esac
-"#,
-            args_file = args_file.display()
-        ));
-
-        let result = open_config_in_herdr_pane(
-            script.to_str().unwrap(),
-            "nvim",
-            std::path::Path::new("/fake/config/dir/config.toml"),
-        )
-        .await;
-
-        assert_eq!(result, Ok(()));
-
-        let captured = std::fs::read_to_string(&args_file).unwrap();
         assert_eq!(
             captured,
-            "CALL: tab list\n\
-             CALL: tab create --cwd /fake/config/dir --label herdr-linear-config --focus\n\
-             CALL: pane run p9 'nvim' '/fake/config/dir/config.toml'\n",
-            "unexpected sequence of herdr CLI calls: {captured}"
+            Some((
+                "nvim".to_string(),
+                std::path::PathBuf::from("/fake/config/dir/config.toml")
+            ))
         );
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn open_config_in_herdr_pane_treats_an_unlistable_tabs_call_as_no_existing_tab() {
-        // `tab list` failing outright (rather than succeeding with an empty/non-matching list)
-        // must fall through to creating a fresh tab, not bubble up as a hard failure.
-        let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"error":{"message":"no such workspace"}}'; exit 1"#,
-            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"herdr-linear-config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
-            r#"echo '{"result":{}}'; exit 0"#,
-            None,
-            None,
+    #[test]
+    fn run_editor_in_terminal_with_reports_not_launched_when_suspend_fails_and_never_spawns() {
+        let outcome = run_editor_in_terminal_with(
+            "nvim",
+            std::path::Path::new("/fake/config.toml"),
+            || Err(std::io::Error::other("suspend boom")),
+            |_cmd, _path| panic!("spawn must not run when suspend fails"),
+            || Ok(()),
         );
 
-        let result = open_config_in_herdr_pane(
-            script.to_str().unwrap(),
-            "nvim",
-            std::path::Path::new("/fake/config/dir/config.toml"),
-        )
-        .await;
-
-        assert_eq!(result, Ok(()));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn open_config_in_herdr_pane_fails_when_tab_create_fails_after_no_existing_tab_is_found()
-    {
-        let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"result":{"tabs":[]}}'; exit 0"#,
-            r#"echo '{"error":{"message":"no such workspace"}}'; exit 1"#,
-            r#"echo 'pane run should not run'; exit 1"#,
-            None,
-            None,
-        );
-
-        let result = open_config_in_herdr_pane(
-            script.to_str().unwrap(),
-            "nvim",
-            std::path::Path::new("/fake/config/dir/config.toml"),
-        )
-        .await;
-
-        let Err(HerdrPaneError::Unavailable(message)) = result else {
-            panic!("expected Err(Unavailable), got {result:?}");
+        let EditorOutcome::NotLaunched(message) = outcome else {
+            panic!("expected NotLaunched, got {outcome:?}");
         };
         assert!(
-            message.contains("failed to create a tab") && message.contains("no such workspace"),
+            message.contains("suspend boom"),
+            "unexpected message: {message}"
+        );
+    }
+
+    #[test]
+    fn run_editor_in_terminal_with_folds_a_resume_failure_into_a_failed_suspends_message() {
+        // A `suspend` failure that ALSO can't recover via `resume` must stay classified as
+        // `NotLaunched` (nothing ever touched the terminal from the editor's side, so the
+        // OS-opener fallback is still safe), just with both errors folded into one message —
+        // not silently dropped, and not reclassified into a fallback-blocking variant.
+        let outcome = run_editor_in_terminal_with(
+            "nvim",
+            std::path::Path::new("/fake/config.toml"),
+            || Err(std::io::Error::other("suspend boom")),
+            |_cmd, _path| panic!("spawn must not run when suspend fails"),
+            || Err(std::io::Error::other("resume boom")),
+        );
+
+        let EditorOutcome::NotLaunched(message) = outcome else {
+            panic!("expected NotLaunched, got {outcome:?}");
+        };
+        assert!(
+            message.contains("suspend boom") && message.contains("resume boom"),
             "unexpected message: {message}"
         );
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn open_config_in_herdr_pane_returns_ambiguous_when_pane_run_fails_after_tab_create() {
-        // `pane_run`'s `Err` doesn't mean the editor never launched (see this function's own doc
-        // on `run_with_timeout`'s lack of `kill_on_drop`) — so this must be reported as
-        // `Ambiguous`, not `Unavailable`, or the caller would fall back to the OS opener and risk
-        // opening the file a second time.
-        let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"result":{"tabs":[]}}'; exit 0"#,
-            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"herdr-linear-config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
-            r#"echo '{"error":{"message":"no such pane"}}'; exit 1"#,
-            None,
-            None,
+    #[test]
+    fn run_editor_in_terminal_with_reports_terminal_not_restored_when_resume_fails_after_success() {
+        use std::os::unix::process::ExitStatusExt;
+
+        // Regression test (PR #46 review): previously a `resume` failure after a
+        // successful edit was silently dropped — `run_editor_in_terminal` returned a bare
+        // `Ok`, which `open_config_editor`/`open_config_result_status` turn into *clearing*
+        // the status bar, leaving zero on-screen indication anything went wrong.
+        let outcome = run_editor_in_terminal_with(
+            "nvim",
+            std::path::Path::new("/fake/config.toml"),
+            || Ok(()),
+            |_cmd, _path| Ok(std::process::ExitStatus::from_raw(0)),
+            || Err(std::io::Error::other("resume boom")),
         );
 
-        let result = open_config_in_herdr_pane(
-            script.to_str().unwrap(),
-            "nvim",
-            std::path::Path::new("/fake/config/dir/config.toml"),
-        )
-        .await;
-
-        let Err(HerdrPaneError::Ambiguous(message)) = result else {
-            panic!("expected Err(Ambiguous), got {result:?}");
+        let EditorOutcome::TerminalNotRestored(message) = outcome else {
+            panic!("expected TerminalNotRestored, got {outcome:?}");
         };
         assert!(
-            message.contains("no such pane")
-                && message.contains("check the")
-                && message.contains(plugin::editor::EDITOR_AGENT_NAME),
+            message.contains("resume boom"),
             "unexpected message: {message}"
         );
     }
 
-    #[tokio::test]
-    async fn open_config_editor_calls_the_opener_when_no_editor_resolved() {
+    #[cfg(unix)]
+    #[test]
+    fn run_editor_in_terminal_with_folds_a_resume_failure_into_a_non_zero_exits_message() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let outcome = run_editor_in_terminal_with(
+            "nvim",
+            std::path::Path::new("/fake/config.toml"),
+            || Ok(()),
+            |_cmd, _path| Ok(std::process::ExitStatus::from_raw(1 << 8)),
+            || Err(std::io::Error::other("resume boom")),
+        );
+
+        let EditorOutcome::TerminalNotRestored(message) = outcome else {
+            panic!("expected TerminalNotRestored, got {outcome:?}");
+        };
+        assert!(
+            message.contains("nvim") && message.contains("resume boom"),
+            "unexpected message: {message}"
+        );
+    }
+
+    #[test]
+    fn run_editor_in_terminal_with_folds_a_resume_failure_into_a_not_launched_message() {
+        // Mirrors the non-zero-exit case above, but for the "editor never even launched"
+        // outcome — must stay `NotLaunched` (still safe to fall back to the OS opener),
+        // not get reclassified into a fallback-blocking `TerminalNotRestored`.
+        let outcome = run_editor_in_terminal_with(
+            "nvim",
+            std::path::Path::new("/fake/config.toml"),
+            || Ok(()),
+            |_cmd, _path| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no such file",
+                ))
+            },
+            || Err(std::io::Error::other("resume boom")),
+        );
+
+        let EditorOutcome::NotLaunched(message) = outcome else {
+            panic!("expected NotLaunched, got {outcome:?}");
+        };
+        assert!(
+            message.contains("no such file") && message.contains("resume boom"),
+            "unexpected message: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_editor_in_terminal_with_resumes_and_returns_ok_when_everything_succeeds() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let resume_called = std::cell::Cell::new(false);
+        let outcome = run_editor_in_terminal_with(
+            "nvim",
+            std::path::Path::new("/fake/config.toml"),
+            || Ok(()),
+            |_cmd, _path| Ok(std::process::ExitStatus::from_raw(0)),
+            || {
+                resume_called.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(
+            resume_called.get(),
+            "resume must always run after a successful spawn"
+        );
+        assert_eq!(outcome, EditorOutcome::Ok);
+    }
+
+    #[test]
+    fn open_config_editor_calls_the_opener_when_no_editor_resolved() {
         let opener_calls = std::cell::RefCell::new(Vec::new());
 
         let result = open_config_editor(
             std::path::Path::new("/fake/config/dir/config.toml"),
             None,
-            "/nonexistent/herdr-should-not-run",
+            |_cmd, _path| panic!("run_editor must not be called when no editor resolved"),
             |p| {
                 opener_calls.borrow_mut().push(p.to_path_buf());
                 Ok(())
             },
-        )
-        .await;
+        );
 
         assert_eq!(result, Ok(()));
         assert_eq!(
@@ -1679,130 +1666,149 @@ esac
         );
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn open_config_editor_does_not_call_the_opener_when_the_herdr_pane_succeeds() {
-        let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"result":{"tabs":[{"tab_id":"w1:t2","label":"herdr-linear-config"}]}}'; exit 0"#,
-            r#"echo 'tab create should not run'; exit 1"#,
-            r#"echo 'pane run should not run'; exit 1"#,
-            Some(r#"echo '{"result":{"panes":[{"pane_id":"w1:p2","tab_id":"w1:t2"}]}}'; exit 0"#),
-            Some(
-                r#"echo '{"result":{"process_info":{"shell_pid":1000,"foreground_processes":[{"pid":2000,"name":"nvim"}]}}}'; exit 0"#,
-            ),
-        );
-        let opener_calls = std::cell::RefCell::new(Vec::new());
-
+    #[test]
+    fn open_config_editor_fails_when_no_editor_resolved_and_the_opener_fails() {
+        // The `None`-`editor_cmd` precondition, paired with a failing opener — the sibling
+        // `..._fails_when_both_the_editor_and_the_opener_fail` test above covers the same
+        // final `opener(path).map_err(...)` line, but only reaches it via `NotLaunched`, not
+        // via `editor_cmd: None`.
         let result = open_config_editor(
             std::path::Path::new("/fake/config/dir/config.toml"),
-            Some("nvim".to_string()),
-            script.to_str().unwrap(),
-            |p| {
-                opener_calls.borrow_mut().push(p.to_path_buf());
-                Ok(())
-            },
-        )
-        .await;
-
-        assert_eq!(result, Ok(()));
-        assert!(
-            opener_calls.into_inner().is_empty(),
-            "opener must not run when the herdr-pane path already succeeded"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn open_config_editor_falls_back_to_the_opener_when_the_herdr_pane_path_fails() {
-        let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"result":{"tabs":[]}}'; exit 0"#,
-            r#"echo '{"error":{"message":"no such workspace"}}'; exit 1"#,
-            r#"echo 'pane run should not run'; exit 1"#,
             None,
-            None,
-        );
-        let opener_calls = std::cell::RefCell::new(Vec::new());
-
-        let result = open_config_editor(
-            std::path::Path::new("/fake/config/dir/config.toml"),
-            Some("nvim".to_string()),
-            script.to_str().unwrap(),
-            |p| {
-                opener_calls.borrow_mut().push(p.to_path_buf());
-                Ok(())
-            },
-        )
-        .await;
-
-        assert_eq!(result, Ok(()));
-        assert_eq!(
-            opener_calls.into_inner(),
-            vec![std::path::PathBuf::from("/fake/config/dir/config.toml")]
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn open_config_editor_does_not_fall_back_when_pane_run_ambiguously_fails() {
-        // Unlike the `tab_create`-fails case above (nothing was created, safe to fall back),
-        // a `pane_run` failure after a tab was already created is ambiguous — falling back
-        // to the opener here would risk opening the file a second time. The opener must not run.
-        let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"result":{"tabs":[]}}'; exit 0"#,
-            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"herdr-linear-config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
-            r#"echo '{"error":{"message":"no such pane"}}'; exit 1"#,
-            None,
-            None,
-        );
-        let opener_calls = std::cell::RefCell::new(Vec::new());
-
-        let result = open_config_editor(
-            std::path::Path::new("/fake/config/dir/config.toml"),
-            Some("nvim".to_string()),
-            script.to_str().unwrap(),
-            |p| {
-                opener_calls.borrow_mut().push(p.to_path_buf());
-                Ok(())
-            },
-        )
-        .await;
-
-        let Err(message) = result else {
-            panic!("expected Err, got {result:?}");
-        };
-        assert!(
-            message.contains("check the") && message.contains(plugin::editor::EDITOR_AGENT_NAME),
-            "unexpected message: {message}"
-        );
-        assert!(
-            opener_calls.into_inner().is_empty(),
-            "opener must not run on an ambiguous pane_run failure — it could open the file twice"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn open_config_editor_fails_when_both_the_herdr_pane_and_the_opener_fail() {
-        let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"result":{"tabs":[]}}'; exit 0"#,
-            r#"echo '{"error":{"message":"no such workspace"}}'; exit 1"#,
-            r#"echo 'pane run should not run'; exit 1"#,
-            None,
-            None,
-        );
-
-        let result = open_config_editor(
-            std::path::Path::new("/fake/config/dir/config.toml"),
-            Some("nvim".to_string()),
-            script.to_str().unwrap(),
+            |_cmd, _path| panic!("run_editor must not be called when no editor resolved"),
             |_p| {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     "no handler registered",
                 ))
             },
-        )
-        .await;
+        );
+
+        let Err(message) = result else {
+            panic!("expected Err, got {result:?}");
+        };
+        assert!(
+            message.contains("Couldn't open") && message.contains("no handler registered"),
+            "unexpected message: {message}"
+        );
+    }
+
+    #[test]
+    fn open_config_editor_does_not_call_the_opener_when_the_editor_succeeds() {
+        let opener_calls = std::cell::RefCell::new(Vec::new());
+
+        let result = open_config_editor(
+            std::path::Path::new("/fake/config/dir/config.toml"),
+            Some("nvim".to_string()),
+            |_cmd, _path| EditorOutcome::Ok,
+            |p| {
+                opener_calls.borrow_mut().push(p.to_path_buf());
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Ok(()));
+        assert!(
+            opener_calls.into_inner().is_empty(),
+            "opener must not run when the editor already succeeded"
+        );
+    }
+
+    #[test]
+    fn open_config_editor_falls_back_to_the_opener_when_the_editor_could_not_be_launched() {
+        let opener_calls = std::cell::RefCell::new(Vec::new());
+
+        let result = open_config_editor(
+            std::path::Path::new("/fake/config/dir/config.toml"),
+            Some("nvim".to_string()),
+            |_cmd, _path| EditorOutcome::NotLaunched("nvim not found".to_string()),
+            |p| {
+                opener_calls.borrow_mut().push(p.to_path_buf());
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            opener_calls.into_inner(),
+            vec![std::path::PathBuf::from("/fake/config/dir/config.toml")]
+        );
+    }
+
+    #[test]
+    fn open_config_editor_does_not_fall_back_when_the_editor_exits_non_zero() {
+        // Unlike the "could not launch" case above (nothing happened, safe to fall back), a
+        // non-zero exit means the editor already took over the terminal — falling back to the
+        // opener here would risk opening the file a second time. The opener must not run.
+        let opener_calls = std::cell::RefCell::new(Vec::new());
+
+        let result = open_config_editor(
+            std::path::Path::new("/fake/config/dir/config.toml"),
+            Some("nvim".to_string()),
+            |_cmd, _path| EditorOutcome::NonZeroExit("nvim exited with exit status: 1".to_string()),
+            |p| {
+                opener_calls.borrow_mut().push(p.to_path_buf());
+                Ok(())
+            },
+        );
+
+        let Err(message) = result else {
+            panic!("expected Err, got {result:?}");
+        };
+        assert!(
+            message.contains("exited with"),
+            "unexpected message: {message}"
+        );
+        assert!(
+            opener_calls.into_inner().is_empty(),
+            "opener must not run when the editor already exited — it could open the file twice"
+        );
+    }
+
+    #[test]
+    fn open_config_editor_does_not_fall_back_when_the_terminal_fails_to_restore() {
+        // Mirrors the non-zero-exit case above: `TerminalNotRestored` means the terminal was
+        // already handed over to the editor, so the opener must not run either.
+        let opener_calls = std::cell::RefCell::new(Vec::new());
+
+        let result = open_config_editor(
+            std::path::Path::new("/fake/config/dir/config.toml"),
+            Some("nvim".to_string()),
+            |_cmd, _path| {
+                EditorOutcome::TerminalNotRestored("couldn't re-enter raw mode".to_string())
+            },
+            |p| {
+                opener_calls.borrow_mut().push(p.to_path_buf());
+                Ok(())
+            },
+        );
+
+        let Err(message) = result else {
+            panic!("expected Err, got {result:?}");
+        };
+        assert!(
+            message.contains("raw mode"),
+            "unexpected message: {message}"
+        );
+        assert!(
+            opener_calls.into_inner().is_empty(),
+            "opener must not run when the terminal was already handed over to the editor"
+        );
+    }
+
+    #[test]
+    fn open_config_editor_fails_when_both_the_editor_and_the_opener_fail() {
+        let result = open_config_editor(
+            std::path::Path::new("/fake/config/dir/config.toml"),
+            Some("nvim".to_string()),
+            |_cmd, _path| EditorOutcome::NotLaunched("nvim not found".to_string()),
+            |_p| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no handler registered",
+                ))
+            },
+        );
 
         let Err(message) = result else {
             panic!("expected Err, got {result:?}");
@@ -1949,9 +1955,9 @@ exit 1
     #[test]
     fn open_config_result_status_sets_an_error_on_failure() {
         assert_eq!(
-            open_config_result_status(&Err("herdr unreachable".to_string())),
+            open_config_result_status(&Err("nvim exited with exit status: 1".to_string())),
             Some(plugin::app::Status::Error(
-                "herdr unreachable. Edit it manually.".to_string()
+                "nvim exited with exit status: 1. Edit it manually.".to_string()
             ))
         );
     }
@@ -2644,8 +2650,9 @@ esac
         // load-bearing token this branch changed — TF-624), dropped the `--timeout` budget, or
         // renamed/reordered the wrong pane would pass every one of them while silently breaking
         // Implement-on-`<Enter>` against real herdr. This captures every call's full argv
-        // instead, exactly like `open_config_in_herdr_pane_threads_the_editor_cmd_and_cwd_into_
-        // the_cli_calls` does for the `c` keybinding.
+        // instead, mirroring `run_editor_command_passes_the_editor_command_and_config_path_to_
+        // spawn`'s identical "assert the exact call, not just that a call happened" discipline
+        // for the `c` keybinding's own (now herdr-free) editor hand-off.
         //
         // The workflow-state lookup is mocked to fail so the flow lands on
         // `StartedWithWarnings` without a live Linear endpoint — it issues no `herdr` call

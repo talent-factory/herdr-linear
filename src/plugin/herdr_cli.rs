@@ -1,10 +1,10 @@
 //! Thin subprocess wrapper around the `herdr` CLI's JSON socket protocol, used by the
 //! "implement this issue" flow (`main.rs`'s `implement_one`, shared by both the single- and
 //! multi-issue callers) to open a tab, type the launch command into it, wait for the resulting
-//! agent to become ready, and inject text — and by the `c` keybinding's
-//! `open_config_in_herdr_pane` to open/reuse a config-editor tab the same way. The
-//! subprocess-spawning half is deliberately untested at this layer — same status as the existing
-//! `open::that(url)` call for the `o` key; see
+//! agent to become ready, and inject text. (The `c` keybinding's config-editor hand-off no
+//! longer goes through here at all — it runs the editor in-place instead; see
+//! `main.rs::run_editor_in_terminal`.) The subprocess-spawning half is deliberately untested at
+//! this layer — same status as the existing `open::that(url)` call for the `o` key; see
 //! docs/superpowers/specs/2026-08-05-implement-on-enter-design.md for why. The
 //! response-interpretation half (`interpret_output`) is pure and unit-tested below.
 //!
@@ -241,10 +241,9 @@ fn is_agent_not_found_response(error: &Error) -> bool {
 
 /// Wall-clock ceiling for `herdr` subprocess calls that don't carry their own `--timeout`
 /// argument (everything routed through [`run`]: `agent_list`, `tab_create`, `agent_prompt`,
-/// `agent_read`, `pane_run`, `tab_list`, `tab_focus`, `agent_rename`). Without this, a hung
-/// `herdr` daemon blocks the single-threaded TUI's event loop indefinitely — `agent_wait` is the
-/// exception, since it computes its own call-specific bound in [`agent_wait`] instead of using
-/// this constant.
+/// `agent_read`, `pane_run`, `agent_rename`). Without this, a hung `herdr` daemon blocks the
+/// single-threaded TUI's event loop indefinitely — `agent_wait` is the exception, since it
+/// computes its own call-specific bound in [`agent_wait`] instead of using this constant.
 const DEFAULT_CLI_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Max attempts and per-attempt backoff for [`spawn_with_etxtbsy_retry`]'s retry loop —
@@ -402,112 +401,6 @@ pub async fn tab_create(herdr_bin: &str, cwd: &Path, label: &str) -> Result<TabC
 /// registration call is needed or possible for an unrecognized command like `nvim`.
 pub async fn pane_run(herdr_bin: &str, pane_id: &PaneId, command: &str) -> Result<()> {
     run(herdr_bin, &["pane", "run", pane_id.as_str(), command])
-        .await
-        .map(|_| ())
-}
-
-/// `herdr tab list` — the raw JSON text of the `result` field. Used by
-/// this module's private `find_tab_id_by_label` to locate an existing labeled tab (the
-/// config-editor pane's reuse-on-second-`c`-press check) — `agent focus`/`agent rename` can't
-/// do this for `nvim`, since herdr only tracks *recognized* coding-agent binaries as "agents",
-/// never a plain editor pane.
-pub async fn tab_list(herdr_bin: &str) -> Result<String> {
-    let result = run(herdr_bin, &["tab", "list"]).await?;
-    Ok(result.to_string())
-}
-
-/// Find the `tab_id` of the first tab in a `herdr tab list` JSON result (the already-unwrapped
-/// `result` value, serialized back to text by [`tab_list`]) whose `label` exactly matches
-/// `label`. Returns `None` on unparseable JSON, an empty/missing `tabs` array, or no match —
-/// all of which mean "nothing to reuse, create a fresh one" to every caller. Pure — no I/O — so
-/// the matching logic is unit-testable without spawning a process, mirroring
-/// [`crate::plugin::implement::resolve_preferred_agent`]'s same split for `agent list`.
-fn find_tab_id_by_label(tab_list_json: &str, label: &str) -> Option<TabId> {
-    let parsed: Value = serde_json::from_str(tab_list_json).ok()?;
-    let tabs = parsed.get("tabs")?.as_array()?;
-    tabs.iter().find_map(|tab| {
-        let tab_label = tab.get("label")?.as_str()?;
-        if tab_label != label {
-            return None;
-        }
-        let tab_id = tab.get("tab_id")?.as_str()?;
-        Some(TabId(tab_id.to_string()))
-    })
-}
-
-/// Convenience wrapper around this module's private `find_tab_id_by_label` for `main.rs`'s
-/// `open_config_in_herdr_pane`: looks for an existing tab labeled
-/// [`crate::plugin::editor::EDITOR_AGENT_NAME`] in a `tab list` JSON result.
-pub fn find_existing_editor_tab(tab_list_json: &str) -> Option<TabId> {
-    find_tab_id_by_label(tab_list_json, crate::plugin::editor::EDITOR_AGENT_NAME)
-}
-
-/// `herdr pane list` — raw JSON text of the `result` field. Used by
-/// `main.rs::open_config_in_herdr_pane` to find the root pane of an existing editor tab so it can
-/// verify the editor process is still alive before reusing the tab.
-pub async fn pane_list(herdr_bin: &str) -> Result<String> {
-    let result = run(herdr_bin, &["pane", "list"]).await?;
-    Ok(result.to_string())
-}
-
-/// Find the `pane_id` of the first pane in a `herdr pane list` JSON result whose `tab_id`
-/// matches `tab_id`. Returns `None` on unparseable JSON, an empty/missing `panes` array, or no
-/// match — all of which make the caller fall back to creating a fresh tab.
-pub fn find_root_pane_for_tab(pane_list_json: &str, tab_id: &TabId) -> Option<PaneId> {
-    let parsed: Value = serde_json::from_str(pane_list_json).ok()?;
-    let panes = parsed.get("panes")?.as_array()?;
-    panes.iter().find_map(|pane| {
-        let pane_tab_id = pane.get("tab_id")?.as_str()?;
-        if pane_tab_id != tab_id.as_str() {
-            return None;
-        }
-        let pane_id = pane.get("pane_id")?.as_str()?;
-        Some(PaneId(pane_id.to_string()))
-    })
-}
-
-/// `herdr pane process-info --pane <pane_id>` — raw JSON text of the `result` field. Used by
-/// `main.rs::open_config_in_herdr_pane` to check whether an editor is still running in a pane.
-pub async fn pane_process_info(herdr_bin: &str, pane_id: &PaneId) -> Result<String> {
-    let result = run(
-        herdr_bin,
-        &["pane", "process-info", "--pane", pane_id.as_str()],
-    )
-    .await?;
-    Ok(result.to_string())
-}
-
-/// True if a `herdr pane process-info` JSON result shows a non-shell foreground process running
-/// in the pane, i.e. the pane is not sitting idle at a shell prompt. Returns `false` on
-/// unparseable JSON or a missing/empty `foreground_processes` array.
-pub fn is_pane_alive(process_info_json: &str) -> bool {
-    let Ok(parsed) = serde_json::from_str::<Value>(process_info_json) else {
-        return false;
-    };
-    let Some(process_info) = parsed.get("process_info") else {
-        return false;
-    };
-    let Some(shell_pid) = process_info.get("shell_pid").and_then(|v| v.as_i64()) else {
-        return false;
-    };
-    let Some(foreground) = process_info
-        .get("foreground_processes")
-        .and_then(|v| v.as_array())
-    else {
-        return false;
-    };
-    foreground.iter().any(|proc| {
-        proc.get("pid")
-            .and_then(|v| v.as_i64())
-            .is_some_and(|pid| pid != shell_pid)
-    })
-}
-
-/// `herdr tab focus <tab_id>`. Used to switch to an already-open config-editor tab on a second
-/// `c` press, in place of the old `agent focus <name>` (impossible for `nvim` — see
-/// [`tab_list`]'s doc).
-pub async fn tab_focus(herdr_bin: &str, tab_id: &TabId) -> Result<()> {
-    run(herdr_bin, &["tab", "focus", tab_id.as_str()])
         .await
         .map(|_| ())
 }
@@ -1146,80 +1039,5 @@ exit 1
 
         assert_eq!(next_retry_budget_ms(&err, 0, 30_000, 30_000), None);
         assert_eq!(next_retry_budget_ms(&err, 0, 40_000, 30_000), None);
-    }
-
-    #[test]
-    fn find_tab_id_by_label_returns_the_matching_tab_id() {
-        let json = r#"{"tabs":[{"tab_id":"w1:t1","label":"Terminal"},{"tab_id":"w1:t2","label":"herdr-linear-config"}]}"#;
-
-        let found = find_tab_id_by_label(json, "herdr-linear-config");
-
-        assert_eq!(found, Some(TabId("w1:t2".to_string())));
-    }
-
-    #[test]
-    fn find_tab_id_by_label_returns_none_when_no_tab_matches() {
-        let json = r#"{"tabs":[{"tab_id":"w1:t1","label":"Terminal"}]}"#;
-
-        assert_eq!(find_tab_id_by_label(json, "herdr-linear-config"), None);
-    }
-
-    #[test]
-    fn find_tab_id_by_label_returns_none_on_unparseable_json() {
-        assert_eq!(
-            find_tab_id_by_label("not json", "herdr-linear-config"),
-            None
-        );
-    }
-
-    #[test]
-    fn find_tab_id_by_label_returns_none_when_tabs_array_is_missing() {
-        assert_eq!(find_tab_id_by_label(r#"{}"#, "herdr-linear-config"), None);
-    }
-
-    #[test]
-    fn find_root_pane_for_tab_returns_the_first_matching_pane_id() {
-        let json = r#"{"panes":[{"pane_id":"w1:p1","tab_id":"w1:t1"},{"pane_id":"w1:p2","tab_id":"w1:t2"}]}"#;
-
-        let found = find_root_pane_for_tab(json, &TabId("w1:t2".to_string()));
-
-        assert_eq!(found, Some(PaneId("w1:p2".to_string())));
-    }
-
-    #[test]
-    fn find_root_pane_for_tab_returns_none_when_no_pane_matches() {
-        let json = r#"{"panes":[{"pane_id":"w1:p1","tab_id":"w1:t1"}]}"#;
-
-        assert_eq!(
-            find_root_pane_for_tab(json, &TabId("w1:t2".to_string())),
-            None
-        );
-    }
-
-    #[test]
-    fn find_root_pane_for_tab_returns_none_on_unparseable_json() {
-        assert_eq!(
-            find_root_pane_for_tab("not json", &TabId("w1:t2".to_string())),
-            None
-        );
-    }
-
-    #[test]
-    fn is_pane_alive_is_true_when_foreground_process_is_not_the_shell() {
-        let json = r#"{"process_info":{"shell_pid":1000,"foreground_processes":[{"pid":2000,"name":"nvim"}]}}"#;
-
-        assert!(is_pane_alive(json));
-    }
-
-    #[test]
-    fn is_pane_alive_is_false_when_only_the_shell_is_in_foreground() {
-        let json = r#"{"process_info":{"shell_pid":1000,"foreground_processes":[{"pid":1000,"name":"zsh"}]}}"#;
-
-        assert!(!is_pane_alive(json));
-    }
-
-    #[test]
-    fn is_pane_alive_is_false_on_unparseable_json() {
-        assert!(!is_pane_alive("not json"));
     }
 }
