@@ -46,8 +46,8 @@ struct ConfigFile {
     /// `crate::plugin::query::sort_issues`. `None`/unset means no default — a view loads
     /// exactly as it did before this feature. `#[serde(default)]` isn't load-bearing
     /// here the way it is on `project_overrides` above (an `Option<T>` field already
-    /// deserializes to `None` when absent) — kept for explicitness, since this is the
-    /// newest field and the one most likely to be copied as a template for the next one.
+    /// deserializes to `None` when absent) — kept purely for explicitness/documentation
+    /// symmetry with that field, not because it changes behavior.
     #[serde(default)]
     default_query: Option<String>,
 }

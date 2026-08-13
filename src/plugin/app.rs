@@ -117,16 +117,25 @@ pub struct FilterState {
 /// `ParsedQuery::free_text` (which re-joins tokenized text, so isn't guaranteed
 /// byte-identical to `query` for e.g. irregular whitespace) — so nothing about TF-580's
 /// original behavior changes; see the `matching_issue_indices_*` tests below, which this
-/// path keeps passing unmodified. A query that *does* contain recognized
-/// `priority:`/`state:`/`label:` terms additionally narrows by those terms client-side
-/// (`crate::plugin::query::matches_filter_term`), against whatever `issues` already is —
-/// which may itself be narrower than "every open issue", since `default_query`'s own
-/// filter terms are applied server-side at fetch time (see `main.rs`'s `load_issues`).
-/// That fetch-time query plays no further part here: a `/`-filter query *overrides*
-/// `default_query` rather than merging with it, so this function's ordering and
-/// narrowing come entirely from what was actually typed, not from any interaction with
-/// how `issues` got here. `sort:` terms, if present, reorder the matches afterwards
-/// (`crate::plugin::query::compare_issues`).
+/// path keeps passing unmodified (a query wrapped in one pair of double quotes is the one
+/// exception: [`strip_surrounding_quotes`] unwraps it first, so a whole-phrase quoted
+/// search behaves the same whether or not the query also happens to contain a `sort:`/
+/// filter term that pushes it onto the DSL path below — see that function's doc). A query
+/// that *does* contain recognized `priority:`/`state:`/`label:` terms additionally
+/// narrows by those terms client-side (`crate::plugin::query::matches_filter_term`).
+///
+/// **This is *not* independent of `default_query` (TF-617)** — a caveat the earlier
+/// version of this doc got backwards. `issues` is whatever was already fetched, and
+/// `default_query`'s filter terms are applied server-side *before* that fetch (see
+/// `main.rs`'s `load_issues`), so anything `default_query` excluded from the fetch is
+/// gone before a `/`-filter ever runs — no query typed here can widen back past it. And
+/// when `query` carries no `sort:` of its own, `parsed.sort_keys` is empty, this
+/// function's own `matched.sort_by(...)` below is skipped, and the result keeps
+/// whatever order `issues` was already in — which is `default_query`'s `sort:` order
+/// when one was set (see `main.rs`'s `apply_fetched_issues`), not "fetch order". In
+/// short: a `/`-filter narrows and (optionally) reorders *on top of* `default_query`,
+/// it does not replace or reset it — README.md's DSL section documents the user-facing
+/// version of this.
 ///
 /// Pure and independent of `App`/`ViewState` so it's directly unit-testable, mirroring
 /// the `assignee_open_filter`/`project_open_filter` pattern in `data.rs`.
@@ -137,7 +146,7 @@ pub fn matching_issue_indices(issues: &[Issue], query: &str) -> Vec<usize> {
 
     let parsed = crate::plugin::query::parse_query(query);
     if parsed.filters.is_empty() && parsed.sort_keys.is_empty() {
-        let query = query.to_lowercase();
+        let query = strip_surrounding_quotes(query).to_lowercase();
         return issues
             .iter()
             .enumerate()
@@ -172,6 +181,29 @@ pub fn matching_issue_indices(issues: &[Issue], query: &str) -> Vec<usize> {
     }
 
     matched
+}
+
+/// Strips one pair of surrounding `"` quotes from `query`, if the *entire* string is
+/// wrapped in one — TF-617 review fix, so `matching_issue_indices`' legacy substring
+/// fast path treats a whole-phrase quoted search the same way `crate::plugin::query`'s
+/// tokenizer would (see its doc: a `"..."` span is a single token with the quotes
+/// stripped). Before this, `/"fix login"` searched for the six-character literal
+/// `"fix login"` — quote characters included — and matched nothing, while
+/// `/"fix login" sort:priority` (same phrase, plus an unrelated `sort:` term that
+/// pushes the query onto the DSL path and its `ParsedQuery::free_text`, which *is*
+/// already quote-stripped) matched correctly — the exact same typed phrase behaving
+/// differently depending on what else was in the query. Only single quotes (`'`)
+/// aren't handled, matching the tokenizer, which doesn't recognize them as quoting
+/// either. Doesn't attempt to strip a quote that doesn't wrap the *whole* query (e.g.
+/// `fix "login"`) — the fast path is a single raw substring search with no
+/// tokenization, so only the whole-string case has an unambiguous answer.
+fn strip_surrounding_quotes(query: &str) -> &str {
+    let bytes = query.as_bytes();
+    if bytes.len() >= 2 && bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"' {
+        &query[1..query.len() - 1]
+    } else {
+        query
+    }
 }
 
 /// What the UI should currently display: the view-selection menu, or an entered view.
@@ -1894,6 +1926,37 @@ mod tests {
     }
 
     #[test]
+    fn matching_issue_indices_strips_a_whole_query_wrapped_in_double_quotes() {
+        // TF-617 review fix: previously the fast path searched for the literal
+        // `"fix login"` (quote characters included) and matched nothing, while
+        // `"fix login" sort:priority` (same phrase, plus an unrelated `sort:` that
+        // pushes the query onto the DSL path and its already-quote-stripped
+        // `ParsedQuery::free_text`) matched correctly — same typed phrase, inconsistent
+        // result depending on what else was in the query.
+        let mut issues = vec![sample_issue("ENG-1")];
+        issues[0].title = "Fix login bug".to_string();
+
+        assert_eq!(matching_issue_indices(&issues, "\"fix login\""), vec![0]);
+    }
+
+    #[test]
+    fn matching_issue_indices_does_not_strip_a_quote_that_does_not_wrap_the_whole_query() {
+        // Only the whole-string-wrapped case is handled (see
+        // `strip_surrounding_quotes`'s doc) — a query that isn't wrapped start-to-end in
+        // quotes is searched for literally, quote characters included, same as before
+        // this fix. The query here has trailing text after its closing quote, so the
+        // literal `"` characters stay in the search string and this does not match a
+        // title that (realistically) doesn't itself contain a `"`.
+        let mut issues = vec![sample_issue("ENG-1")];
+        issues[0].title = "hello extra text".to_string();
+
+        assert_eq!(
+            matching_issue_indices(&issues, "\"hello\" extra"),
+            Vec::<usize>::new()
+        );
+    }
+
+    #[test]
     fn slash_key_starts_filtering() {
         let mut app = app_in_my_issues_view();
         app.set_issues(vec![sample_issue("ENG-1")]);
@@ -2094,6 +2157,137 @@ mod tests {
         }
 
         assert_eq!(app.selected_issue().unwrap().identifier, "ENG-2");
+    }
+
+    // TF-617 review fixes: composition-level regression tests for how a `/`-filter and
+    // `default_query` (applied server-side/pre-sorted by the time `issues` lands in
+    // `App` — see `main.rs`'s `load_issues`/`apply_fetched_issues`) interact. These
+    // pin the corrected `matching_issue_indices` doc/README claim: a `/`-filter
+    // narrows and (optionally) re-sorts *on top of* `default_query`, it never replaces
+    // or resets it.
+
+    #[test]
+    fn slash_filter_cannot_widen_past_what_default_query_already_excluded_from_the_fetch() {
+        // `default_query`'s filter terms narrow the fetch itself (main.rs's
+        // `load_issues`), so an excluded issue is never in `issues` to begin with — no
+        // `/`-filter query, however permissive, can bring it back. Simulates
+        // `default_query = "priority:>=2"` having already excluded a low-priority issue
+        // from the fetch, by simply never including one in `issues` here.
+        let mut app = app_in_my_issues_view();
+        let mut high = sample_issue("ENG-2");
+        high.priority = 3;
+        app.set_issues(vec![high]); // the hypothetical low-priority issue was never fetched
+
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        for c in "priority:<=1".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+
+        assert_eq!(app.selected_issue(), None);
+    }
+
+    #[test]
+    fn slash_filter_without_a_sort_term_of_its_own_preserves_the_already_loaded_order() {
+        // A `/`-filter with no `sort:` doesn't revert to "fetch order" —
+        // `matching_issue_indices` only reorders when the *typed* query has its own
+        // `sort:` (its `matched.sort_by(...)` step is skipped otherwise), so whatever
+        // order `issues` was already in — e.g. `default_query`'s own `sort:`, applied at
+        // fetch time via `apply_fetched_issues` — survives narrowing untouched.
+        let mut app = app_in_my_issues_view();
+        let mut high = sample_issue("ENG-2");
+        high.priority = 3;
+        let mut medium = sample_issue("ENG-3");
+        medium.priority = 2;
+        // Pre-sorted priority-descending, as `apply_fetched_issues` would leave it for
+        // `default_query = "sort:-priority"` — deliberately not insertion order.
+        app.set_issues(vec![high, medium]);
+
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        for c in "eng".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+
+        assert_eq!(app.selected_issue().unwrap().identifier, "ENG-2");
+        app.move_selection_down();
+        assert_eq!(app.selected_issue().unwrap().identifier, "ENG-3");
+    }
+
+    #[test]
+    fn slash_filter_requires_all_of_multiple_recognized_filter_terms_at_once() {
+        // `matching_issue_indices`' DSL path ANDs every recognized filter term together
+        // (`parsed.filters.iter().all(...)`) — every other test exercising this path
+        // only ever used a single term, so a regression to OR-combining (any term
+        // matches) would have passed them all. Three issues, each satisfying at most
+        // one of the two typed terms except the last, which satisfies both.
+        let mut app = app_in_my_issues_view();
+        let mut state_only = sample_issue("ENG-1");
+        state_only.state.name = "Done".to_string();
+        state_only.priority = 0;
+        let mut priority_only = sample_issue("ENG-2");
+        priority_only.priority = 2;
+        let mut both = sample_issue("ENG-3");
+        both.state.name = "Done".to_string();
+        both.priority = 2;
+        app.set_issues(vec![state_only, priority_only, both]);
+
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        for c in "state:done priority:>=2".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+
+        assert_eq!(app.selected_issue().unwrap().identifier, "ENG-3");
+        // Only the one issue satisfies both terms — moving "down" within the matched
+        // set is a no-op, confirming neither of the other two slipped through.
+        app.move_selection_down();
+        assert_eq!(app.selected_issue().unwrap().identifier, "ENG-3");
+    }
+
+    #[test]
+    fn slash_filter_narrows_and_sorts_together_in_one_query() {
+        let mut app = app_in_my_issues_view();
+        let mut low = sample_issue("ENG-1");
+        low.priority = 2;
+        let mut high = sample_issue("ENG-2");
+        high.priority = 4;
+        let mut excluded = sample_issue("ENG-3");
+        excluded.priority = 0;
+        app.set_issues(vec![low, high, excluded]); // insertion order: low, high, excluded
+
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        for c in "priority:>=1 sort:-priority".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+
+        // `excluded` (priority 0) fails the filter half; the two survivors are
+        // reordered priority-descending by the query's own `sort:`, not left in
+        // insertion/fetch order.
+        assert_eq!(app.selected_issue().unwrap().identifier, "ENG-2");
+        app.move_selection_down();
+        assert_eq!(app.selected_issue().unwrap().identifier, "ENG-1");
+    }
+
+    #[test]
+    fn esc_restores_default_query_shaped_order_not_fetch_order() {
+        // README's "Esc ... restores default_query's view" claim — regression test
+        // using a list that's already sorted the way `apply_fetched_issues` would leave
+        // it for `default_query = "sort:-priority"`, confirming `cancel_filter` doesn't
+        // touch `issues` at all, so whatever order it was already in survives.
+        let mut app = app_in_my_issues_view();
+        let mut high = sample_issue("ENG-2");
+        high.priority = 3;
+        let mut low = sample_issue("ENG-1");
+        low.priority = 1;
+        app.set_issues(vec![high, low]); // pre-sorted priority-descending
+
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        for c in "eng".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+        assert_eq!(app.selected_issue().unwrap().identifier, "ENG-2");
+        app.move_selection_down();
+        assert_eq!(app.selected_issue().unwrap().identifier, "ENG-1");
     }
 
     #[test]

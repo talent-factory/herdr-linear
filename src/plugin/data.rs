@@ -88,9 +88,16 @@ pub fn team_open_filter(team_id: &str, filter_terms: &[FilterTerm]) -> Value {
 /// the earlier one is silently dropped — ordinary last-write-wins map-insert semantics.
 /// `query.rs`'s `ParsedQuery::filters` doc left this an open question for TF-616 to
 /// settle; this is the answer, and it's deliberately simple: no attempt is made here to
-/// combine same-key repeats into an `and`/`or` group. If that turns out to be the wrong
-/// UX once TF-617 lets a real query produce repeats, the fix belongs at the query layer
-/// (dedupe or reject repeats before they reach this function), not in this merge.
+/// combine same-key repeats into an `and`/`or` group. TF-617 settled where the fix
+/// belongs: `query.rs`'s `push_filter_term`/`filter_terms_collide` now dedupe exactly
+/// these same-leaf-key repeats *before* they ever reach `parse_query`'s output, so a real
+/// `/`-filter or `default_query` never hands this function a colliding pair anymore —
+/// keeping this last-write-wins fallback consistent with `matches_filter_term`'s
+/// client-side AND-all (which would otherwise disagree with "last one wins" the moment a
+/// query produced two colliding terms). This function's own last-write-wins behavior is
+/// kept as-is regardless, since it's still reachable by any caller — including this
+/// module's own tests below — that builds a `FilterTerm` slice directly rather than
+/// through `parse_query`.
 fn merge_filter_terms(mut base: Value, filter_terms: &[FilterTerm]) -> Value {
     for term in filter_terms {
         merge_json_object(&mut base, filter_term_fragment(term));

@@ -405,16 +405,33 @@ it, `priority:`/`state:`/`label:` narrow by those fields and `sort:` orders the 
 | `label:bug` | Has a label with this name (case-insensitive) |
 | `sort:priority`, `sort:-updated` | Order by `priority`/`updated`/`created`/`identifier` |
 
+Every view's own base filter only ever fetches non-terminal issues, so `state:Done`/
+`state:Canceled`/`state:Cancelled` never match anything — there's no way to bring a
+completed or canceled issue back into view with a `state:` term.
+
 Set a default for every view with `default_query` in `config.toml`:
 
 ```toml
 default_query = "priority:>=2 sort:-priority"
 ```
 
-Pressing `/` on a loaded view opens its own filter, parsed through the same DSL — it
-fully replaces `default_query` for that view rather than narrowing further on top of it,
-matching how `/`-filter already worked before this DSL existed. `Enter` confirms,
-`Esc` clears it and restores `default_query`'s view.
+Filter terms in `default_query` narrow the fetch itself, so an excluded issue is never
+loaded in the first place; `sort:` in `default_query` orders the view as soon as it's
+loaded. Pressing `/` on a loaded view opens a second filter, parsed through the same
+DSL, but it composes *with* `default_query` rather than replacing it: it can only narrow
+further within whatever `default_query` already fetched (it can't bring back an issue
+`default_query` excluded), and if the typed query has no `sort:` of its own, the view
+keeps whatever order `default_query` put it in rather than reverting to fetch order. A
+`/`-filter with its own `priority:`/`state:`/`label:`/`sort:` terms does fully take over
+*those* aspects for as long as it's active, on top of whatever `default_query` already
+narrowed the fetch to. `Enter` confirms the `/`-filter, `Esc` clears it and returns to
+`default_query`'s own filtered-and-sorted view.
+
+If a `priority:`/`state:`/`label:`/`sort:` term isn't recognized — a typo like
+`priority:hihg`, or an out-of-range value — it's dropped and folded back into the
+free-text search instead of being applied; the currently-active filter's title bar shows
+`(⚠ not recognized: ...)` when that happens, and a `default_query` with the same problem
+shows a status message under the loaded list.
 
 ### Use
 
