@@ -392,6 +392,17 @@ pub async fn tab_create(herdr_bin: &str, cwd: &Path, label: &str) -> Result<TabC
     parse_tab_created(&result)
 }
 
+/// `herdr tab close <tab_id>` — closes the whole tab, along with every pane inside it (in
+/// practice just [`TabCreated::root_pane_id`], see [`tab_create`]'s docs on why that pane is
+/// never closed *by itself*). Closing the tab as a unit rather than the pane sidesteps that
+/// distinction entirely — there is nothing left in it to keep alive. Used by `main.rs`'s
+/// close-on-done watcher (TF-649) to tidy up a per-issue tab once its agent finishes.
+pub async fn tab_close(herdr_bin: &str, tab_id: &TabId) -> Result<()> {
+    run(herdr_bin, &["tab", "close", tab_id.as_str()])
+        .await
+        .map(|_| ())
+}
+
 /// `herdr pane run <pane_id> <command>` — types `command` into `pane_id` followed by Enter.
 /// The pane must already be at an interactive shell prompt (the state every `tab_create` root
 /// pane starts in). Unlike the old `agent_start`, this works for *any* command — an arbitrary
@@ -821,6 +832,49 @@ exit 1
 
         assert!(
             err.to_string().contains("no such workspace"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tab_close_builds_the_expected_cli_invocation() {
+        let capture_dir = tempfile::tempdir().unwrap();
+        let args_file = capture_dir.path().join("args.txt");
+        let (_dir, script) = write_fake_herdr_script(&format!(
+            r#"
+printf '%s\n' "$@" > "{}"
+echo '{{"result":{{}}}}'
+exit 0
+"#,
+            args_file.display()
+        ));
+
+        tab_close(script.to_str().unwrap(), &TabId("t2".to_string()))
+            .await
+            .expect("tab_close should succeed");
+
+        let captured = std::fs::read_to_string(&args_file).unwrap();
+        let args: Vec<&str> = captured.lines().collect();
+        assert_eq!(args, vec!["tab", "close", "t2"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tab_close_propagates_a_herdr_error() {
+        let (_dir, script) = write_fake_herdr_script(
+            r#"
+echo '{"error":{"message":"no such tab"}}'
+exit 1
+"#,
+        );
+
+        let err = tab_close(script.to_str().unwrap(), &TabId("t2".to_string()))
+            .await
+            .expect_err("tab_close should propagate the herdr error");
+
+        assert!(
+            err.to_string().contains("no such tab"),
             "unexpected message: {err}"
         );
     }

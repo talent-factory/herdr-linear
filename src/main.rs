@@ -694,11 +694,78 @@ async fn implement_one(
         ));
     }
 
+    spawn_tab_close_when_agent_is_done(herdr_bin.to_string(), created_tab);
+
     if warnings.is_empty() {
         ImplementOutcome::Started("tab opened, agent started, set to In Progress.".to_string())
     } else {
         ImplementOutcome::StartedWithWarnings(format!("started, but {}", warnings.join("; ")))
     }
+}
+
+/// Wall-clock ceiling for [`close_tab_once_agent_is_done`]'s `agent_wait(..., "done", ...)` call
+/// — deliberately generous compared to [`implement_one`]'s own `agent_wait(..., "idle", ...)`
+/// 30s wait for the agent process to *start*: this one instead covers however long the actual
+/// implementation work takes, which for a real coding agent can run for hours. TF-649 requires
+/// fail-open on timeout (see [`close_tab_once_agent_is_done`]), so erring generous here only
+/// costs a leftover tab in the rare case an agent runs unusually long — never a prematurely
+/// closed one out from under a still-working agent.
+const AGENT_DONE_WAIT_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000; // 24h
+
+/// TF-649: once [`implement_one`]'s prompt has landed, waits for that issue's agent to reach
+/// herdr's "done" status, then closes its tab — cleaning up the leftover idle tab that would
+/// otherwise sit around after every implement run. Always called through
+/// [`spawn_tab_close_when_agent_is_done`], the fire-and-forget wrapper that keeps this off
+/// `implement_one`'s critical path; split out on its own so it can be driven directly (awaited to
+/// completion) in tests instead of racing a background task's scheduling.
+///
+/// Fails open on both steps, matching the ticket's explicit acceptance criteria: a real timeout,
+/// herdr losing track of the pane, or the agent simply never reaching "done" (its status
+/// detection is heuristic — see `agent_wait`'s missing-`result` retry workaround in
+/// `herdr_cli.rs`) all leave the tab exactly as it is, on the theory that a possibly still-useful
+/// (or failed) agent's output must never silently vanish. A `tab_close` failure afterwards
+/// (already closed, herdr restarted mid-wait, ...) is swallowed too — there is nothing left for
+/// this task to usefully do at that point.
+async fn close_tab_once_agent_is_done(
+    herdr_bin: &str,
+    tab: &plugin::herdr_cli::TabCreated,
+    timeout_ms: u64,
+) {
+    if let Err(err) =
+        plugin::herdr_cli::agent_wait(herdr_bin, &tab.root_pane_id, "done", timeout_ms).await
+    {
+        tracing::debug!(
+            "close_tab_once_agent_is_done: agent in {:?} never reached \"done\" ({err}), \
+             leaving its tab open",
+            tab.root_pane_id
+        );
+        return;
+    }
+
+    if let Err(err) = plugin::herdr_cli::tab_close(herdr_bin, &tab.tab_id).await {
+        tracing::debug!(
+            "close_tab_once_agent_is_done: agent in {:?} finished but closing its tab failed \
+             ({err})",
+            tab.root_pane_id
+        );
+    }
+}
+
+/// Fire-and-forget wrapper around [`close_tab_once_agent_is_done`] (TF-649): detaches it onto the
+/// runtime via `tokio::spawn` and returns immediately, so `implement_one` — and in turn
+/// `start_implementation`/[`implement_many`] — return to their caller as soon as the prompt
+/// lands, regardless of how long the agent actually takes. This is not optional for correctness:
+/// `implement_many`'s parallel multi-issue flow (TF-622) must not have one issue's close-watcher
+/// block starting, or waiting on, any of the others.
+///
+/// Deliberately detached rather than tracked/joined anywhere — if the user quits the plugin
+/// before the agent finishes, tokio drops this task along with the rest of the runtime on exit:
+/// no cleanup hook, no panic, just a task that silently stops existing (see TF-649's "out of
+/// scope" on guaranteed cleanup across plugin/herdr-server restarts).
+fn spawn_tab_close_when_agent_is_done(herdr_bin: String, tab: plugin::herdr_cli::TabCreated) {
+    tokio::spawn(async move {
+        close_tab_once_agent_is_done(&herdr_bin, &tab, AGENT_DONE_WAIT_TIMEOUT_MS).await;
+    });
 }
 
 /// Outcome of [`run_editor_command`]/[`run_editor_in_terminal_with`] — the actual "launch the
@@ -2745,6 +2812,108 @@ esac
         assert!(
             calls.contains(&"CALL: agent read p9 --source visible --lines 60"),
             "expected the prompt-stability poll to read the same pane: {captured}"
+        );
+    }
+
+    /// [`close_tab_once_agent_is_done`] is tested directly (awaited to completion) rather than
+    /// through [`spawn_tab_close_when_agent_is_done`]'s `tokio::spawn` — a fire-and-forget task
+    /// spawned from a synchronous tail with no further `.await` in between (as `implement_one`'s
+    /// call site is) has no guaranteed opportunity to actually run before a `#[tokio::test]`'s
+    /// single-threaded runtime tears down at the end of the test function, making it an unreliable
+    /// thing to assert on directly (TF-649).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn close_tab_once_agent_is_done_closes_the_tab_once_the_agent_reports_done() {
+        let capture_dir = tempfile::tempdir().unwrap();
+        let close_args_file = capture_dir.path().join("close_args.txt");
+        let (_dir, script) = write_fake_herdr_script(&format!(
+            r#"
+case "$1 $2" in
+  "tab create")
+    echo '{{"result":{{"tab":{{"tab_id":"t1","label":"TF-649"}},"root_pane":{{"pane_id":"p1"}}}}}}'
+    exit 0
+    ;;
+  "agent wait")
+    echo '{{"result":{{}}}}'
+    exit 0
+    ;;
+  "tab close")
+    printf '%s\n' "$@" > "{}"
+    echo '{{"result":{{}}}}'
+    exit 0
+    ;;
+  *)
+    echo '{{"error":{{"message":"unexpected herdr call: $1 $2"}}}}'
+    exit 1
+    ;;
+esac
+"#,
+            close_args_file.display()
+        ));
+
+        let tab = plugin::herdr_cli::tab_create(
+            script.to_str().unwrap(),
+            std::path::Path::new("/tmp"),
+            "TF-649",
+        )
+        .await
+        .expect("tab_create should succeed");
+
+        close_tab_once_agent_is_done(script.to_str().unwrap(), &tab, 5_000).await;
+
+        let captured = std::fs::read_to_string(&close_args_file)
+            .expect("close_tab_once_agent_is_done should have closed the tab");
+        let args: Vec<&str> = captured.lines().collect();
+        assert_eq!(args, vec!["tab", "close", "t1"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn close_tab_once_agent_is_done_leaves_the_tab_open_when_agent_wait_fails() {
+        let capture_dir = tempfile::tempdir().unwrap();
+        let close_marker = capture_dir.path().join("tab_close_was_called");
+        let (_dir, script) = write_fake_herdr_script(&format!(
+            r#"
+case "$1 $2" in
+  "tab create")
+    echo '{{"result":{{"tab":{{"tab_id":"t1","label":"TF-649"}},"root_pane":{{"pane_id":"p1"}}}}}}'
+    exit 0
+    ;;
+  "agent wait")
+    echo '{{"error":{{"message":"pane not found"}}}}'
+    exit 1
+    ;;
+  "tab close")
+    touch "{}"
+    echo '{{"result":{{}}}}'
+    exit 0
+    ;;
+  *)
+    echo '{{"error":{{"message":"unexpected herdr call: $1 $2"}}}}'
+    exit 1
+    ;;
+esac
+"#,
+            close_marker.display()
+        ));
+
+        let tab = plugin::herdr_cli::tab_create(
+            script.to_str().unwrap(),
+            std::path::Path::new("/tmp"),
+            "TF-649",
+        )
+        .await
+        .expect("tab_create should succeed");
+
+        // `agent_wait` fails on its very first attempt: "pane not found" carries neither the
+        // `agent_not_found` code (which would poll-retry) nor a missing-`result` body (which
+        // `next_retry_budget_ms` retries) — see `herdr_cli.rs`'s retry-classification tests. So
+        // this exercises the fail-open path without needing to burn the full timeout budget.
+        close_tab_once_agent_is_done(script.to_str().unwrap(), &tab, 5_000).await;
+
+        assert!(
+            !close_marker.exists(),
+            "tab close must never run once agent_wait has failed (fail-open, TF-649)"
         );
     }
 
