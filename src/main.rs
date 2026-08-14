@@ -535,47 +535,86 @@ async fn wait_for_prompt_stable(
 ///   samples (500ms after send, then 800ms later), which just narrows the window the same race
 ///   can reappear in rather than closing it — see [`wait_for_prompt_stable`].
 ///
+/// Tuning knobs for [`send_prompt_until_visible_with`]'s resend/confirm loop, bundled into one
+/// struct rather than four positional parameters — split out when adding the `on_attempt`
+/// progress hook (see that function's doc) pushed the parameter count past clippy's
+/// `too_many_arguments` threshold. Fields mirror the `PROMPT_SEND_*` constants exactly;
+/// [`send_prompt_until_visible`] is the only real (non-test) caller and always passes those.
+#[derive(Debug, Clone, Copy)]
+struct PromptSendPolicy {
+    attempts: u32,
+    poll_interval: std::time::Duration,
+    stability_duration: std::time::Duration,
+    attempt_timeout: std::time::Duration,
+}
+
 /// Thin wrapper around [`send_prompt_until_visible_with`] that supplies the real
 /// [`PROMPT_SEND_ATTEMPTS`]/[`PROMPT_SEND_POLL_INTERVAL`]/[`PROMPT_SEND_STABILITY_DURATION`]/
-/// [`PROMPT_SEND_ATTEMPT_TIMEOUT`] constants — split out purely so tests can drive the retry loop
-/// itself (resend-after-timeout, exhaustion-after-N-attempts) with millisecond-scale values
-/// instead of the real multi-second ones, the same reason [`wait_for_prompt_stable`] takes its
-/// durations as parameters rather than reading the constants directly.
+/// [`PROMPT_SEND_ATTEMPT_TIMEOUT`] constants (via [`PromptSendPolicy`]) — split out purely so
+/// tests can drive the retry loop itself (resend-after-timeout, exhaustion-after-N-attempts)
+/// with millisecond-scale values instead of the real multi-second ones, the same reason
+/// [`wait_for_prompt_stable`] takes its durations as parameters rather than reading the
+/// constants directly.
+///
+/// `on_attempt` is forwarded to [`send_prompt_until_visible_with`] verbatim — see its doc for
+/// when it's called and why.
 async fn send_prompt_until_visible(
     herdr_bin: &str,
     pane_id: &plugin::herdr_cli::PaneId,
     prompt: &str,
+    on_attempt: impl FnMut(u32, u32) + Send,
 ) -> std::result::Result<(), String> {
     send_prompt_until_visible_with(
         herdr_bin,
         pane_id,
         prompt,
-        PROMPT_SEND_ATTEMPTS,
-        PROMPT_SEND_POLL_INTERVAL,
-        PROMPT_SEND_STABILITY_DURATION,
-        PROMPT_SEND_ATTEMPT_TIMEOUT,
+        PromptSendPolicy {
+            attempts: PROMPT_SEND_ATTEMPTS,
+            poll_interval: PROMPT_SEND_POLL_INTERVAL,
+            stability_duration: PROMPT_SEND_STABILITY_DURATION,
+            attempt_timeout: PROMPT_SEND_ATTEMPT_TIMEOUT,
+        },
+        on_attempt,
     )
     .await
 }
 
-/// See [`send_prompt_until_visible`]. This resends up to `attempts` times, delegating each
-/// attempt's confirmation to [`wait_for_prompt_stable`]; a `TimedOut`/error result falls through
-/// to the next (re)send rather than trusting an early sighting. Every attempt's failure is logged
-/// via `tracing::debug!` before moving on (see `main.rs::init_tracing`, and `agent_wait`'s
-/// missing-`result` retry loop in `herdr_cli.rs` for the established convention this follows)
-/// — only the *last* attempt's error is returned to the caller, so a log-enabled session is the
-/// only way to see what the earlier, discarded attempts actually failed with.
+/// See [`send_prompt_until_visible`]. This resends up to `policy.attempts` times, delegating
+/// each attempt's confirmation to [`wait_for_prompt_stable`]; a `TimedOut`/error result falls
+/// through to the next (re)send rather than trusting an early sighting. Every attempt's failure
+/// is logged via `tracing::debug!` before moving on (see `main.rs::init_tracing`, and
+/// `agent_wait`'s missing-`result` retry loop in `herdr_cli.rs` for the established convention
+/// this follows) — only the *last* attempt's error is returned to the caller, so a log-enabled
+/// session is the only way to see what the earlier, discarded attempts actually failed with.
+///
+/// `on_attempt(attempt, attempts)` fires once per (re)send, immediately before that attempt's
+/// `agent_prompt` call — including the first. Diagnosed live: against a freshly-launched
+/// `headroom wrap claude ...`-style multi-process `agent_command`, `agent_wait`'s "idle" status
+/// (checked by the caller before any of this runs) resolves in single-digit milliseconds, long
+/// before the target's own input loop has attached — so attempt 1 is a *near-certain* miss, not
+/// an occasional one, and the caller is blocked for a full `attempt_timeout` before attempt 2
+/// (typically the one that lands) even starts. `Action::Implement`'s caller uses this hook to
+/// redraw a "still starting…" status once that happens, so the mandatory wait has some visible
+/// sign of life instead of looking indistinguishable from a hang for its whole duration — see
+/// `start_implementation`'s doc. Every caller that doesn't need this (tests, the concurrent
+/// multi-issue path in `implement_many`, which has no single terminal it can safely redraw from
+/// mid-flight) passes a no-op closure.
 async fn send_prompt_until_visible_with(
     herdr_bin: &str,
     pane_id: &plugin::herdr_cli::PaneId,
     prompt: &str,
-    attempts: u32,
-    poll_interval: std::time::Duration,
-    stability_duration: std::time::Duration,
-    attempt_timeout: std::time::Duration,
+    policy: PromptSendPolicy,
+    mut on_attempt: impl FnMut(u32, u32) + Send,
 ) -> std::result::Result<(), String> {
+    let PromptSendPolicy {
+        attempts,
+        poll_interval,
+        stability_duration,
+        attempt_timeout,
+    } = policy;
     let mut last_err = None;
     for attempt in 1..=attempts {
+        on_attempt(attempt, attempts);
         if let Err(err) = plugin::herdr_cli::agent_prompt(herdr_bin, pane_id, prompt).await {
             tracing::debug!(
                 "send_prompt_until_visible: attempt {attempt} failed to send ({err}), retrying"
@@ -693,11 +732,18 @@ async fn resolve_validated_agent_command(
 /// doc), so this function separately guards against the one case that matters here: both its
 /// launch-context parse *and* its `current_dir()` fallback failing, which would otherwise pass
 /// an empty `--cwd` straight through to `tab_create`.
+///
+/// `on_prompt_attempt` is forwarded verbatim to [`send_prompt_until_visible`] — see that
+/// function's doc for when it fires. `start_implementation` (single-issue) passes a closure that
+/// redraws the terminal; `implement_many` (concurrent multi-issue, TF-622) passes a no-op, since
+/// several of its futures can be mid-flight at once and none of them owns the one shared
+/// terminal safely.
 async fn implement_one(
     herdr_bin: &str,
     client: &herdr_linear::LinearClient,
     issue: &herdr_linear::Issue,
     command: &plugin::implement::ValidatedAgentCommand,
+    mut on_prompt_attempt: impl FnMut(u32, u32) + Send,
 ) -> ImplementOutcome {
     let cwd = plugin::host::resolve_cwd();
     if cwd.as_os_str().is_empty() {
@@ -780,7 +826,11 @@ async fn implement_one(
         ));
     }
 
-    if let Err(err) = send_prompt_until_visible(herdr_bin, &created_tab.root_pane_id, &prompt).await
+    if let Err(err) =
+        send_prompt_until_visible(herdr_bin, &created_tab.root_pane_id, &prompt, |a, n| {
+            on_prompt_attempt(a, n)
+        })
+        .await
     {
         return ImplementOutcome::Failed(status_with_warnings(
             format!("{err} — run manually: {prompt}"),
@@ -1089,12 +1139,53 @@ fn open_config_editor(
     opener(path).map_err(|e| format!("Couldn't open {}: {e}", path.display()))
 }
 
+/// Status shown while [`start_implementation`] is blocked confirming a (re)sent prompt, once
+/// `send_prompt_until_visible`'s progress hook reaches a (re)send beyond the first — diagnosed
+/// live (session of 2026-08-14): against a freshly-launched `headroom wrap claude ...`-style
+/// multi-process `agent_command`, `agent_wait`'s "idle" status resolves in single-digit
+/// milliseconds, long before the target's own input loop has attached, so attempt 1 is a
+/// near-certain miss rather than an occasional one — every single-issue implement pays a
+/// mandatory multi-second wait for attempt 2 (typically the one that lands) with, until now, no
+/// visible sign anything was still happening, which is exactly the shape of a "not injected, but
+/// the second manual try usually works" report: the user is very plausibly looking at this same
+/// unindicated wait and concluding it failed before `send_prompt_until_visible`'s own retry
+/// (already reliable — see the constants' own docs) had a chance to land.
+///
+/// Returns `None` for attempt 1 — it fires essentially the instant `Action::Implement`'s own
+/// "Starting implementation for X…" status is already on screen, so redrawing identical
+/// information at that point would be a no-op flicker rather than new signal. Split out as a
+/// pure function (rather than inlined in the closure `start_implementation` builds) purely so
+/// the wording is unit-testable without a real `App`/`Terminal`.
+fn prompt_attempt_status(
+    issue_identifier: &str,
+    attempt: u32,
+    attempts: u32,
+) -> Option<plugin::app::Status> {
+    if attempt <= 1 {
+        return None;
+    }
+    Some(plugin::app::Status::Ok(format!(
+        "{issue_identifier}: still waiting for the agent to finish starting up — confirming \
+         attempt {attempt} of {attempts}…"
+    )))
+}
+
 /// Single-issue `<Enter>` flow (unmarked selection — [`plugin::app::Action::Implement`]).
 /// Status wording is unchanged from before TF-590: `implement_one` does the work, this just
 /// prefixes its outcome with the issue identifier and picks `Ok`/`Error` the same way the
 /// inlined version used to.
+///
+/// Takes `terminal` (new) so it can redraw mid-flight via [`prompt_attempt_status`] — safe here
+/// specifically because this is the *single*-issue path: exactly one `implement_one` call is
+/// ever in flight, so nothing else could be racing this function for the one shared terminal.
+/// The multi-issue path (`implement_many`, TF-622) runs several `implement_one` calls
+/// concurrently and deliberately does not attempt this — see that function's doc. A failed
+/// mid-flight redraw (a real terminal I/O error) is swallowed, not propagated: it's a
+/// best-effort progress indicator, not something worth aborting an otherwise-healthy implement
+/// flow over — mirroring `init_tracing`'s own "diagnostic aid, not a reason to fail" precedent.
 async fn start_implementation(
     app: &mut plugin::app::App,
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     client: &herdr_linear::LinearClient,
     issue: herdr_linear::Issue,
 ) {
@@ -1109,7 +1200,15 @@ async fn start_implementation(
             return;
         }
     };
-    match implement_one(&herdr_bin, client, &issue, &command).await {
+    let identifier = issue.identifier.clone();
+    let outcome = implement_one(&herdr_bin, client, &issue, &command, |attempt, attempts| {
+        if let Some(status) = prompt_attempt_status(&identifier, attempt, attempts) {
+            app.set_status(status);
+            let _ = terminal.draw(|frame| plugin::ui::draw(frame, app));
+        }
+    })
+    .await;
+    match outcome {
         ImplementOutcome::Started(message) => {
             app.set_status(plugin::app::Status::Ok(format!(
                 "{}: {message}",
@@ -1220,7 +1319,9 @@ async fn implement_many(
 ) -> Vec<(String, ImplementOutcome)> {
     let requests = issues.into_iter().map(|issue| async move {
         let identifier = issue.identifier.clone();
-        let outcome = implement_one(herdr_bin, client, &issue, command).await;
+        // No progress redraw here — see `implement_one`'s doc on why the concurrent path passes
+        // a no-op.
+        let outcome = implement_one(herdr_bin, client, &issue, command, |_, _| {}).await;
         Ok::<_, herdr_linear::Error>((identifier, outcome))
     });
     client
@@ -1610,7 +1711,7 @@ async fn event_loop(
                                 )));
                                 terminal.draw(|frame| plugin::ui::draw(frame, app))?;
                                 match client.as_ref() {
-                                    Some(c) => start_implementation(app, c, issue).await,
+                                    Some(c) => start_implementation(app, terminal, c, issue).await,
                                     None => app.set_status(plugin::app::Status::Error(format!(
                                         "{}: not connected to Linear yet — try again.",
                                         issue.identifier
@@ -2219,6 +2320,38 @@ exit 1
             open_config_result_status(&Err("nvim exited with exit status: 1".to_string())),
             Some(plugin::app::Status::Error(
                 "nvim exited with exit status: 1. Edit it manually.".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn prompt_attempt_status_is_none_on_the_first_attempt() {
+        // Attempt 1 fires the instant `Action::Implement`'s own "Starting implementation…"
+        // status is already on screen — redrawing identical information would be a no-op
+        // flicker, not new signal, so this must stay silent.
+        assert_eq!(prompt_attempt_status("TF-579", 1, 5), None);
+    }
+
+    #[test]
+    fn prompt_attempt_status_reports_progress_from_the_second_attempt_on() {
+        assert_eq!(
+            prompt_attempt_status("TF-579", 2, 5),
+            Some(plugin::app::Status::Ok(
+                "TF-579: still waiting for the agent to finish starting up — confirming \
+                 attempt 2 of 5…"
+                    .to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn prompt_attempt_status_reflects_the_actual_attempt_and_total() {
+        assert_eq!(
+            prompt_attempt_status("ENG-42", 3, 3),
+            Some(plugin::app::Status::Ok(
+                "ENG-42: still waiting for the agent to finish starting up — confirming \
+                 attempt 3 of 3…"
+                    .to_string()
             ))
         );
     }
@@ -3113,7 +3246,14 @@ esac
         let issue = sample_issue("TF-579");
         let command = plugin::implement::ValidatedAgentCommand::parse("hr".to_string()).unwrap();
 
-        let outcome = implement_one(script.to_str().unwrap(), &client, &issue, &command).await;
+        let outcome = implement_one(
+            script.to_str().unwrap(),
+            &client,
+            &issue,
+            &command,
+            |_, _| {},
+        )
+        .await;
 
         let ImplementOutcome::Failed(message) = outcome else {
             panic!("expected Failed, got {outcome:?}");
@@ -3141,7 +3281,14 @@ esac
         let issue = sample_issue("TF-579");
         let command = plugin::implement::ValidatedAgentCommand::parse("hr".to_string()).unwrap();
 
-        let outcome = implement_one(script.to_str().unwrap(), &client, &issue, &command).await;
+        let outcome = implement_one(
+            script.to_str().unwrap(),
+            &client,
+            &issue,
+            &command,
+            |_, _| {},
+        )
+        .await;
 
         let ImplementOutcome::Failed(message) = outcome else {
             panic!("expected Failed, got {outcome:?}");
@@ -3188,7 +3335,14 @@ esac
         let issue = sample_issue("TF-579");
         let command = plugin::implement::ValidatedAgentCommand::parse("hr".to_string()).unwrap();
 
-        let outcome = implement_one(script.to_str().unwrap(), &client, &issue, &command).await;
+        let outcome = implement_one(
+            script.to_str().unwrap(),
+            &client,
+            &issue,
+            &command,
+            |_, _| {},
+        )
+        .await;
 
         let ImplementOutcome::StartedWithWarnings(message) = outcome else {
             panic!("expected StartedWithWarnings, got {outcome:?}");
@@ -3266,7 +3420,14 @@ esac
         let issue = sample_issue("TF-579");
         let command = plugin::implement::ValidatedAgentCommand::parse("hr".to_string()).unwrap();
 
-        let outcome = implement_one(script.to_str().unwrap(), &client, &issue, &command).await;
+        let outcome = implement_one(
+            script.to_str().unwrap(),
+            &client,
+            &issue,
+            &command,
+            |_, _| {},
+        )
+        .await;
 
         let ImplementOutcome::StartedWithWarnings(message) = outcome else {
             panic!("expected StartedWithWarnings, got {outcome:?}");
@@ -3679,8 +3840,13 @@ esac
             .await
             .expect("stub tab_create must succeed");
 
-        let outcome =
-            send_prompt_until_visible(script.to_str().unwrap(), &tab.root_pane_id, &prompt).await;
+        let outcome = send_prompt_until_visible(
+            script.to_str().unwrap(),
+            &tab.root_pane_id,
+            &prompt,
+            |_, _| {},
+        )
+        .await;
 
         assert_eq!(
             outcome,
@@ -3813,14 +3979,29 @@ esac
             .await
             .expect("stub tab_create must succeed");
 
+        // Also captures every `on_attempt` call — this is the one test in this group that
+        // actually reaches a second attempt, so it's the natural seam to confirm the progress
+        // hook fires once per (re)send, with the right (attempt, attempts) pair each time,
+        // rather than only being exercised indirectly through `implement_one`'s forwarding.
+        let seen_attempts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_attempts_for_callback = std::sync::Arc::clone(&seen_attempts);
+
         let outcome = send_prompt_until_visible_with(
             script.to_str().unwrap(),
             &tab.root_pane_id,
             &prompt,
-            2,
-            std::time::Duration::from_millis(10),
-            std::time::Duration::from_millis(50),
-            std::time::Duration::from_millis(150),
+            PromptSendPolicy {
+                attempts: 2,
+                poll_interval: std::time::Duration::from_millis(10),
+                stability_duration: std::time::Duration::from_millis(50),
+                attempt_timeout: std::time::Duration::from_millis(150),
+            },
+            move |attempt, attempts| {
+                seen_attempts_for_callback
+                    .lock()
+                    .unwrap()
+                    .push((attempt, attempts));
+            },
         )
         .await;
 
@@ -3828,6 +4009,11 @@ esac
             outcome,
             Ok(()),
             "attempt 2 must succeed after attempt 1 times out"
+        );
+        assert_eq!(
+            *seen_attempts.lock().unwrap(),
+            vec![(1, 2), (2, 2)],
+            "on_attempt must fire once per (re)send, in order, before that attempt's own send"
         );
     }
 
@@ -3849,10 +4035,13 @@ esac
             script.to_str().unwrap(),
             &tab.root_pane_id,
             &prompt,
-            2,
-            std::time::Duration::from_millis(5),
-            std::time::Duration::from_millis(20),
-            std::time::Duration::from_millis(30),
+            PromptSendPolicy {
+                attempts: 2,
+                poll_interval: std::time::Duration::from_millis(5),
+                stability_duration: std::time::Duration::from_millis(20),
+                attempt_timeout: std::time::Duration::from_millis(30),
+            },
+            |_, _| {},
         )
         .await;
 
