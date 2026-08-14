@@ -34,6 +34,7 @@ pub enum BindingContext {
     Menu,
     View,
     Filtering,
+    Commenting,
     ErrorScreen,
     Global,
 }
@@ -45,6 +46,7 @@ impl BindingContext {
             BindingContext::Menu => "Menu",
             BindingContext::View => "View",
             BindingContext::Filtering => "Filtering",
+            BindingContext::Commenting => "Commenting",
             BindingContext::ErrorScreen => "Error screen",
             BindingContext::Global => "Global",
         }
@@ -52,8 +54,8 @@ impl BindingContext {
 }
 
 /// Every keybinding currently implemented in `app::handle_key`, grouped by context in
-/// the order `handle_key` itself checks them (menu, view, filtering, error-screen-only,
-/// then global).
+/// the order `handle_key` itself checks them (menu, view, filtering, commenting,
+/// error-screen-only, then global).
 pub static KEYBINDINGS: &[KeyBinding] = &[
     KeyBinding {
         keys: "↑ / ↓",
@@ -83,6 +85,11 @@ pub static KEYBINDINGS: &[KeyBinding] = &[
     KeyBinding {
         keys: "/",
         action: "Filter/sort issues (text, or priority:/state:/label:/sort:)",
+        context: BindingContext::View,
+    },
+    KeyBinding {
+        keys: "m",
+        action: "Compose a comment on the selected issue",
         context: BindingContext::View,
     },
     KeyBinding {
@@ -141,6 +148,26 @@ pub static KEYBINDINGS: &[KeyBinding] = &[
         context: BindingContext::Filtering,
     },
     KeyBinding {
+        keys: "<Enter>",
+        action: "Send comment",
+        context: BindingContext::Commenting,
+    },
+    KeyBinding {
+        keys: "Esc",
+        action: "Cancel comment, discard draft",
+        context: BindingContext::Commenting,
+    },
+    KeyBinding {
+        keys: "Backspace",
+        action: "Remove last comment character",
+        context: BindingContext::Commenting,
+    },
+    KeyBinding {
+        keys: "(any character)",
+        action: "Add to comment draft",
+        context: BindingContext::Commenting,
+    },
+    KeyBinding {
         keys: "r",
         action: "Retry",
         context: BindingContext::ErrorScreen,
@@ -184,6 +211,7 @@ mod tests {
             BindingContext::Menu,
             BindingContext::View,
             BindingContext::Filtering,
+            BindingContext::Commenting,
             BindingContext::ErrorScreen,
             BindingContext::Global,
         ] {

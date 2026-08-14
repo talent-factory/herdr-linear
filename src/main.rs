@@ -1125,6 +1125,34 @@ async fn start_implementation(
     }
 }
 
+/// `Enter`-while-commenting flow ([`plugin::app::Action::AddComment`], TF-648): submit
+/// `body` on `issue` via `client.add_comment()` and report the outcome as a status
+/// banner, the same `"<identifier>: <detail>"` wording and `Ok`/`Error` split
+/// `start_implementation` uses. `client.add_comment`'s `Err` is formatted with
+/// `to_string()`, matching `load_issues`'/`ensure_loaded`'s existing convention for
+/// surfacing `herdr_linear::Error` from a client call.
+async fn start_add_comment(
+    app: &mut plugin::app::App,
+    client: &herdr_linear::LinearClient,
+    issue: herdr_linear::Issue,
+    body: String,
+) {
+    match client.add_comment(&issue.id, &body).await {
+        Ok(_) => {
+            app.set_status(plugin::app::Status::Ok(format!(
+                "{}: comment added.",
+                issue.identifier
+            )));
+        }
+        Err(err) => {
+            app.set_status(plugin::app::Status::Error(format!(
+                "{}: failed to add comment — {}",
+                issue.identifier, err
+            )));
+        }
+    }
+}
+
 /// Max per-issue detail segments [`summarize_many`] includes verbatim in the status banner
 /// before switching to a `"(+K more)"` suffix. `plugin::ui::draw`'s banner area grows with the
 /// message (see `status_banner_height`), but an unmarked/unbounded number of marked issues
@@ -1642,6 +1670,24 @@ async fn event_loop(
                                     None => app.set_status(plugin::app::Status::Error(
                                         "not connected to Linear yet — try again.".to_string(),
                                     )),
+                                }
+
+                                if flush_buffered_quit()? {
+                                    break;
+                                }
+                            }
+                            plugin::app::Action::AddComment(issue, body) => {
+                                app.set_status(plugin::app::Status::Ok(format!(
+                                    "{}: posting comment…",
+                                    issue.identifier
+                                )));
+                                terminal.draw(|frame| plugin::ui::draw(frame, app))?;
+                                match client.as_ref() {
+                                    Some(c) => start_add_comment(app, c, issue, body).await,
+                                    None => app.set_status(plugin::app::Status::Error(format!(
+                                        "{}: not connected to Linear yet — try again.",
+                                        issue.identifier
+                                    ))),
                                 }
 
                                 if flush_buffered_quit()? {
@@ -2465,6 +2511,90 @@ exit 1
             labels: herdr_linear::LabelConnection { nodes: vec![] },
             url: format!("https://linear.app/team/issue/{identifier}"),
         }
+    }
+
+    /// TF-648: `Action::AddComment`'s handler — success path. Verifies the exact status
+    /// text `event_loop` ends up showing, not just "some Ok status got set" (a
+    /// swapped-in-a-different-issue or dropped-identifier regression would still leave
+    /// `status().is_some()` true).
+    #[tokio::test]
+    async fn start_add_comment_reports_success_status() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "data": {
+                        "commentCreate": {
+                            "comment": {
+                                "id": "comment-1",
+                                "body": "Looks good",
+                                "user": {
+                                    "id": "user-1",
+                                    "email": "alice@example.com",
+                                    "name": "Alice",
+                                    "avatarUrl": null,
+                                    "createdAt": "2026-01-01T00:00:00Z",
+                                    "updatedAt": "2026-01-01T00:00:00Z"
+                                },
+                                "createdAt": "2026-01-01T00:00:00Z",
+                                "updatedAt": "2026-01-01T00:00:00Z"
+                            }
+                        }
+                    },
+                    "errors": null
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let client = herdr_linear::LinearClient::with_endpoint(
+            "lin_api_test",
+            format!("{}/graphql", server.url()),
+        )
+        .unwrap();
+        let mut app = plugin::app::App::new();
+        let issue = sample_issue("TF-648");
+
+        start_add_comment(&mut app, &client, issue, "Looks good".to_string()).await;
+
+        let status = app.status().unwrap();
+        assert!(!status.is_error());
+        assert_eq!(status.text(), "TF-648: comment added.");
+        mock.assert_async().await;
+    }
+
+    /// TF-648: `Action::AddComment`'s handler — a GraphQL-level failure (bad auth,
+    /// validation, ...) must surface as an `Error` status naming the issue, mirroring
+    /// `load_issues`'/`ensure_loaded`'s existing `err.to_string()` convention rather than
+    /// swallowing the underlying `herdr_linear::Error`.
+    #[tokio::test]
+    async fn start_add_comment_reports_error_status_on_failure() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(json!({"data": null, "errors": [{"message": "not authorized"}]}).to_string())
+            .create_async()
+            .await;
+        let client = herdr_linear::LinearClient::with_endpoint(
+            "lin_api_test",
+            format!("{}/graphql", server.url()),
+        )
+        .unwrap();
+        let mut app = plugin::app::App::new();
+        let issue = sample_issue("TF-648");
+
+        start_add_comment(&mut app, &client, issue, "Looks good".to_string()).await;
+
+        let status = app.status().unwrap();
+        assert!(status.is_error());
+        assert!(status.text().contains("TF-648"));
+        assert!(status.text().contains("failed to add comment"));
+        assert!(status.text().contains("not authorized"));
     }
 
     /// TF-617: `apply_fetched_issues` is `load_issues`'s shared post-fetch step —

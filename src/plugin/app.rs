@@ -82,6 +82,8 @@ pub enum ViewState {
         marked: HashSet<usize>,
         /// Type-to-filter state for this view's list. See [`FilterState`].
         filter: FilterState,
+        /// Comment-composition state for the selected issue. See [`CommentState`].
+        comment: CommentState,
         /// Vertical scroll offset into the Detail pane's rendered lines for the
         /// currently selected issue, in rows. Reset to `0` whenever `selected` changes
         /// (a new issue's description has nothing to do with the old scroll position) —
@@ -110,6 +112,24 @@ pub struct FilterState {
     /// The current filter text. Empty matches every issue, so a view with no filter
     /// ever applied (or one just cancelled) behaves exactly as before this feature.
     pub query: String,
+}
+
+/// Comment-composition state for a loaded view's issue list (TF-648). A dedicated key
+/// (`m`) opens editing on the currently selected issue; `Enter` confirms and submits a
+/// non-empty comment via `client.add_comment()`, `Esc` cancels without sending — the same
+/// interaction shape as [`FilterState`]. Unlike [`FilterState`], `Up`/`Down` are *not*
+/// passed through while editing: the comment targets whichever issue was selected when
+/// editing started ([`App::start_commenting`] refuses to open without one), and letting
+/// navigation continue underneath it would let a still-open draft silently end up posted
+/// to a different issue than the one shown when composition began.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommentState {
+    /// True while `m` has been pressed and not yet confirmed (`Enter`) or cancelled
+    /// (`Esc`) — character keys are captured into `body` instead of triggering their
+    /// usual view bindings while this is set.
+    pub editing: bool,
+    /// The comment text composed so far. Cleared on cancel and on a successful confirm.
+    pub body: String,
 }
 
 /// Returns the indices into `issues` matching `query`, in the order they should be
@@ -459,6 +479,7 @@ impl App {
                     selected: 0,
                     marked: HashSet::new(),
                     filter: FilterState::default(),
+                    comment: CommentState::default(),
                     detail_scroll: 0,
                 },
             );
@@ -729,6 +750,85 @@ impl App {
         }
     }
 
+    /// True while the current view's comment draft is being edited (`m` pressed, not
+    /// yet confirmed or cancelled). False outside a loaded view.
+    fn is_commenting(&self) -> bool {
+        matches!(
+            &self.screen,
+            Screen::View(_, ViewState::Loaded { comment, .. }) if comment.editing
+        )
+    }
+
+    /// Opens comment editing (bound to `m`) for the currently selected issue. No-op if
+    /// there is no selected issue — an empty list, or a filter matching nothing (TF-648's
+    /// AC) — or outside a loaded view, since there would be nothing to attach the comment
+    /// to.
+    pub fn start_commenting(&mut self) {
+        if self.selected_issue().is_none() {
+            return;
+        }
+        if let Screen::View(_, ViewState::Loaded { comment, .. }) = &mut self.screen {
+            comment.editing = true;
+        }
+    }
+
+    /// Appends `c` to the comment draft. No-op unless currently editing.
+    pub fn push_comment_char(&mut self, c: char) {
+        if let Screen::View(_, ViewState::Loaded { comment, .. }) = &mut self.screen {
+            if comment.editing {
+                comment.body.push(c);
+            }
+        }
+    }
+
+    /// Removes the last character of the comment draft, if any. No-op unless currently
+    /// editing.
+    pub fn pop_comment_char(&mut self) {
+        if let Screen::View(_, ViewState::Loaded { comment, .. }) = &mut self.screen {
+            if comment.editing {
+                comment.body.pop();
+            }
+        }
+    }
+
+    /// Confirms the comment draft (bound to `Enter` while editing) and, if non-empty once
+    /// trimmed, returns an [`Action::AddComment`] for `event_loop` to submit via
+    /// `client.add_comment()`. A blank draft is *not* sent (TF-648's AC) — editing simply
+    /// stays open rather than discarding whatever (nothing) was typed, mirroring how
+    /// `Esc` is the explicit way to abandon a draft. No-op (returns `None`) unless
+    /// currently editing.
+    pub fn confirm_comment(&mut self) -> Option<Action> {
+        let body = if let Screen::View(_, ViewState::Loaded { comment, .. }) = &mut self.screen {
+            if !comment.editing {
+                return None;
+            }
+            let trimmed = comment.body.trim().to_string();
+            if trimmed.is_empty() {
+                return None;
+            }
+            comment.editing = false;
+            comment.body.clear();
+            trimmed
+        } else {
+            return None;
+        };
+
+        self.selected_issue()
+            .cloned()
+            .map(|issue| Action::AddComment(issue, body))
+    }
+
+    /// Cancels comment editing (bound to `Esc` while editing): stops capturing keystrokes
+    /// and discards the draft. No-op unless currently editing.
+    pub fn cancel_comment(&mut self) {
+        if let Screen::View(_, ViewState::Loaded { comment, .. }) = &mut self.screen {
+            if comment.editing {
+                comment.editing = false;
+                comment.body.clear();
+            }
+        }
+    }
+
     /// The current status banner, if any.
     pub fn status(&self) -> Option<&Status> {
         self.status.as_ref()
@@ -901,6 +1001,13 @@ pub enum Action {
     /// read `config.toml`, call [`App::cycle_active_preset`], then [`App::retry`] +
     /// refetch — a no-op when no presets are configured (TF-647's AC).
     CyclePreset,
+    /// `Enter` confirmed a non-empty comment draft (bound to `m`, see
+    /// [`App::confirm_comment`], TF-648): submit it for the issue selected when editing
+    /// started via `client.add_comment()`. Orchestrated in `main.rs`'s `event_loop`,
+    /// mirroring `Action::Implement`'s status-banner pattern (an interim `Status::Ok`
+    /// while the request is in flight, then `Status::Ok`/`Status::Error` once it
+    /// resolves).
+    AddComment(Issue, String),
 }
 
 /// Map a key press to an [`Action`], applying any state change (menu navigation,
@@ -921,6 +1028,10 @@ pub enum Action {
 /// `App::is_filtering`) until `Enter` confirms or `Esc` cancels, so none of the
 /// ordinary view bindings below (`q`, `o`, `r`, `Enter`-to-implement, ...) fire on a
 /// character typed into the filter.
+///
+/// `m` opens comment composition for the selected issue (TF-648), the same shape as `/`
+/// but via `App::is_commenting`/`App::confirm_comment`/`App::cancel_comment` — see their
+/// doc comments and `CommentState` for why `Up`/`Down` are excluded here unlike filtering.
 pub fn handle_key(
     app: &mut App,
     key: crossterm::event::KeyCode,
@@ -937,7 +1048,7 @@ pub fn handle_key(
         return None;
     }
 
-    if key == KeyCode::Char('?') && !app.is_filtering() {
+    if key == KeyCode::Char('?') && !app.is_filtering() && !app.is_commenting() {
         app.open_help_overlay();
         return None;
     }
@@ -951,10 +1062,15 @@ pub fn handle_key(
     // `Ctrl+C` case already handled above: it also keeps e.g. `Alt+C`/`Shift+C` from
     // triggering config-file writes, since this action's side effect (create + open
     // `config.toml`) is meant for a deliberate, bare `c` press, not any key event that
-    // happens to carry the `'c'` character. `!app.is_filtering()` defers to the filtering
-    // branch below, where a bare `c` must be captured as query text instead (and is always
-    // `false` on the menu screen, so it's safe to check here before the `in_menu` split).
-    if key == KeyCode::Char('c') && modifiers.is_empty() && !app.is_filtering() {
+    // happens to carry the `'c'` character. `!app.is_filtering() && !app.is_commenting()`
+    // defers to the filtering/commenting branches below, where a bare `c` must be
+    // captured as query/draft text instead (and both are always `false` on the menu
+    // screen, so it's safe to check here before the `in_menu` split).
+    if key == KeyCode::Char('c')
+        && modifiers.is_empty()
+        && !app.is_filtering()
+        && !app.is_commenting()
+    {
         return open_config_action(std::env::var_os("HERDR_PLUGIN_CONFIG_DIR").as_deref());
     }
 
@@ -1012,10 +1128,39 @@ pub fn handle_key(
         };
     }
 
+    // Same precedence as the filtering branch above, but for a comment draft (TF-648):
+    // character keys are captured into the draft instead of dispatching their usual view
+    // bindings. Unlike filtering, `Up`/`Down` are deliberately *not* forwarded to
+    // `move_selection_*` here — the draft targets whichever issue was selected when `m`
+    // opened editing (see `App::confirm_comment`), and letting navigation continue
+    // underneath would risk it silently landing on a different issue than the one shown.
+    if app.is_commenting() {
+        return match key {
+            KeyCode::Enter => app.confirm_comment(),
+            KeyCode::Esc => {
+                app.cancel_comment();
+                None
+            }
+            KeyCode::Backspace => {
+                app.pop_comment_char();
+                None
+            }
+            KeyCode::Char(c) => {
+                app.push_comment_char(c);
+                None
+            }
+            _ => None,
+        };
+    }
+
     match key {
         KeyCode::Char('q') => Some(Action::Quit),
         KeyCode::Char('/') => {
             app.start_filtering();
+            None
+        }
+        KeyCode::Char('m') => {
+            app.start_commenting();
             None
         }
         KeyCode::Esc => {
@@ -3267,6 +3412,260 @@ mod tests {
 
         assert!(app.help_overlay().is_none());
         assert!(app.is_filtering());
+    }
+
+    // --- TF-648: comment composition (`m`) -------------------------------------------
+
+    #[test]
+    fn m_key_starts_commenting() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+
+        let action = handle_key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+
+        assert_eq!(action, None);
+        assert!(app.is_commenting());
+    }
+
+    #[test]
+    fn m_key_outside_a_loaded_view_does_nothing() {
+        let mut app = app_in_my_issues_view(); // still Loading, not Loaded
+
+        handle_key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+
+        assert!(!app.is_commenting());
+    }
+
+    #[test]
+    fn m_key_with_no_selected_issue_does_nothing() {
+        // AC (TF-648): "kein Issue selektiert/leere Liste → No-op" — an empty list has no
+        // issue for the draft to target, so `m` must not open editing.
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![]);
+
+        handle_key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+
+        assert!(!app.is_commenting());
+    }
+
+    #[test]
+    fn m_key_when_the_active_filter_matches_nothing_does_nothing() {
+        // Same AC, reached via a narrowed-to-empty filter rather than a literally empty
+        // list — `selected_issue()` is `None` either way.
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        for c in "nonexistent".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE); // confirm, stop editing
+
+        handle_key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+
+        assert!(!app.is_commenting());
+    }
+
+    #[test]
+    fn typing_while_commenting_appends_to_the_draft_instead_of_triggering_its_usual_binding() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        handle_key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+
+        // 'q' would normally quit — while commenting it must be captured as text instead.
+        let action = handle_key(&mut app, KeyCode::Char('q'), KeyModifiers::NONE);
+
+        assert_eq!(action, None);
+        assert!(app.is_commenting());
+    }
+
+    #[test]
+    fn c_while_commenting_is_captured_as_draft_text_not_open_config() {
+        // Mirrors `c_while_filtering_is_captured_as_query_text_not_open_config`: `c`
+        // opens config.toml from any screen, but typed into an open comment draft it
+        // must stay draft text. `HERDR_PLUGIN_CONFIG_DIR` is set deliberately so `None`
+        // isn't a vacuous pass if the commenting guard were ever deleted.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR");
+        std::env::set_var("HERDR_PLUGIN_CONFIG_DIR", "/fake/config/dir");
+
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        handle_key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+        let action = handle_key(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
+
+        match previous {
+            Some(value) => std::env::set_var("HERDR_PLUGIN_CONFIG_DIR", value),
+            None => std::env::remove_var("HERDR_PLUGIN_CONFIG_DIR"),
+        }
+
+        assert_eq!(action, None);
+        assert!(app.is_commenting());
+    }
+
+    #[test]
+    fn question_mark_while_commenting_types_into_the_draft_instead_of_opening_the_overlay() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        handle_key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+
+        handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+
+        assert!(app.help_overlay().is_none());
+        assert!(app.is_commenting());
+    }
+
+    #[test]
+    fn up_and_down_while_commenting_do_not_move_the_selection() {
+        // Unlike filtering, navigation must not leak through while composing a comment:
+        // the draft targets whichever issue was selected when `m` opened editing, and
+        // silently moving `selected` underneath it could post the comment to the wrong
+        // issue. See `CommentState`'s doc comment.
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
+        handle_key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+
+        handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Up, KeyModifiers::NONE);
+
+        assert_eq!(app.selected_issue().unwrap().identifier, "ENG-1");
+        assert!(app.is_commenting());
+    }
+
+    #[test]
+    fn backspace_while_commenting_removes_the_last_character() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        handle_key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('!'), KeyModifiers::NONE); // typo
+
+        handle_key(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        let action = handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(
+            action,
+            Some(Action::AddComment(sample_issue("ENG-1"), "hi".to_string()))
+        );
+    }
+
+    #[test]
+    fn enter_with_an_empty_draft_does_not_send_and_stays_in_editing_mode() {
+        // AC (TF-648): "Ein leerer Kommentar wird nicht abgesendet" — nothing was typed,
+        // so confirming must be a no-op rather than sending a blank comment or silently
+        // discarding the (empty) draft the way `Esc` would.
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        handle_key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+
+        let action = handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(action, None);
+        assert!(app.is_commenting());
+    }
+
+    #[test]
+    fn enter_with_only_whitespace_does_not_send() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        handle_key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+        for c in "   ".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+
+        let action = handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(action, None);
+        assert!(app.is_commenting());
+    }
+
+    #[test]
+    fn enter_confirms_a_non_empty_comment_and_returns_an_add_comment_action() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        handle_key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+        for c in "Looks good".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+
+        let action = handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(
+            action,
+            Some(Action::AddComment(
+                sample_issue("ENG-1"),
+                "Looks good".to_string()
+            ))
+        );
+        assert!(!app.is_commenting());
+    }
+
+    #[test]
+    fn enter_trims_leading_and_trailing_whitespace_from_the_sent_comment() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        handle_key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+        for c in "  padded  ".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+
+        let action = handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(
+            action,
+            Some(Action::AddComment(
+                sample_issue("ENG-1"),
+                "padded".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn esc_while_commenting_cancels_and_discards_the_draft() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        handle_key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+        for c in "throwaway".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+
+        let action = handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+        assert_eq!(action, None);
+        assert!(!app.is_commenting());
+
+        // Reopening editing must not resurrect the discarded draft.
+        handle_key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+        let action = handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(action, None); // draft is empty again — nothing to send
+    }
+
+    #[test]
+    fn esc_after_confirming_a_comment_falls_through_to_its_usual_binding() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        handle_key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE); // confirm, stop editing
+
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+        // No longer editing, so Esc falls through to its ordinary "back to menu" binding.
+        assert!(matches!(app.screen, Screen::Menu { selected: 0 }));
+    }
+
+    #[test]
+    fn reentering_a_view_clears_any_previous_comment_draft() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        handle_key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+
+        // A fresh fetch (e.g. `r`etry, or re-entering the view) rebuilds `Loaded` from
+        // scratch via `set_issues`, which must not carry a stale draft along with it.
+        app.set_issues(vec![sample_issue("ENG-1")]);
+
+        assert!(!app.is_commenting());
     }
 
     #[test]

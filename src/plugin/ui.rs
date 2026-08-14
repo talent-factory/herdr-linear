@@ -134,9 +134,50 @@ fn draw_view(
             selected,
             marked,
             filter,
+            comment,
             detail_scroll,
         } => {
-            let area = if let Some(status) = status {
+            // `selected` indexes this filtered subset, not `issues` directly — see
+            // `matching_issue_indices`'s doc comment and `App::selected_issue`, which the
+            // detail pane below (and, since TF-648, the comment-draft banner) mirrors
+            // exactly so no two of them can ever disagree about which issue is
+            // highlighted. Computed once, up here, rather than at each call site, so
+            // there's exactly one place that answers "which issue is selected".
+            let matched_indices = matching_issue_indices(issues, &filter.query);
+            let selected_issue = matched_indices
+                .get(*selected)
+                .and_then(|&index| issues.get(index));
+
+            let area = if comment.editing {
+                // TF-648: while composing a comment, the banner area shows the live
+                // draft instead of any stale `status` — the same live-cursor (`▏`)
+                // convention the `/`-filter uses in the list title below, just in the
+                // banner rather than the title, since (unlike the filter query) the
+                // draft has no live effect on the list itself to show inline.
+                // `selected_issue` is guaranteed `Some` here: `App::start_commenting`
+                // refuses to open editing without one, and nothing can change the
+                // selection while editing (`handle_key`'s commenting branch doesn't
+                // forward `Up`/`Down`) — but this still falls back to an empty
+                // identifier rather than unwrapping, since a rendering bug is not a
+                // reason to panic the whole plugin.
+                let identifier = selected_issue.map_or("", |issue| issue.identifier.as_str());
+                let draft = format!(
+                    "Comment on {identifier} (Enter to send, Esc to cancel): {}▏",
+                    comment.body
+                );
+                let banner_height = status_banner_height(&draft, frame.area().width);
+                let outer = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(3), Constraint::Length(banner_height)])
+                    .split(frame.area());
+                frame.render_widget(
+                    Paragraph::new(draft)
+                        .style(Style::default().fg(Color::Cyan))
+                        .wrap(Wrap { trim: false }),
+                    outer[1],
+                );
+                outer[0]
+            } else if let Some(status) = status {
                 let banner_height = status_banner_height(status.text(), frame.area().width);
                 let outer = Layout::default()
                     .direction(Direction::Vertical)
@@ -167,12 +208,6 @@ fn draw_view(
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .split(area);
-
-            // `selected` indexes this filtered subset, not `issues` directly — see
-            // `matching_issue_indices`'s doc comment and `App::selected_issue`, which the
-            // detail pane below mirrors exactly so the two panes never disagree about
-            // which issue is highlighted.
-            let matched_indices = matching_issue_indices(issues, &filter.query);
 
             // `▏` marks the live cursor position while editing, so it's visually
             // distinct from a confirmed-but-inactive filter shown without one.
@@ -244,9 +279,6 @@ fn draw_view(
             let detail_area = detail_block.inner(chunks[1]);
             frame.render_widget(detail_block, chunks[1]);
 
-            let selected_issue = matched_indices
-                .get(*selected)
-                .and_then(|&index| issues.get(index));
             if let Some(issue) = selected_issue {
                 // Header (identifier/title/Status/Assignee/Project) and body
                 // (the Markdown description) are rendered as one continuous
@@ -1486,6 +1518,35 @@ mod tests {
     }
 
     #[test]
+    fn renders_the_comment_draft_banner_while_commenting() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        handle_key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+        for c in "lgtm".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+
+        let text = rendered_text(&app);
+        assert!(text.contains("Comment on ENG-1"));
+        assert!(text.contains("lgtm"));
+    }
+
+    #[test]
+    fn comment_draft_banner_takes_precedence_over_a_stale_status_banner() {
+        // A leftover `status` from a previous action (e.g. a prior implement run) must
+        // not bleed into view while a comment draft is open — the banner area can only
+        // show one or the other, and TF-648's draft is deliberately the one shown.
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        app.set_status(Status::Ok("ENG-1: tab opened.".to_string()));
+        handle_key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+
+        let text = rendered_text(&app);
+        assert!(text.contains("Comment on ENG-1"));
+        assert!(!text.contains("tab opened."));
+    }
+
+    #[test]
     fn renders_issue_description_as_formatted_markdown() {
         let mut app = app_in_my_issues_view();
         app.set_issues(vec![sample_issue_with_description(
@@ -2676,7 +2737,11 @@ mod tests {
         handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
         handle_key(&mut app, KeyCode::Char('2'), KeyModifiers::NONE); // -> Keybindings
 
-        let text = rendered_text_with_size(&app, 100, 40);
+        // Tall enough that the whole registry renders without scrolling — bumped from 40
+        // to 60 by TF-648, which added a 5th context (`Commenting`, 4 entries + a
+        // heading + a separator) on top of a new `m` binding in `View`. Bump again,
+        // generously, next time this starts failing rather than shaving off the minimum.
+        let text = rendered_text_with_size(&app, 100, 60);
 
         assert!(text.contains("Keybindings"));
         for binding in crate::plugin::keybindings::KEYBINDINGS {
