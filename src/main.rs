@@ -188,6 +188,16 @@ fn resolved_query(app: &mut plugin::app::App) -> plugin::query::ParsedQuery {
     resolved_query_for(app, config_dir.as_deref())
 }
 
+/// Formats the "filter presets could not be resolved at all" status message (TF-647
+/// review fix): shared by [`resolved_query_for`]'s `Err` arm and `event_loop`'s
+/// `Action::CyclePreset` handling — the same underlying failure
+/// ([`plugin::config::resolve_filter_presets`] erroring, e.g. malformed TOML) can surface
+/// from either call site depending on whether it's hit while cycling or while fetching,
+/// so both should say the same thing rather than risk drifting apart.
+fn filter_presets_error_message(err: herdr_linear::Error) -> String {
+    format!("filter presets in config.toml could not be applied: {err}")
+}
+
 /// The pure core of [`resolved_query`] (TF-647): the active named filter preset
 /// (`app.active_preset()`) if one is set, otherwise the plain `default_query` —
 /// delegating to the unchanged [`resolved_default_query_for`] for that fallback, so
@@ -209,8 +219,22 @@ fn resolved_query_for(
     };
 
     match plugin::config::resolve_filter_presets(config_dir) {
-        Ok(presets) => match presets.get(active.index) {
+        Ok(resolved) => match resolved.presets.get(active.index) {
             Some(preset) => {
+                // TF-647 review fix: `config.toml` can be reordered/renamed (not just
+                // shrunk) between activation and this fetch, e.g. via `c` mid-session —
+                // `index` alone can no longer prove this is still the same preset the
+                // user activated. Re-derive the display name from this fresh read so the
+                // list title (`ui.rs`) never shows a name that doesn't match the query
+                // actually being applied; a mismatch here is not itself an error (the
+                // preset at this position is still a real, user-configured preset), just
+                // stale display state to correct.
+                if preset.name != active.name {
+                    app.set_active_preset(Some(plugin::app::ActivePreset {
+                        index: active.index,
+                        name: preset.name.clone(),
+                    }));
+                }
                 let parsed = plugin::query::parse_query(&preset.query);
                 if !parsed.rejected.is_empty() {
                     app.set_status(plugin::app::Status::Error(format!(
@@ -226,14 +250,23 @@ fn resolved_query_for(
                 // The preset list shrank since this preset was activated (config.toml
                 // edited mid-session, e.g. via `c`) — fall back to `default_query` rather
                 // than fetching with an undefined query, same "adapt, don't crash" spirit
-                // every other config resolver here follows.
+                // every other config resolver here follows. Status is set *before*
+                // delegating: if `default_query` itself also has a problem,
+                // `resolved_default_query_for`'s own `set_status` call runs after this one
+                // and wins (status is last-write, not appended) — an intentional, rare
+                // double-fault tradeoff rather than an oversight.
+                app.set_status(plugin::app::Status::Error(format!(
+                    "preset \"{}\" no longer exists in config.toml (list changed since it \
+                     was activated) — reverted to default_query",
+                    active.name
+                )));
                 app.set_active_preset(None);
                 resolved_default_query_for(app, config_dir)
             }
         },
         Err(err) => {
-            app.set_status(plugin::app::Status::Error(format!(
-                "filter presets in config.toml could not be applied: {err}"
+            app.set_status(plugin::app::Status::Error(filter_presets_error_message(
+                err,
             )));
             plugin::query::ParsedQuery::default()
         }
@@ -242,8 +275,9 @@ fn resolved_query_for(
 
 /// Sorts `issues` by `sort_keys` (a no-op for an empty slice) and hands them to
 /// [`plugin::app::App::set_issues`] — the shared tail of every `load_issues` fetch arm,
-/// so `default_query`'s `sort:` terms (TF-617) apply identically regardless of which
-/// view was entered.
+/// so the resolved query's `sort:` terms — `default_query`'s (TF-617), or an active named
+/// preset's (TF-647) — apply identically regardless of which view was entered or which of
+/// the two supplied them.
 fn apply_fetched_issues(
     app: &mut plugin::app::App,
     mut issues: Vec<herdr_linear::Issue>,
@@ -1249,8 +1283,7 @@ fn is_buffered_quit_key(
 /// this was added for: TF-610's rate-limit retry, which can leave `ensure_loaded` blocking for
 /// up to ~2 minutes (3 attempts × up to 60s `Retry-After` each) with the screen looking hung.
 /// 1s is comfortably above any ordinary round-trip and comfortably below the first retry wait.
-const RETRY_OR_ENTER_VIEW_STALE_LOAD_THRESHOLD: std::time::Duration =
-    std::time::Duration::from_secs(1);
+const STALE_LOAD_FLUSH_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(1);
 
 fn flush_buffered_quit() -> std::io::Result<bool> {
     let mut quit_requested = false;
@@ -1283,7 +1316,7 @@ fn flush_buffered_quit() -> std::io::Result<bool> {
 /// the terminal instead of being handled. This drains them the same way the
 /// Implement/ImplementMany arms do, so a quit pressed while this was stuck actually takes
 /// effect instead of leaving the app looking hung. But only once the load actually took
-/// long enough to justify it (see `RETRY_OR_ENTER_VIEW_STALE_LOAD_THRESHOLD`) — on the
+/// long enough to justify it (see `STALE_LOAD_FLUSH_THRESHOLD`) — on the
 /// common fast round-trip, draining unconditionally would silently eat a legitimate
 /// follow-up keypress that the loop's normal poll would otherwise have picked up next
 /// iteration.
@@ -1300,10 +1333,52 @@ async fn draw_and_load(
     let load_started = std::time::Instant::now();
     ensure_loaded(app, client).await;
 
-    Ok(
-        load_started.elapsed() >= RETRY_OR_ENTER_VIEW_STALE_LOAD_THRESHOLD
-            && flush_buffered_quit()?,
-    )
+    Ok(load_started.elapsed() >= STALE_LOAD_FLUSH_THRESHOLD && flush_buffered_quit()?)
+}
+
+/// The pure core of `Action::CyclePreset`'s handling in [`event_loop`] (TF-647 review
+/// fix): given the freshly-read `[[filter_presets]]` resolution, cycles `app`'s active
+/// preset and decides whether a refetch is warranted. Extracted from `event_loop` (which
+/// is hardcoded to a real terminal backend, so it can't itself be driven by
+/// `ratatui::backend::TestBackend` the way `ui.rs`'s render tests are) so this decision —
+/// and its "no valid preset to cycle to, but some configured entries were malformed"
+/// status message — is directly testable.
+///
+/// Always calls [`plugin::app::App::cycle_active_preset`], even against an empty
+/// `resolved.presets` — that's the only way a currently-active preset gets cleared once
+/// its last remaining `config.toml` entry is deleted (previously this was gated on the
+/// list being non-empty, which left a stale `active_preset`, and its bracketed name in
+/// the title, stuck forever once the list it pointed into became empty).
+///
+/// Returns `true` if the active preset actually changed and the caller should transition
+/// to `Loading` and refetch. If cycling was a genuine no-op — no valid preset to switch
+/// to, or already back at `None` — and at least one `[[filter_presets]]` entry existed but
+/// was dropped for having a blank `name`/`query`, sets a status message: this is
+/// distinguished from "no `[[filter_presets]]` configured at all" (TF-647's AC, which
+/// stays silent) precisely so a config typo doesn't look identical to the feature not
+/// being used.
+fn apply_cycle_preset(
+    app: &mut plugin::app::App,
+    resolved: &plugin::config::ResolvedFilterPresets,
+) -> bool {
+    let before = app.active_preset().cloned();
+    app.cycle_active_preset(&resolved.presets);
+    if app.active_preset().cloned() != before {
+        return true;
+    }
+    if resolved.presets.is_empty() && resolved.dropped > 0 {
+        let noun = if resolved.dropped == 1 {
+            "entry"
+        } else {
+            "entries"
+        };
+        app.set_status(plugin::app::Status::Error(format!(
+            "{} [[filter_presets]] {noun} in config.toml ignored: each needs both a \
+             non-blank `name` and `query`",
+            resolved.dropped
+        )));
+    }
+    false
 }
 
 async fn event_loop(
@@ -1418,28 +1493,26 @@ async fn event_loop(
                                 // can't know the configured preset count without reading
                                 // `config.toml`, and must stay pure/I/O-free (see
                                 // `Action::CyclePreset`'s own doc comment). Do that read
-                                // here, then mirror `Retry`: cycle, transition to
-                                // `Loading`, and reuse `draw_and_load`.
+                                // here, then hand off to `apply_cycle_preset` (pure core,
+                                // directly tested below) to decide whether a refetch is
+                                // warranted, then mirror `Retry`: transition to `Loading`
+                                // and reuse `draw_and_load`.
                                 let config_dir = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR")
                                     .map(std::path::PathBuf::from);
                                 match plugin::config::resolve_filter_presets(config_dir.as_deref())
                                 {
-                                    Ok(presets) if !presets.is_empty() => {
-                                        app.cycle_active_preset(&presets);
-                                        app.retry();
-                                        if draw_and_load(terminal, app, client).await? {
-                                            break;
+                                    Ok(resolved) => {
+                                        if apply_cycle_preset(app, &resolved) {
+                                            app.retry();
+                                            if draw_and_load(terminal, app, client).await? {
+                                                break;
+                                            }
                                         }
                                     }
-                                    // No presets configured — TF-647's AC: behavior stays
-                                    // unchanged (only `default_query` applies), so `p`
-                                    // does nothing rather than triggering a pointless
-                                    // refetch.
-                                    Ok(_) => {}
                                     Err(err) => {
-                                        app.set_status(plugin::app::Status::Error(format!(
-                                            "filter presets in config.toml could not be applied: {err}"
-                                        )));
+                                        app.set_status(plugin::app::Status::Error(
+                                            filter_presets_error_message(err),
+                                        ));
                                     }
                                 }
                             }
@@ -2586,6 +2659,161 @@ exit 1
             }]
         );
         assert_eq!(app.active_preset(), None);
+        // Review fix: this used to fall back silently — the doc comment on
+        // `resolved_query_for` already claimed a status banner appears here, but no
+        // `set_status` call actually existed. The user has no other way to learn why
+        // their active preset's name just vanished from the title.
+        let status = app.status().expect("a removed preset should set a status");
+        assert!(status.is_error());
+        assert!(status.text().contains("Stale"));
+    }
+
+    #[test]
+    fn resolved_query_for_refreshes_the_active_presets_stale_name_when_the_list_is_reordered() {
+        // Review fix: `config.toml` reordered — not shrunk — since "Urgent" (index 0) was
+        // activated. `index` alone is no longer proof this is the same preset the user
+        // meant; the query actually applied is whatever now lives at that index, and the
+        // title (driven by `app.active_preset()`) must say so rather than keep showing
+        // the stale "Urgent" label over a different query.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[[filter_presets]]\nname = \"In Review\"\nquery = \"sort:created\"\n\n\
+             [[filter_presets]]\nname = \"Urgent\"\nquery = \"priority:>=2\"\n",
+        )
+        .unwrap();
+        let mut app = plugin::app::App::new();
+        app.enter_selected_menu_option();
+        app.set_active_preset(Some(plugin::app::ActivePreset {
+            index: 0,
+            name: "Urgent".to_string(),
+        }));
+
+        let parsed = resolved_query_for(&mut app, Some(dir.path()));
+
+        // The query actually applied is "In Review"'s (whatever now sits at index 0), not
+        // a merge and not the stale "Urgent" query.
+        assert_eq!(
+            parsed.sort_keys,
+            vec![plugin::query::SortKey {
+                field: plugin::query::SortField::Created,
+                ascending: true,
+            }]
+        );
+        assert!(parsed.filters.is_empty());
+        // And the displayed name is corrected to match what was actually applied.
+        assert_eq!(
+            app.active_preset(),
+            Some(&plugin::app::ActivePreset {
+                index: 0,
+                name: "In Review".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn resolved_query_for_leaves_the_active_preset_untouched_when_its_name_still_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[[filter_presets]]\nname = \"Urgent\"\nquery = \"priority:>=2\"\n",
+        )
+        .unwrap();
+        let mut app = plugin::app::App::new();
+        app.enter_selected_menu_option();
+        app.set_active_preset(Some(plugin::app::ActivePreset {
+            index: 0,
+            name: "Urgent".to_string(),
+        }));
+
+        resolved_query_for(&mut app, Some(dir.path()));
+
+        assert_eq!(
+            app.active_preset(),
+            Some(&plugin::app::ActivePreset {
+                index: 0,
+                name: "Urgent".to_string(),
+            })
+        );
+    }
+
+    // TF-647 review fix: `apply_cycle_preset` — the pure core of `Action::CyclePreset`'s
+    // event_loop handling, extracted so it's directly testable without driving the
+    // terminal-coupled event loop itself.
+
+    #[test]
+    fn apply_cycle_preset_clears_a_stale_active_preset_when_the_list_becomes_empty() {
+        // The bug this closes: cycling used to be gated on `!presets.is_empty()`, so once
+        // a preset's last remaining config.toml entry was deleted, `p` did nothing at
+        // all — the stale `active_preset` (and its bracketed name in the title) was stuck
+        // forever, with no in-app way to clear it short of leaving and re-entering the view.
+        let mut app = plugin::app::App::new();
+        app.set_active_preset(Some(plugin::app::ActivePreset {
+            index: 0,
+            name: "Urgent".to_string(),
+        }));
+
+        let refetch =
+            apply_cycle_preset(&mut app, &plugin::config::ResolvedFilterPresets::default());
+
+        assert!(refetch, "clearing a stale preset must trigger a refetch");
+        assert_eq!(app.active_preset(), None);
+    }
+
+    #[test]
+    fn apply_cycle_preset_is_a_silent_no_op_when_nothing_is_configured() {
+        // TF-647's AC: zero `[[filter_presets]]` entries (none dropped either) → `p` does
+        // nothing, no status, no refetch.
+        let mut app = plugin::app::App::new();
+
+        let refetch =
+            apply_cycle_preset(&mut app, &plugin::config::ResolvedFilterPresets::default());
+
+        assert!(!refetch);
+        assert_eq!(app.active_preset(), None);
+        assert!(app.status().is_none());
+    }
+
+    #[test]
+    fn apply_cycle_preset_surfaces_a_status_when_every_configured_entry_was_malformed() {
+        // Distinct from the "nothing configured" case above: entries exist but all got
+        // dropped (blank name/query, likely a typo) — telling the two apart is the whole
+        // point of `ResolvedFilterPresets::dropped`.
+        let mut app = plugin::app::App::new();
+        let resolved = plugin::config::ResolvedFilterPresets {
+            presets: Vec::new(),
+            dropped: 2,
+        };
+
+        let refetch = apply_cycle_preset(&mut app, &resolved);
+
+        assert!(!refetch);
+        let status = app.status().expect("malformed entries should set a status");
+        assert!(status.is_error());
+        assert!(status.text().contains('2'));
+    }
+
+    #[test]
+    fn apply_cycle_preset_advances_to_the_next_preset_and_reports_a_refetch() {
+        let mut app = plugin::app::App::new();
+        let resolved = plugin::config::ResolvedFilterPresets {
+            presets: vec![crate::plugin::config::FilterPreset {
+                name: "Urgent".to_string(),
+                query: "priority:>=2".to_string(),
+            }],
+            dropped: 0,
+        };
+
+        let refetch = apply_cycle_preset(&mut app, &resolved);
+
+        assert!(refetch);
+        assert_eq!(
+            app.active_preset(),
+            Some(&plugin::app::ActivePreset {
+                index: 0,
+                name: "Urgent".to_string(),
+            })
+        );
     }
 
     #[test]

@@ -227,20 +227,46 @@ pub fn resolve_default_query(config_dir: Option<&Path>) -> Result<Option<String>
     Ok(default_query)
 }
 
+/// The outcome of resolving `[[filter_presets]]` (TF-647 review fix): the valid,
+/// non-blank presets in declaration order, plus how many raw entries were dropped for
+/// having a blank `name` or `query`. Distinguishing `dropped` from a plain `Vec` lets a
+/// caller tell "no `[[filter_presets]]` configured at all" (`presets` empty, `dropped ==
+/// 0`) apart from "configured but every entry was malformed" (`presets` empty, `dropped >
+/// 0`) — see `main.rs`'s `Action::CyclePreset` handling, which surfaces the latter as a
+/// status message instead of silently behaving as if nothing were configured.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ResolvedFilterPresets {
+    pub presets: Vec<FilterPreset>,
+    pub dropped: usize,
+}
+
 /// Resolve the configured named filter presets (TF-647): `config_dir/config.toml`'s
 /// `[[filter_presets]]` entries, in declaration order. An entry whose `name` or `query`
 /// is empty/whitespace-only is dropped — same "blank means unset" rule
-/// [`resolve_default_query`] uses, applied per-entry rather than to a single value.
-/// `Ok(vec![])` means "no presets configured" — everything downstream
-/// (`crate::plugin::app::App::cycle_active_preset`, `main.rs`'s `Action::CyclePreset`
-/// handling) treats that as a no-op, leaving `default_query`-only behavior fully
-/// unchanged (TF-647's AC). Pure function — callers own reading the real environment
-/// (see [`load_filter_presets`]).
-pub fn resolve_filter_presets(config_dir: Option<&Path>) -> Result<Vec<FilterPreset>> {
-    let presets = read_config_file(config_dir)?
-        .map(|file| filter_presets_from_entries(file.filter_presets))
+/// [`resolve_default_query`] uses, applied per-entry rather than to a single value — but
+/// unlike that single-value case, a dropped `[[filter_presets]]` entry is far more likely
+/// to be an unintended typo (e.g. `nam = "..."` instead of `name = "..."`) than a
+/// deliberately blank field, so a drop is both logged (`tracing::warn!`) and counted in
+/// the returned [`ResolvedFilterPresets::dropped`] for a caller to surface to the user.
+/// An empty `presets` with `dropped == 0` means "no presets configured" — everything
+/// downstream (`crate::plugin::app::App::cycle_active_preset`, `main.rs`'s
+/// `Action::CyclePreset` handling) treats that as a no-op, leaving `default_query`-only
+/// behavior fully unchanged (TF-647's AC). Pure function — callers own reading the real
+/// environment (see [`load_filter_presets`]).
+pub fn resolve_filter_presets(config_dir: Option<&Path>) -> Result<ResolvedFilterPresets> {
+    let entries = read_config_file(config_dir)?
+        .map(|file| file.filter_presets)
         .unwrap_or_default();
-    Ok(presets)
+    let total = entries.len();
+    let presets = filter_presets_from_entries(entries);
+    let dropped = total - presets.len();
+    if dropped > 0 {
+        tracing::warn!(
+            "{dropped} of {total} [[filter_presets]] entries in config.toml ignored: each \
+             needs both a non-blank `name` and `query`"
+        );
+    }
+    Ok(ResolvedFilterPresets { presets, dropped })
 }
 
 /// Drops any `[[filter_presets]]` entry whose `name` or `query` is empty/whitespace-only
@@ -518,7 +544,7 @@ pub fn load_default_query() -> Result<Option<String>> {
 /// its own inline `HERDR_PLUGIN_CONFIG_DIR` lookup (for the same testability-via-injection
 /// reason `resolved_default_query`/`resolved_default_query_for` are split) rather than
 /// calling this directly.
-pub fn load_filter_presets() -> Result<Vec<FilterPreset>> {
+pub fn load_filter_presets() -> Result<ResolvedFilterPresets> {
     let config_dir = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR").map(std::path::PathBuf::from);
     resolve_filter_presets(config_dir.as_deref())
 }
@@ -991,10 +1017,10 @@ query = "state:\"In Review\""
         )
         .unwrap();
 
-        let presets = resolve_filter_presets(Some(dir.path())).unwrap();
+        let resolved = resolve_filter_presets(Some(dir.path())).unwrap();
 
         assert_eq!(
-            presets,
+            resolved.presets,
             vec![
                 FilterPreset {
                     name: "Urgent".to_string(),
@@ -1006,15 +1032,17 @@ query = "state:\"In Review\""
                 },
             ]
         );
+        assert_eq!(resolved.dropped, 0);
     }
 
     #[test]
     fn returns_empty_vec_when_config_file_missing_for_filter_presets() {
         let dir = tempfile::tempdir().unwrap();
 
-        let presets = resolve_filter_presets(Some(dir.path())).unwrap();
+        let resolved = resolve_filter_presets(Some(dir.path())).unwrap();
 
-        assert!(presets.is_empty());
+        assert!(resolved.presets.is_empty());
+        assert_eq!(resolved.dropped, 0);
     }
 
     #[test]
@@ -1022,9 +1050,10 @@ query = "state:\"In Review\""
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("config.toml"), "api_key = \"lin_api_x\"\n").unwrap();
 
-        let presets = resolve_filter_presets(Some(dir.path())).unwrap();
+        let resolved = resolve_filter_presets(Some(dir.path())).unwrap();
 
-        assert!(presets.is_empty());
+        assert!(resolved.presets.is_empty());
+        assert_eq!(resolved.dropped, 0);
     }
 
     #[test]
@@ -1048,15 +1077,19 @@ query = "sort:-updated"
         )
         .unwrap();
 
-        let presets = resolve_filter_presets(Some(dir.path())).unwrap();
+        let resolved = resolve_filter_presets(Some(dir.path())).unwrap();
 
         assert_eq!(
-            presets,
+            resolved.presets,
             vec![FilterPreset {
                 name: "Kept".to_string(),
                 query: "sort:-updated".to_string(),
             }]
         );
+        // TF-647 review fix: the two malformed entries are counted as dropped, not just
+        // silently absent from the result — `main.rs`'s `Action::CyclePreset` handling
+        // uses this to tell "nothing configured" apart from "configured but malformed".
+        assert_eq!(resolved.dropped, 2);
     }
 
     #[test]

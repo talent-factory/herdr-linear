@@ -340,6 +340,18 @@ pub struct HelpOverlayState {
 /// `default_query` (or no query at all) is in effect, exactly as before this feature.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivePreset {
+    /// Considered `pub(crate)` (the [`HelpOverlayState`] TF-585 precedent above), but
+    /// unlike that type, `ActivePreset` is also constructed and read directly from
+    /// `main.rs`'s `resolved_query_for` (and its tests) — and `main.rs` is a separate
+    /// crate from this `[lib]` target (it depends on it as `herdr_linear`), so
+    /// `pub(crate)` would make those call sites a compile error, not just a warning.
+    /// Fields stay `pub` for that structural reason; the actual invariant (`index` must
+    /// point at a real preset in a freshly-read `[[filter_presets]]` list) is enforced
+    /// where it's checkable — at the point of use in `resolved_query_for`, which
+    /// bounds-checks it on every fetch and falls back to `default_query` (clearing the
+    /// stale preset) rather than trusting it — not at construction time, since validity
+    /// depends on `config.toml`'s state at the moment of use, not at the moment of
+    /// construction.
     pub index: usize,
     pub name: String,
 }
@@ -881,8 +893,9 @@ pub enum Action {
     /// pattern.
     OpenConfig(PathBuf),
     /// `p` was pressed in a view (TF-647): cycle to the next configured named filter
-    /// preset and refetch with it. Unlike every other `Action`, `handle_key` performs
-    /// *no* state mutation before returning this one — cycling needs the current
+    /// preset and refetch with it. Unlike [`Action::Retry`]/[`Action::EnterView`] — the
+    /// other two variants that feed into `main.rs`'s `draw_and_load` — `handle_key`
+    /// performs *no* state mutation before returning this one — cycling needs the current
     /// `[[filter_presets]]` list from `config.toml`, and `handle_key` must stay pure/
     /// I/O-free (see its own doc comment). `main.rs`'s `event_loop` does the actual work:
     /// read `config.toml`, call [`App::cycle_active_preset`], then [`App::retry`] +

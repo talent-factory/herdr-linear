@@ -467,8 +467,8 @@ shows a status message under the loaded list.
 
 `config.toml` only reads one `default_query`, though — for switching between a handful of
 go-to queries throughout the day (e.g. "just what's urgent" vs. "what's in review right
-now") without editing `config.toml` and pressing `r` every time, set multiple named
-presets and press `p` to cycle through them:
+now") without editing `config.toml` and leaving/re-entering the view every time, set
+multiple named presets and press `p` to cycle through them:
 
 ```toml
 [[filter_presets]]
@@ -483,12 +483,12 @@ query = "state:\"In Review\" sort:created"
 Each preset's `query` uses the exact same DSL as `default_query` above, applied through
 the exact same mechanism (server-side filter terms, client-side `sort:`) — a preset is
 just a named, switchable alternative to it, not a different feature. Pressing `p` on a
-loaded view cycles: `default_query` (the plain view, no bracket shown) → `Urgent` →
-`In Review` → back to `default_query` → `Urgent` again, and so on — a full loop that
-always includes a stop back at the baseline. Whichever preset is active is shown in the
-list title next to the view name (`My Issues [Urgent]`), the same way an active
-`/`-filter's query text already is; the fetch itself refetches server-side on every
-switch, exactly like pressing `r` after editing `default_query` would. An unrecognized
+loaded view cycles: `default_query` (the plain view, no bracket shown) → `Urgent` → `In
+Review` → back to `default_query` → `Urgent` again, and so on — a full loop that always
+includes a stop back at the baseline. Whichever preset is active is shown in the list
+title next to the view name (`My Issues [Urgent]`), the same way an active `/`-filter's
+query text already is; the fetch itself refetches server-side on every switch, exactly
+like leaving and re-entering the view after editing `default_query` would. An unrecognized
 term in a preset's `query` behaves exactly like one in `default_query` — dropped, with a
 status message naming the preset. Presets are independent of the live `/`-filter, which
 still layers on top of whichever one (a preset, or plain `default_query`) is currently
