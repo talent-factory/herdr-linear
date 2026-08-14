@@ -255,8 +255,8 @@ const ETXTBSY_RETRY_DELAY: Duration = Duration::from_millis(20);
 
 /// Whether an abandoned `herdr` CLI subprocess call (its future dropped before completion —
 /// timed out, or the enclosing task itself was dropped) should have its child process killed, or
-/// left to run to completion detached. Every short-`DEFAULT_CLI_TIMEOUT`-bounded call ([`run`],
-/// [`run_raw`]) defaults to [`OnAbandon::LeaveRunning`], preserving the long-standing assumption
+/// left to run to completion detached. Every short-`DEFAULT_CLI_TIMEOUT`-bounded call (`run`,
+/// `run_raw`) defaults to [`OnAbandon::LeaveRunning`], preserving the long-standing assumption
 /// documented at `main.rs`'s `implement_one` (a `pane_run` client-side timeout doesn't necessarily
 /// mean the server-side action didn't happen — see that comment) — flipping that for every call
 /// risked silently cutting off an in-flight request we can't prove has already reached herdr.
@@ -264,7 +264,7 @@ const ETXTBSY_RETRY_DELAY: Duration = Duration::from_millis(20);
 /// exception: nothing is holding a `--timeout`-bounded budget open on its behalf once the
 /// enclosing task is dropped (the plugin quit mid-wait), so leaving its child running would mean
 /// an orphaned `herdr agent wait` process surviving the plugin itself for up to a full day — see
-/// [`spawn_with_etxtbsy_retry`]'s doc for the mechanism.
+/// `spawn_with_etxtbsy_retry`'s doc for the mechanism.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnAbandon {
     /// Let the child keep running to completion even if this call is abandoned. The default for
