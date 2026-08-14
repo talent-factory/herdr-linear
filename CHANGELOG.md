@@ -56,8 +56,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   than an occasional one — every single-issue implement already paid a mandatory multi-second wait
   for the second (re)send (typically the one that lands) with zero on-screen indication anything
   was still happening. That's the exact shape of "prompt not injected, but a manual second
-  `<Enter>` usually works": the user is very plausibly looking at this same silent, already-in-
-  -progress wait and giving up on it early. `send_prompt_until_visible`/`_with` now take an
+  `<Enter>` usually works": the user is very plausibly looking at this same silent,
+  already-in-progress wait and giving up on it early. `send_prompt_until_visible`/`_with` now take an
   `on_attempt(attempt, attempts)` progress hook, called once per (re)send; `implement_one` forwards
   it, and the new `PromptSendPolicy` struct bundles the four retry-tuning parameters that hook
   would otherwise have pushed past clippy's `too_many_arguments` threshold. `start_implementation`
