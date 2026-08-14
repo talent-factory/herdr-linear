@@ -122,6 +122,13 @@ deferred to a dedicated phase.
       left behind after quitting the editor, and removes the herdr-CLI-pane
       machinery (`open_config_in_herdr_pane` and friends) that TF-614
       originally added for it
+- [x] Leftover idle tab after an implement agent finishes now closes itself:
+      right after `implement_one`'s prompt lands, a detached background
+      watcher runs `herdr agent wait --until done` and then `herdr tab
+      close` — fails open (tab stays put) on any timeout or error, and never
+      blocks the synchronous single-/multi-implement flow it's spawned from,
+      so parallel multi-implement (TF-622) still returns immediately per
+      issue (TF-649)
 
 ### Phase 2: Advanced Features
 
