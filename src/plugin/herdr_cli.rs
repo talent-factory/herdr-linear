@@ -4,9 +4,11 @@
 //! agent to become ready, and inject text. (The `c` keybinding's config-editor hand-off no
 //! longer goes through here at all — it runs the editor in-place instead; see
 //! `main.rs::run_editor_in_terminal`.) The subprocess-spawning half is deliberately untested at
-//! this layer — same status as the existing `open::that(url)` call for the `o` key; see
-//! docs/superpowers/specs/2026-08-05-implement-on-enter-design.md for why. The
-//! response-interpretation half (`interpret_output`) is pure and unit-tested below.
+//! this layer — there's no lower-level abstraction here worth mocking; see
+//! docs/superpowers/specs/2026-08-05-implement-on-enter-design.md for why. (This no longer holds
+//! for the `o` key's `open::that(url)` call, which TF-652's `main.rs::open_issue_url` now wraps
+//! behind an injectable `opener` closure and unit-tests directly — see that function's doc
+//! comment.) The response-interpretation half (`interpret_output`) is pure and unit-tested below.
 //!
 //! ## `agent_wait`'s retry-on-missing-`result` workaround
 //!

@@ -1198,6 +1198,55 @@ fn open_config_editor(
     opener(path).map_err(|e| format!("Couldn't open {}: {e}", path.display()))
 }
 
+/// Whether the process is attached to a remote session (SSH, and by extension Mosh — which
+/// still sets `SSH_TTY` on the far end even though the transport itself is UDP — or Moshi, which
+/// tunnels over one of those). Checked once at startup and threaded through to the `o` key's
+/// browser-open handling: `open::that(url)` shells out to the *local* OS opener, so over a
+/// remote session it opens a browser on the host, not the device the user is actually looking
+/// at. Presence, not content, is what matters — both vars are always non-empty when a real SSH
+/// daemon sets them, so `.is_some()` is sufficient without inspecting the value.
+fn is_remote_session(ssh_connection: Option<&str>, ssh_tty: Option<&str>) -> bool {
+    ssh_connection.is_some() || ssh_tty.is_some()
+}
+
+/// Wraps `text` in an OSC 52 "set clipboard" escape sequence. Terminal multiplexers/clients that
+/// pass OSC 52 through (Moshi does, per its docs — host → iOS clipboard) apply it to the
+/// *client's* clipboard even over SSH/Mosh, unlike `open::that()` which always acts on whatever
+/// machine the process itself is running on.
+fn osc52_copy_sequence(text: &str) -> String {
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    format!("\x1b]52;c;{encoded}\x07")
+}
+
+/// Handles the `o` key's `Action::OpenInBrowser(url)`. Minimal-diff by design (TF-652):
+/// the local branch is untouched — `open::that(url)`'s result is still discarded exactly as
+/// before, preserving pre-TF-652 behaviour (silent no-op on failure; there's no useful recovery
+/// action to offer for "the OS couldn't open a browser"). Only the remote branch is new, since
+/// that's the one that's actually broken (see module docs on `is_remote_session`): it can't call
+/// the local OS opener at all, so it copies the URL via OSC 52 instead. Unlike the local branch,
+/// a failed clipboard write here has no other fallback the user could fall back on, so — unlike
+/// `open::that`'s discarded result above — it's surfaced as `Status::Error` rather than assumed
+/// to have succeeded.
+fn open_issue_url(
+    url: &str,
+    is_remote: bool,
+    opener: impl FnOnce(&str) -> std::io::Result<()>,
+    write_clipboard_sequence: impl FnOnce(&str) -> std::io::Result<()>,
+) -> Option<plugin::app::Status> {
+    if is_remote {
+        Some(match write_clipboard_sequence(&osc52_copy_sequence(url)) {
+            Ok(()) => plugin::app::Status::Ok("Issue-URL kopiert – in Safari einfügen".to_string()),
+            Err(e) => {
+                plugin::app::Status::Error(format!("Issue-URL konnte nicht kopiert werden: {e}"))
+            }
+        })
+    } else {
+        let _ = opener(url);
+        None
+    }
+}
+
 /// Status shown while [`start_implementation`] is blocked confirming a (re)sent prompt, once
 /// `send_prompt_until_visible`'s progress hook reaches a (re)send beyond the first — diagnosed
 /// live (TF-650): against a freshly-launched `headroom wrap claude ...`-style multi-process
@@ -1641,6 +1690,13 @@ async fn event_loop(
     app: &mut plugin::app::App,
     client: &mut Option<herdr_linear::LinearClient>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Doesn't change over the process lifetime, so resolved once here rather than re-reading
+    // the environment on every `o` keypress.
+    let is_remote = is_remote_session(
+        std::env::var("SSH_CONNECTION").ok().as_deref(),
+        std::env::var("SSH_TTY").ok().as_deref(),
+    );
+
     loop {
         terminal.draw(|frame| plugin::ui::draw(frame, app))?;
 
@@ -1659,18 +1715,33 @@ async fn event_loop(
                         match action {
                             plugin::app::Action::Quit => break,
                             plugin::app::Action::OpenInBrowser(url) => {
-                                let _ = open::that(url);
+                                // Local branch is untouched — see `open_issue_url`'s doc comment
+                                // for why the remote (SSH/Mosh/Moshi) branch needs different
+                                // handling than just calling the OS opener.
+                                if let Some(status) = open_issue_url(
+                                    &url,
+                                    is_remote,
+                                    |u| open::that(u),
+                                    |seq| {
+                                        use std::io::Write as _;
+                                        let mut stdout = std::io::stdout();
+                                        stdout.write_all(seq.as_bytes())?;
+                                        stdout.flush()
+                                    },
+                                ) {
+                                    app.set_status(status);
+                                }
                             }
                             plugin::app::Action::OpenConfig(path) => {
-                                // Unlike `OpenInBrowser` above, this chains filesystem writes and
-                                // a blocking editor hand-off (`run_editor_in_terminal`) in front
-                                // of the final "open it" step — each with real, user-hittable
-                                // failure modes (permission denied, disk full, editor not found)
-                                // — and it's one of the recovery actions offered on the error
-                                // screen. Silently doing nothing here would leave the user stuck
-                                // with no indication that pressing `c` didn't work, so unlike
-                                // `OpenInBrowser` this surfaces a failure via `set_status` rather
-                                // than discarding it.
+                                // Unlike `OpenInBrowser`'s local branch above, this chains
+                                // filesystem writes and a blocking editor hand-off
+                                // (`run_editor_in_terminal`) in front of the final "open it" step
+                                // — each with real, user-hittable failure modes (permission
+                                // denied, disk full, editor not found) — and it's one of the
+                                // recovery actions offered on the error screen. Silently doing
+                                // nothing here would leave the user stuck with no indication that
+                                // pressing `c` didn't work, so unlike that branch this surfaces a
+                                // failure via `set_status` rather than discarding it.
                                 let ensure_result: Result<(), String> = (|| {
                                     if let Some(parent) = path.parent() {
                                         std::fs::create_dir_all(parent).map_err(|e| {
@@ -2246,6 +2317,121 @@ mod tests {
             message.contains("Couldn't open") && message.contains("no handler registered"),
             "unexpected message: {message}"
         );
+    }
+
+    #[test]
+    fn is_remote_session_is_false_when_neither_ssh_env_var_is_set() {
+        assert!(!is_remote_session(None, None));
+    }
+
+    #[test]
+    fn is_remote_session_is_true_when_only_ssh_connection_is_set() {
+        assert!(is_remote_session(Some("10.0.0.1 1234 10.0.0.2 22"), None));
+    }
+
+    #[test]
+    fn is_remote_session_is_true_when_only_ssh_tty_is_set() {
+        assert!(is_remote_session(None, Some("/dev/pts/0")));
+    }
+
+    #[test]
+    fn is_remote_session_is_true_when_both_ssh_vars_are_set() {
+        // The realistic case for a Mosh-over-SSH session: mosh-server inherits both from the
+        // bootstrap SSH connection and never unsets them (see module docs on `is_remote_session`).
+        assert!(is_remote_session(
+            Some("10.0.0.1 1234 10.0.0.2 22"),
+            Some("/dev/pts/0")
+        ));
+    }
+
+    #[test]
+    fn is_remote_session_is_true_when_a_var_is_set_but_empty() {
+        // Pins down the doc comment's claim that presence, not content, is what matters: even an
+        // empty (but present) value counts as "set".
+        assert!(is_remote_session(Some(""), None));
+        assert!(is_remote_session(None, Some("")));
+    }
+
+    #[test]
+    fn osc52_copy_sequence_wraps_base64_of_the_input_in_the_osc52_escape_codes() {
+        assert_eq!(osc52_copy_sequence("hello"), "\x1b]52;c;aGVsbG8=\x07");
+    }
+
+    #[test]
+    fn osc52_copy_sequence_handles_empty_and_unicode_input() {
+        assert_eq!(osc52_copy_sequence(""), "\x1b]52;c;\x07");
+        // Multi-byte UTF-8 (ü) must be base64-encoded byte-for-byte, not per-`char`.
+        assert_eq!(osc52_copy_sequence("für"), "\x1b]52;c;ZsO8cg==\x07");
+    }
+
+    #[test]
+    fn open_issue_url_copies_via_osc52_and_returns_a_status_when_remote() {
+        let clipboard_calls = std::cell::RefCell::new(Vec::new());
+
+        let status = open_issue_url(
+            "https://linear.app/team/issue/TF-1",
+            true,
+            |_url| panic!("opener must not be called for a remote session"),
+            |seq| {
+                clipboard_calls.borrow_mut().push(seq.to_string());
+                Ok(())
+            },
+        );
+
+        assert_eq!(
+            status,
+            Some(plugin::app::Status::Ok(
+                "Issue-URL kopiert – in Safari einfügen".to_string()
+            ))
+        );
+        assert_eq!(
+            clipboard_calls.into_inner(),
+            vec![osc52_copy_sequence("https://linear.app/team/issue/TF-1")]
+        );
+    }
+
+    #[test]
+    fn open_issue_url_calls_the_opener_and_returns_no_status_when_local() {
+        let opener_calls = std::cell::RefCell::new(Vec::new());
+
+        let status = open_issue_url(
+            "https://linear.app/team/issue/TF-1",
+            false,
+            |url| {
+                opener_calls.borrow_mut().push(url.to_string());
+                Ok(())
+            },
+            |_seq| panic!("clipboard writer must not be called for a local session"),
+        );
+
+        assert_eq!(status, None);
+        assert_eq!(
+            opener_calls.into_inner(),
+            vec!["https://linear.app/team/issue/TF-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn open_issue_url_returns_an_error_status_when_the_clipboard_write_fails_remotely() {
+        // Unlike the local branch (which has no working fallback to fall back on if
+        // `open::that` fails either), a failed OSC 52 write must not be reported as success —
+        // there's no other signal the user could use to notice the copy didn't happen.
+        let status = open_issue_url(
+            "https://linear.app/team/issue/TF-1",
+            true,
+            |_url| panic!("opener must not be called for a remote session"),
+            |_seq| Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+        );
+
+        match status {
+            Some(plugin::app::Status::Error(message)) => {
+                assert!(
+                    message.contains("Issue-URL"),
+                    "expected the error message to mention the issue URL, got: {message}"
+                );
+            }
+            other => panic!("expected Some(Status::Error(_)) on a failed write, got: {other:?}"),
+        }
     }
 
     #[cfg(unix)]
