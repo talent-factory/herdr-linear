@@ -666,8 +666,14 @@ async fn implement_one(
 
     // From here on, every early return must still report `warnings` — a failure below doesn't
     // undo (or excuse hiding) a warning collected above it.
-    if let Err(err) =
-        plugin::herdr_cli::agent_wait(herdr_bin, &created_tab.root_pane_id, "idle", 30_000).await
+    if let Err(err) = plugin::herdr_cli::agent_wait(
+        herdr_bin,
+        &created_tab.root_pane_id,
+        "idle",
+        30_000,
+        plugin::herdr_cli::OnAbandon::LeaveRunning,
+    )
+    .await
     {
         return ImplementOutcome::Failed(status_with_warnings(
             format!("agent didn't become ready ({err}) — run manually: {prompt}"),
@@ -726,13 +732,27 @@ const AGENT_DONE_WAIT_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000; // 24h
 /// (or failed) agent's output must never silently vanish. A `tab_close` failure afterwards
 /// (already closed, herdr restarted mid-wait, ...) is swallowed too — there is nothing left for
 /// this task to usefully do at that point.
+///
+/// Waits with [`plugin::herdr_cli::OnAbandon::KillChild`], not the
+/// [`plugin::herdr_cli::OnAbandon::LeaveRunning`] every other `agent_wait` call in this codebase
+/// uses: since nothing else keeps this call's budget alive once its enclosing task is dropped
+/// (the plugin quit mid-wait, per this same ticket's acceptance criteria), leaving its child
+/// `herdr agent wait` process running would let it survive the plugin process itself for up to
+/// [`AGENT_DONE_WAIT_TIMEOUT_MS`]'s full 24h — see [`plugin::herdr_cli::OnAbandon`]'s doc for the
+/// underlying mechanism.
 async fn close_tab_once_agent_is_done(
     herdr_bin: &str,
     tab: &plugin::herdr_cli::TabCreated,
     timeout_ms: u64,
 ) {
-    if let Err(err) =
-        plugin::herdr_cli::agent_wait(herdr_bin, &tab.root_pane_id, "done", timeout_ms).await
+    if let Err(err) = plugin::herdr_cli::agent_wait(
+        herdr_bin,
+        &tab.root_pane_id,
+        "done",
+        timeout_ms,
+        plugin::herdr_cli::OnAbandon::KillChild,
+    )
+    .await
     {
         tracing::debug!(
             "close_tab_once_agent_is_done: agent in {:?} never reached \"done\" ({err}), \
@@ -2915,6 +2935,53 @@ esac
             !close_marker.exists(),
             "tab close must never run once agent_wait has failed (fail-open, TF-649)"
         );
+    }
+
+    /// The other half of `close_tab_once_agent_is_done`'s fail-open contract: `agent_wait`
+    /// succeeds (the agent really did reach "done"), but the subsequent `tab_close` call itself
+    /// fails (already closed, herdr restarted mid-wait, ...). Must not panic — the failure is
+    /// swallowed (logged at `debug!`, per the function's own doc), leaving the tab exactly as it
+    /// is, same as the `agent_wait`-fails case above.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn close_tab_once_agent_is_done_does_not_panic_when_tab_close_fails_after_agent_wait_succeeds(
+    ) {
+        let (_dir, script) = write_fake_herdr_script(
+            r#"
+case "$1 $2" in
+  "tab create")
+    echo '{"result":{"tab":{"tab_id":"t1","label":"TF-649"},"root_pane":{"pane_id":"p1"}}}'
+    exit 0
+    ;;
+  "agent wait")
+    echo '{"result":{}}'
+    exit 0
+    ;;
+  "tab close")
+    echo '{"error":{"message":"no such tab"}}'
+    exit 1
+    ;;
+  *)
+    echo '{"error":{"message":"unexpected herdr call: $1 $2"}}'
+    exit 1
+    ;;
+esac
+"#,
+        );
+
+        let tab = plugin::herdr_cli::tab_create(
+            script.to_str().unwrap(),
+            std::path::Path::new("/tmp"),
+            "TF-649",
+        )
+        .await
+        .expect("tab_create should succeed");
+
+        // Reaching this line at all (rather than the test process aborting on an unwind through
+        // an `.await` point, or a `#[tokio::test]` failure from a panicking task) is the
+        // assertion: a `tab_close` error after a successful `agent_wait` must be swallowed, not
+        // propagated or panicked on.
+        close_tab_once_agent_is_done(script.to_str().unwrap(), &tab, 5_000).await;
     }
 
     /// Writes a fake `herdr` handling exactly the calls [`implement_many`] drives per issue up to

@@ -253,6 +253,28 @@ const DEFAULT_CLI_TIMEOUT: Duration = Duration::from_secs(15);
 const ETXTBSY_MAX_RETRIES: u32 = 5;
 const ETXTBSY_RETRY_DELAY: Duration = Duration::from_millis(20);
 
+/// Whether an abandoned `herdr` CLI subprocess call (its future dropped before completion —
+/// timed out, or the enclosing task itself was dropped) should have its child process killed, or
+/// left to run to completion detached. Every short-`DEFAULT_CLI_TIMEOUT`-bounded call ([`run`],
+/// [`run_raw`]) defaults to [`OnAbandon::LeaveRunning`], preserving the long-standing assumption
+/// documented at `main.rs`'s `implement_one` (a `pane_run` client-side timeout doesn't necessarily
+/// mean the server-side action didn't happen — see that comment) — flipping that for every call
+/// risked silently cutting off an in-flight request we can't prove has already reached herdr.
+/// [`agent_wait`]'s up-to-24h "done" wait (`close_tab_once_agent_is_done`, TF-649) is the
+/// exception: nothing is holding a `--timeout`-bounded budget open on its behalf once the
+/// enclosing task is dropped (the plugin quit mid-wait), so leaving its child running would mean
+/// an orphaned `herdr agent wait` process surviving the plugin itself for up to a full day — see
+/// [`spawn_with_etxtbsy_retry`]'s doc for the mechanism.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnAbandon {
+    /// Let the child keep running to completion even if this call is abandoned. The default for
+    /// every short-timeout call — see [`OnAbandon`]'s own doc for why.
+    LeaveRunning,
+    /// Kill the child as soon as this call is abandoned. Used only by [`agent_wait`]'s "done"
+    /// wait (TF-649) — see [`OnAbandon`]'s own doc for why.
+    KillChild,
+}
+
 /// Spawns `herdr_bin args`, retrying up to [`ETXTBSY_MAX_RETRIES`] times with a short
 /// delay if the OS reports `ErrorKind::ExecutableFileBusy` ("text file busy" / `ETXTBSY`)
 /// — a transient condition (something else has the executable open for writing at the
@@ -261,13 +283,26 @@ const ETXTBSY_RETRY_DELAY: Duration = Duration::from_millis(20);
 /// almost immediately (a known kernel/VFS race on some CI filesystems) — but the same
 /// condition could in principle hit a real `herdr` binary that's mid-reinstall/update at
 /// the exact moment this runs, so the retry lives here rather than only in test scaffolding.
+///
+/// `on_abandon`: with [`OnAbandon::KillChild`], Tokio sends the child a kill signal as soon as
+/// its `Child` handle is dropped (e.g. this future being cancelled by an outer
+/// `tokio::time::timeout`, or the whole task being dropped) — without it, neither Tokio's runtime
+/// shutdown nor a closed stdout/stderr pipe (nothing is written to it until the call actually
+/// succeeds) kills an orphaned child by itself, so it keeps running detached until it exits on
+/// its own. See [`OnAbandon`] for which calls use which behavior and why.
 async fn spawn_with_etxtbsy_retry(
     herdr_bin: &str,
     args: &[&str],
+    on_abandon: OnAbandon,
 ) -> std::io::Result<std::process::Output> {
     let mut attempt = 0;
     loop {
-        match Command::new(herdr_bin).args(args).output().await {
+        match Command::new(herdr_bin)
+            .args(args)
+            .kill_on_drop(on_abandon == OnAbandon::KillChild)
+            .output()
+            .await
+        {
             Err(e)
                 if e.kind() == std::io::ErrorKind::ExecutableFileBusy
                     && attempt < ETXTBSY_MAX_RETRIES =>
@@ -287,24 +322,33 @@ async fn spawn_output(
     herdr_bin: &str,
     args: &[&str],
     call_timeout: Duration,
+    on_abandon: OnAbandon,
 ) -> Result<std::process::Output> {
     let command_desc = format!("{herdr_bin} {}", args.join(" "));
 
-    tokio::time::timeout(call_timeout, spawn_with_etxtbsy_retry(herdr_bin, args))
-        .await
-        .map_err(|_| {
-            Error::Internal(format!(
-                "`{command_desc}` timed out after {call_timeout:?} waiting for herdr"
-            ))
-        })?
-        .map_err(|e| Error::Internal(format!("Failed to run `{herdr_bin}`: {e}")))
+    tokio::time::timeout(
+        call_timeout,
+        spawn_with_etxtbsy_retry(herdr_bin, args, on_abandon),
+    )
+    .await
+    .map_err(|_| {
+        Error::Internal(format!(
+            "`{command_desc}` timed out after {call_timeout:?} waiting for herdr"
+        ))
+    })?
+    .map_err(|e| Error::Internal(format!("Failed to run `{herdr_bin}`: {e}")))
 }
 
 /// Run a `herdr` CLI subcommand, bounded by `call_timeout`, returning the parsed `result` field
 /// on success. See [`interpret_output`] for the success/failure mapping.
-async fn run_with_timeout(herdr_bin: &str, args: &[&str], call_timeout: Duration) -> Result<Value> {
+async fn run_with_timeout(
+    herdr_bin: &str,
+    args: &[&str],
+    call_timeout: Duration,
+    on_abandon: OnAbandon,
+) -> Result<Value> {
     let command_desc = format!("{herdr_bin} {}", args.join(" "));
-    let output = spawn_output(herdr_bin, args, call_timeout).await?;
+    let output = spawn_output(herdr_bin, args, call_timeout, on_abandon).await?;
 
     interpret_output(
         &command_desc,
@@ -317,7 +361,13 @@ async fn run_with_timeout(herdr_bin: &str, args: &[&str], call_timeout: Duration
 /// [`run_with_timeout`] bounded by [`DEFAULT_CLI_TIMEOUT`] — used by every `herdr` subcommand
 /// except `agent_wait`, which computes its own call-specific budget instead (see [`agent_wait`]).
 async fn run(herdr_bin: &str, args: &[&str]) -> Result<Value> {
-    run_with_timeout(herdr_bin, args, DEFAULT_CLI_TIMEOUT).await
+    run_with_timeout(
+        herdr_bin,
+        args,
+        DEFAULT_CLI_TIMEOUT,
+        OnAbandon::LeaveRunning,
+    )
+    .await
 }
 
 /// [`run`]'s sibling for subcommands whose success output is raw text rather than a JSON
@@ -326,7 +376,13 @@ async fn run(herdr_bin: &str, args: &[&str]) -> Result<Value> {
 /// on stderr, a non-zero exit, ...) — only the success shape differs.
 async fn run_raw(herdr_bin: &str, args: &[&str]) -> Result<String> {
     let command_desc = format!("{herdr_bin} {}", args.join(" "));
-    let output = spawn_output(herdr_bin, args, DEFAULT_CLI_TIMEOUT).await?;
+    let output = spawn_output(
+        herdr_bin,
+        args,
+        DEFAULT_CLI_TIMEOUT,
+        OnAbandon::LeaveRunning,
+    )
+    .await?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -472,12 +528,15 @@ fn next_retry_budget_ms(
 /// this subcommand's `--status` flag to `--until`, TF-624). Retries, within the caller's
 /// original `timeout_ms` budget, when herdr responds with the missing-`result` bug documented at
 /// the top of this module — any other error (a real timeout, no such pane, ...) returns
-/// immediately.
+/// immediately. `on_abandon` controls what happens to the underlying `herdr` subprocess if this
+/// call itself is abandoned before completing (e.g. its enclosing task dropped) — see
+/// [`OnAbandon`] for which value to pass and why.
 pub async fn agent_wait(
     herdr_bin: &str,
     pane_id: &PaneId,
     status: &str,
     timeout_ms: u64,
+    on_abandon: OnAbandon,
 ) -> Result<()> {
     let start = std::time::Instant::now();
     let mut attempt = 0;
@@ -506,6 +565,7 @@ pub async fn agent_wait(
                 &timeout_str,
             ],
             call_timeout,
+            on_abandon,
         )
         .await;
 
@@ -909,6 +969,7 @@ echo '{{"result":{{}},"id":"cli:agent:wait"}}'
             &PaneId("wY:p7Z".to_string()),
             "idle",
             5_000,
+            OnAbandon::LeaveRunning,
         )
         .await
         .expect("agent_wait should poll through agent_not_found and succeed");
@@ -937,6 +998,7 @@ exit 1
             &PaneId("wY:p7Z".to_string()),
             "idle",
             100,
+            OnAbandon::LeaveRunning,
         )
         .await
         .expect_err("agent_wait should time out when agent_not_found persists");
@@ -944,6 +1006,115 @@ exit 1
         assert!(
             err.to_string().contains("timed out"),
             "expected timeout error, got: {err}"
+        );
+    }
+
+    /// Polls for `path` to exist, up to `timeout`, checking every 50ms. Used by the
+    /// `OnAbandon`/kill-on-drop tests below instead of a single fixed sleep-then-check: under a
+    /// full, parallel `cargo test` run, OS scheduling contention can easily push either the fake
+    /// script's own 1s `sleep` or this test's wakeup past a tight fixed margin, so a generous
+    /// polling ceiling is what actually makes these tests reliable rather than flaky.
+    async fn marker_appears_within(path: &std::path::Path, timeout: Duration) -> bool {
+        let start = std::time::Instant::now();
+        loop {
+            if path.exists() {
+                return true;
+            }
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// TF-649 follow-up: verifies [`OnAbandon::KillChild`] actually kills the underlying `herdr`
+    /// subprocess when the `agent_wait` call itself is abandoned (here, by racing it against an
+    /// outer `tokio::time::timeout` shorter than the fake script's own sleep — the same drop this
+    /// codebase would see if the plugin quit while `close_tab_once_agent_is_done`'s "done" wait
+    /// was still in flight). The fake script only writes its completion marker *after* sleeping;
+    /// if the child is killed mid-sleep, that marker must never appear, even after polling well
+    /// past the sleep's own duration.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_wait_with_kill_on_drop_kills_its_child_when_abandoned() {
+        let capture_dir = tempfile::tempdir().unwrap();
+        let completed_marker = capture_dir.path().join("completed");
+        let (_dir, script) = write_fake_herdr_script(&format!(
+            r#"
+sleep 1
+touch "{}"
+echo '{{"result":{{}}}}'
+exit 0
+"#,
+            completed_marker.display()
+        ));
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            agent_wait(
+                script.to_str().unwrap(),
+                &PaneId("wY:p7Z".to_string()),
+                "done",
+                10_000,
+                OnAbandon::KillChild,
+            ),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "expected the outer timeout to abandon agent_wait before the fake script's 1s sleep \
+             completed"
+        );
+
+        // Proving a negative means waiting out the full ceiling — generous on purpose (see
+        // `marker_appears_within`'s doc) so this doesn't flake under parallel test-suite load.
+        assert!(
+            !marker_appears_within(&completed_marker, Duration::from_secs(5)).await,
+            "OnAbandon::KillChild should have killed the herdr subprocess before its 1s sleep \
+             finished, but the completion marker appeared — it ran to completion instead"
+        );
+    }
+
+    /// TF-649 follow-up: the [`OnAbandon::KillChild`] test's negative control — confirms
+    /// [`OnAbandon::LeaveRunning`] (every pre-existing `agent_wait` call site) is unaffected by
+    /// this parameter's introduction: an abandoned call's child keeps running detached and
+    /// completes on its own, exactly as it did before `OnAbandon` existed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_wait_with_leave_running_lets_its_child_finish_when_abandoned() {
+        let capture_dir = tempfile::tempdir().unwrap();
+        let completed_marker = capture_dir.path().join("completed");
+        let (_dir, script) = write_fake_herdr_script(&format!(
+            r#"
+sleep 1
+touch "{}"
+echo '{{"result":{{}}}}'
+exit 0
+"#,
+            completed_marker.display()
+        ));
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            agent_wait(
+                script.to_str().unwrap(),
+                &PaneId("wY:p7Z".to_string()),
+                "idle",
+                10_000,
+                OnAbandon::LeaveRunning,
+            ),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "expected the outer timeout to abandon agent_wait before the fake script's 1s sleep \
+             completed"
+        );
+
+        assert!(
+            marker_appears_within(&completed_marker, Duration::from_secs(5)).await,
+            "OnAbandon::LeaveRunning should leave the herdr subprocess running detached — \
+             expected it to finish its 1s sleep on its own and write the completion marker"
         );
     }
 
