@@ -797,11 +797,16 @@ async fn resolve_validated_agent_command(
 /// redraws the terminal; `implement_many` (concurrent multi-issue, TF-622) passes a no-op, since
 /// several of its futures can be mid-flight at once and none of them owns the one shared
 /// terminal safely.
+///
+/// `notify` is forwarded to [`spawn_tab_close_when_agent_is_done`] (TF-653) — the channel
+/// `event_loop` drains each tick to surface a `Status::Ok` once that background watcher actually
+/// closes this issue's tab, so "the tab is gone" never has to be read as "something broke".
 async fn implement_one(
     herdr_bin: &str,
     client: &herdr_linear::LinearClient,
     issue: &herdr_linear::Issue,
     command: &plugin::implement::ValidatedAgentCommand,
+    notify: &tokio::sync::mpsc::UnboundedSender<plugin::app::Status>,
     mut on_prompt_attempt: impl FnMut(u32, u32) + Send,
 ) -> ImplementOutcome {
     let cwd = plugin::host::resolve_cwd();
@@ -897,7 +902,12 @@ async fn implement_one(
         ));
     }
 
-    spawn_tab_close_when_agent_is_done(herdr_bin.to_string(), created_tab);
+    spawn_tab_close_when_agent_is_done(
+        herdr_bin.to_string(),
+        issue.identifier.clone(),
+        created_tab,
+        notify.clone(),
+    );
 
     if warnings.is_empty() {
         ImplementOutcome::Started("tab opened, agent started, set to In Progress.".to_string())
@@ -915,6 +925,16 @@ async fn implement_one(
 /// closed one out from under a still-working agent.
 const AGENT_DONE_WAIT_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000; // 24h
 
+/// Status banner shown once [`close_tab_once_agent_is_done`] (TF-649) actually closes a tab —
+/// the only user-visible sign that "the tab is gone" means "the agent finished", not "lost" or
+/// "crashed" (TF-653: two tabs vanished mid-session with no such signal, which led to re-running
+/// an already-finished implementation). Split out as a pure function, mirroring
+/// [`prompt_attempt_status`] above, purely so the wording is unit-testable without a channel or
+/// background task in the loop.
+fn tab_auto_closed_status(identifier: &str) -> plugin::app::Status {
+    plugin::app::Status::Ok(format!("{identifier}: agent finished, tab closed."))
+}
+
 /// TF-649: once [`implement_one`]'s prompt has landed, waits for that issue's agent to reach
 /// herdr's "done" status, then closes its tab — cleaning up the leftover idle tab that would
 /// otherwise sit around after every implement run. Always called through
@@ -928,7 +948,9 @@ const AGENT_DONE_WAIT_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000; // 24h
 /// `herdr_cli.rs`) all leave the tab exactly as it is, on the theory that a possibly still-useful
 /// (or failed) agent's output must never silently vanish. A `tab_close` failure afterwards
 /// (already closed, herdr restarted mid-wait, ...) is swallowed too — there is nothing left for
-/// this task to usefully do at that point.
+/// this task to usefully do at that point. Neither fail-open branch sends anything through
+/// `notify` (TF-653): a notice on either would falsely claim "finished" for a tab that's either
+/// still working or still open because closing it failed.
 ///
 /// Waits with [`plugin::herdr_cli::OnAbandon::KillChild`], not the
 /// [`plugin::herdr_cli::OnAbandon::LeaveRunning`] every other `agent_wait` call in this codebase
@@ -937,10 +959,17 @@ const AGENT_DONE_WAIT_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000; // 24h
 /// `herdr agent wait` process running would let it survive the plugin process itself for up to
 /// [`AGENT_DONE_WAIT_TIMEOUT_MS`]'s full 24h — see [`plugin::herdr_cli::OnAbandon`]'s doc for the
 /// underlying mechanism.
+///
+/// `identifier` and `notify` are TF-653 additions: once `tab_close` actually succeeds, this
+/// sends [`tab_auto_closed_status`] through `notify` so `event_loop` can surface it — a
+/// `send` on an already-dropped receiver (the plugin quit) is silently ignored, same fail-open
+/// spirit as everything else in this function.
 async fn close_tab_once_agent_is_done(
     herdr_bin: &str,
+    identifier: &str,
     tab: &plugin::herdr_cli::TabCreated,
     timeout_ms: u64,
+    notify: &tokio::sync::mpsc::UnboundedSender<plugin::app::Status>,
 ) {
     if let Err(err) = plugin::herdr_cli::agent_wait(
         herdr_bin,
@@ -965,7 +994,10 @@ async fn close_tab_once_agent_is_done(
              ({err})",
             tab.root_pane_id
         );
+        return;
     }
+
+    let _ = notify.send(tab_auto_closed_status(identifier));
 }
 
 /// Fire-and-forget wrapper around [`close_tab_once_agent_is_done`] (TF-649): detaches it onto the
@@ -979,9 +1011,25 @@ async fn close_tab_once_agent_is_done(
 /// before the agent finishes, tokio drops this task along with the rest of the runtime on exit:
 /// no cleanup hook, no panic, just a task that silently stops existing (see TF-649's "out of
 /// scope" on guaranteed cleanup across plugin/herdr-server restarts).
-fn spawn_tab_close_when_agent_is_done(herdr_bin: String, tab: plugin::herdr_cli::TabCreated) {
+///
+/// `identifier` and `notify` (TF-653) are forwarded verbatim to [`close_tab_once_agent_is_done`];
+/// `notify` is an owned clone rather than a borrow because this closure must be `'static` to
+/// satisfy `tokio::spawn`.
+fn spawn_tab_close_when_agent_is_done(
+    herdr_bin: String,
+    identifier: String,
+    tab: plugin::herdr_cli::TabCreated,
+    notify: tokio::sync::mpsc::UnboundedSender<plugin::app::Status>,
+) {
     tokio::spawn(async move {
-        close_tab_once_agent_is_done(&herdr_bin, &tab, AGENT_DONE_WAIT_TIMEOUT_MS).await;
+        close_tab_once_agent_is_done(
+            &herdr_bin,
+            &identifier,
+            &tab,
+            AGENT_DONE_WAIT_TIMEOUT_MS,
+            &notify,
+        )
+        .await;
     });
 }
 
@@ -1303,6 +1351,7 @@ async fn start_implementation(
     app: &mut plugin::app::App,
     client: &herdr_linear::LinearClient,
     issue: herdr_linear::Issue,
+    notify: &tokio::sync::mpsc::UnboundedSender<plugin::app::Status>,
 ) {
     let herdr_bin = plugin::herdr_cli::herdr_bin();
     let command = match resolve_validated_agent_command(&herdr_bin).await {
@@ -1315,14 +1364,23 @@ async fn start_implementation(
             return;
         }
     };
-    let outcome = implement_one(&herdr_bin, client, &issue, &command, |attempt, attempts| {
-        if let Some(status) = prompt_attempt_status(&issue.identifier, attempt, attempts) {
-            app.set_status(status);
-            if let Err(err) = terminal.draw(|frame| plugin::ui::draw(frame, app)) {
-                tracing::debug!("start_implementation: mid-flight progress redraw failed ({err})");
+    let outcome = implement_one(
+        &herdr_bin,
+        client,
+        &issue,
+        &command,
+        notify,
+        |attempt, attempts| {
+            if let Some(status) = prompt_attempt_status(&issue.identifier, attempt, attempts) {
+                app.set_status(status);
+                if let Err(err) = terminal.draw(|frame| plugin::ui::draw(frame, app)) {
+                    tracing::debug!(
+                        "start_implementation: mid-flight progress redraw failed ({err})"
+                    );
+                }
             }
-        }
-    })
+        },
+    )
     .await;
     match outcome {
         ImplementOutcome::Started(message) => {
@@ -1432,12 +1490,13 @@ async fn implement_many(
     client: &herdr_linear::LinearClient,
     issues: Vec<herdr_linear::Issue>,
     command: &plugin::implement::ValidatedAgentCommand,
+    notify: &tokio::sync::mpsc::UnboundedSender<plugin::app::Status>,
 ) -> Vec<(String, ImplementOutcome)> {
     let requests = issues.into_iter().map(|issue| async move {
         let identifier = issue.identifier.clone();
         // No progress redraw here — see `implement_one`'s doc on why the concurrent path passes
         // a no-op.
-        let outcome = implement_one(herdr_bin, client, &issue, command, |_, _| {}).await;
+        let outcome = implement_one(herdr_bin, client, &issue, command, notify, |_, _| {}).await;
         Ok::<_, herdr_linear::Error>((identifier, outcome))
     });
     client
@@ -1464,6 +1523,7 @@ async fn start_implementation_many(
     app: &mut plugin::app::App,
     client: &herdr_linear::LinearClient,
     issues: Vec<herdr_linear::Issue>,
+    notify: &tokio::sync::mpsc::UnboundedSender<plugin::app::Status>,
 ) -> bool {
     let herdr_bin = plugin::herdr_cli::herdr_bin();
     let total = issues.len();
@@ -1485,7 +1545,7 @@ async fn start_implementation_many(
         }
     };
 
-    let results = implement_many(&herdr_bin, client, issues, &command).await;
+    let results = implement_many(&herdr_bin, client, issues, &command, notify).await;
 
     let (status, all_started) = summarize_many(total, results);
     app.set_status(status);
@@ -1697,7 +1757,22 @@ async fn event_loop(
         std::env::var("SSH_TTY").ok().as_deref(),
     );
 
+    // TF-653: fed by `spawn_tab_close_when_agent_is_done`'s background watchers (TF-649), one
+    // clone per implement call — `event_loop` is the only place `App::set_status` can be called
+    // from, so this is how a detached `tokio::spawn`ed task gets a status banner onto the
+    // screen at all.
+    let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel::<plugin::app::Status>();
+
     loop {
+        // Drained before the draw below so a tab that auto-closed while this loop was blocked
+        // on `crossterm::event::poll` shows up in the very next frame, not one frame later.
+        // `try_recv` never blocks; if two notices land in the same ~200ms poll window, only the
+        // last survives — an accepted tradeoff for a transient banner, same class as every other
+        // `set_status` overwrite already in this codebase.
+        while let Ok(status) = notify_rx.try_recv() {
+            app.set_status(status);
+        }
+
         terminal.draw(|frame| plugin::ui::draw(frame, app))?;
 
         if crossterm::event::poll(std::time::Duration::from_millis(200))? {
@@ -1849,7 +1924,10 @@ async fn event_loop(
                                 )));
                                 terminal.draw(|frame| plugin::ui::draw(frame, app))?;
                                 match client.as_ref() {
-                                    Some(c) => start_implementation(terminal, app, c, issue).await,
+                                    Some(c) => {
+                                        start_implementation(terminal, app, c, issue, &notify_tx)
+                                            .await
+                                    }
                                     None => app.set_status(plugin::app::Status::Error(format!(
                                         "{}: not connected to Linear yet — try again.",
                                         issue.identifier
@@ -1873,7 +1951,8 @@ async fn event_loop(
                                 match client.as_ref() {
                                     Some(c) => {
                                         let all_started =
-                                            start_implementation_many(app, c, issues).await;
+                                            start_implementation_many(app, c, issues, &notify_tx)
+                                                .await;
                                         if should_clear_marks_after_implementing_many(all_started) {
                                             app.clear_marks();
                                         }
@@ -2608,6 +2687,16 @@ exit 1
                  attempt 3 of 3…"
                     .to_string()
             ))
+        );
+    }
+
+    #[test]
+    fn tab_auto_closed_status_names_the_issue_and_says_what_happened() {
+        // TF-653: this exact wording is the whole fix — it's the only thing standing between
+        // "the tab is gone" reading as "finished" instead of "lost".
+        assert_eq!(
+            tab_auto_closed_status("TF-641"),
+            plugin::app::Status::Ok("TF-641: agent finished, tab closed.".to_string())
         );
     }
 
@@ -3500,12 +3589,14 @@ esac
         let client = herdr_linear::LinearClient::new("lin_api_test_key").unwrap();
         let issue = sample_issue("TF-579");
         let command = plugin::implement::ValidatedAgentCommand::parse("hr".to_string()).unwrap();
+        let (notify_tx, _notify_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let outcome = implement_one(
             script.to_str().unwrap(),
             &client,
             &issue,
             &command,
+            &notify_tx,
             |_, _| {},
         )
         .await;
@@ -3535,12 +3626,14 @@ esac
         let client = herdr_linear::LinearClient::new("lin_api_test_key").unwrap();
         let issue = sample_issue("TF-579");
         let command = plugin::implement::ValidatedAgentCommand::parse("hr".to_string()).unwrap();
+        let (notify_tx, _notify_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let outcome = implement_one(
             script.to_str().unwrap(),
             &client,
             &issue,
             &command,
+            &notify_tx,
             |_, _| {},
         )
         .await;
@@ -3589,12 +3682,14 @@ esac
         );
         let issue = sample_issue("TF-579");
         let command = plugin::implement::ValidatedAgentCommand::parse("hr".to_string()).unwrap();
+        let (notify_tx, _notify_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let outcome = implement_one(
             script.to_str().unwrap(),
             &client,
             &issue,
             &command,
+            &notify_tx,
             |_, _| {},
         )
         .await;
@@ -3674,12 +3769,14 @@ esac
         ));
         let issue = sample_issue("TF-579");
         let command = plugin::implement::ValidatedAgentCommand::parse("hr".to_string()).unwrap();
+        let (notify_tx, _notify_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let outcome = implement_one(
             script.to_str().unwrap(),
             &client,
             &issue,
             &command,
+            &notify_tx,
             |_, _| {},
         )
         .await;
@@ -3805,12 +3902,14 @@ esac
         let command = plugin::implement::ValidatedAgentCommand::parse("hr".to_string()).unwrap();
         let seen_attempts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen_attempts_for_callback = std::sync::Arc::clone(&seen_attempts);
+        let (notify_tx, _notify_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let outcome = implement_one(
             script.to_str().unwrap(),
             &client,
             &issue,
             &command,
+            &notify_tx,
             move |attempt, attempts| {
                 seen_attempts_for_callback
                     .lock()
@@ -3880,12 +3979,22 @@ esac
         .await
         .expect("tab_create should succeed");
 
-        close_tab_once_agent_is_done(script.to_str().unwrap(), &tab, 5_000).await;
+        let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel();
+        close_tab_once_agent_is_done(script.to_str().unwrap(), "TF-649", &tab, 5_000, &notify_tx)
+            .await;
 
         let captured = std::fs::read_to_string(&close_args_file)
             .expect("close_tab_once_agent_is_done should have closed the tab");
         let args: Vec<&str> = captured.lines().collect();
         assert_eq!(args, vec!["tab", "close", "t1"]);
+
+        // TF-653: closing the tab must be paired with a notice `event_loop` can turn into a
+        // status banner — otherwise this is exactly TF-641/TF-642's silent-disappearance bug.
+        assert_eq!(
+            notify_rx.try_recv(),
+            Ok(tab_auto_closed_status("TF-649")),
+            "a successful auto-close must notify so the plugin can show it happened"
+        );
     }
 
     #[cfg(unix)]
@@ -3930,11 +4039,19 @@ esac
         // `agent_not_found` code (which would poll-retry) nor a missing-`result` body (which
         // `next_retry_budget_ms` retries) — see `herdr_cli.rs`'s retry-classification tests. So
         // this exercises the fail-open path without needing to burn the full timeout budget.
-        close_tab_once_agent_is_done(script.to_str().unwrap(), &tab, 5_000).await;
+        let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel();
+        close_tab_once_agent_is_done(script.to_str().unwrap(), "TF-649", &tab, 5_000, &notify_tx)
+            .await;
 
         assert!(
             !close_marker.exists(),
             "tab close must never run once agent_wait has failed (fail-open, TF-649)"
+        );
+        // TF-653: the fail-open path must stay silent — a notice here would falsely claim
+        // "finished" for a tab that's actually still open because nothing closed it.
+        assert!(
+            notify_rx.try_recv().is_err(),
+            "agent_wait failing must not send an auto-closed notice"
         );
     }
 
@@ -3982,7 +4099,15 @@ esac
         // an `.await` point, or a `#[tokio::test]` failure from a panicking task) is the
         // assertion: a `tab_close` error after a successful `agent_wait` must be swallowed, not
         // propagated or panicked on.
-        close_tab_once_agent_is_done(script.to_str().unwrap(), &tab, 5_000).await;
+        let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel();
+        close_tab_once_agent_is_done(script.to_str().unwrap(), "TF-649", &tab, 5_000, &notify_tx)
+            .await;
+        // TF-653: `tab_close` failing must stay silent too — the tab is still open, so a
+        // "finished, tab closed" notice would be actively wrong.
+        assert!(
+            notify_rx.try_recv().is_err(),
+            "a failed tab_close must not send an auto-closed notice"
+        );
     }
 
     /// Writes a fake `herdr` handling exactly the calls [`implement_many`] drives per issue up to
@@ -4089,11 +4214,18 @@ esac
             .map(|i| sample_issue(&format!("TF-{i}")))
             .collect();
         let command = plugin::implement::ValidatedAgentCommand::parse("hr".to_string()).unwrap();
+        let (notify_tx, _notify_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let started = std::time::Instant::now();
         let results = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            implement_many(script.to_str().unwrap(), &client, issues, &command),
+            implement_many(
+                script.to_str().unwrap(),
+                &client,
+                issues,
+                &command,
+                &notify_tx,
+            ),
         )
         .await
         .expect("implement_many hung");

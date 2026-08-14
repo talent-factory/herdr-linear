@@ -68,6 +68,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mid-flight at once and none of them owns the one shared terminal safely, so it's unchanged. This
   does not change the resend/confirmation logic or its timing budgets, only what's visible while
   it runs (TF-650)
+- TF-649's leftover-tab auto-close now tells the plugin when it actually closes a tab, instead of
+  doing so silently. Two tabs vanished mid-implement with the agent still visibly working, before
+  the user had said `/exit`; with no on-screen signal to tell "finished" from "lost", one of the
+  two was assumed dead and re-run — on already-completed work. `close_tab_once_agent_is_done` (and
+  `spawn_tab_close_when_agent_is_done`, its `tokio::spawn` wrapper) now take the issue identifier
+  plus an `mpsc::UnboundedSender<plugin::app::Status>`; on a successful `tab_close` only, it sends
+  the new pure `tab_auto_closed_status(identifier)` — `"{identifier}: agent finished, tab
+  closed."` — through it. `event_loop` owns the matching receiver and drains it (non-blocking
+  `try_recv`, so it can never stall the render/input loop) once per tick, before `terminal.draw`,
+  turning any pending notice into a `Status` banner the same way every other action already
+  reports through `App::set_status`. Neither existing fail-open branch (`agent_wait` timing out,
+  `tab_close` itself failing) sends anything — a notice on either would falsely claim "finished"
+  for a tab that's still open. The channel is threaded through `implement_one`/`implement_many`/
+  `start_implementation`/`start_implementation_many`, all of which gain a required parameter — a
+  breaking change for any downstream consumer of the `plugin` feature, matching this codebase's
+  established precedent for threading a new cross-cutting parameter through the implement-flow
+  call chain (see TF-650's `on_attempt` above). Investigated and explicitly dropped from this
+  ticket's scope: distinguishing a clean exit from a crash before auto-closing — verified via
+  `herdr api schema --json` that herdr exposes no exit code/signal anywhere in its socket API
+  (`AgentStatus` is a 5-value screen-content heuristic, `PaneInfo`/the `pane_exited` event carry
+  neither), so there is currently no reliable, non-heuristic way to make that distinction; tracked
+  separately as TF-654, blocked on herdr (TF-653)
 - `HERDR_LINEAR_LOG_FILE`-based logging (`main.rs::init_tracing`) now actually emits `debug!`-level
   records — every `tracing::debug!` call this crate has ever shipped (`send_prompt_until_visible_with`'s
   attempt-failure logging, `flush_buffered_quit`'s discarded-key count, and the mid-flight
