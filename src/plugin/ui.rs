@@ -2,8 +2,8 @@
 //! message with a retry hint, or a two-pane issue list + detail view.
 
 use crate::plugin::app::{
-    matching_issue_indices, App, HelpOverlayState, HelpTab, Screen, Status, ViewKind, ViewState,
-    MENU_OPTIONS,
+    matching_issue_indices, ActivePreset, App, HelpOverlayState, HelpTab, Screen, Status, ViewKind,
+    ViewState, MENU_OPTIONS,
 };
 use crate::Issue;
 use ratatui::{
@@ -18,7 +18,9 @@ use unicode_width::UnicodeWidthChar;
 pub fn draw(frame: &mut Frame, app: &App) {
     match app.screen() {
         Screen::Menu { selected } => draw_menu(frame, *selected),
-        Screen::View(kind, view_state) => draw_view(frame, *kind, view_state, app.status()),
+        Screen::View(kind, view_state) => {
+            draw_view(frame, *kind, view_state, app.status(), app.active_preset())
+        }
     }
     if let Some(overlay) = app.help_overlay() {
         draw_help_overlay(frame, overlay);
@@ -102,7 +104,13 @@ fn status_banner_height(text: &str, width: u16) -> u16 {
     estimated.clamp(STATUS_BANNER_MIN_HEIGHT, STATUS_BANNER_MAX_HEIGHT)
 }
 
-fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState, status: Option<&Status>) {
+fn draw_view(
+    frame: &mut Frame,
+    kind: ViewKind,
+    view_state: &ViewState,
+    status: Option<&Status>,
+    active_preset: Option<&ActivePreset>,
+) {
     match view_state {
         ViewState::Loading => {
             let paragraph = Paragraph::new("Loading issues...")
@@ -169,10 +177,18 @@ fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState, status: 
             // `▏` marks the live cursor position while editing, so it's visually
             // distinct from a confirmed-but-inactive filter shown without one.
             let list_title = {
+                // TF-647: the active named filter preset's name, folded into the label
+                // right next to the view name — the same visibility the `/`-filter query
+                // text already gets below, just for the *other* way a fetch's query can
+                // differ from the plain (unnamed, never shown) `default_query`.
+                let label = match active_preset {
+                    Some(preset) => format!("{} [{}]", kind.label(), preset.name),
+                    None => kind.label().to_string(),
+                };
                 let base = match (filter.editing, filter.query.is_empty()) {
-                    (true, _) => format!("{} — filter: {}▏", kind.label(), filter.query),
-                    (false, true) => kind.label().to_string(),
-                    (false, false) => format!("{} — filter: {}", kind.label(), filter.query),
+                    (true, _) => format!("{label} — filter: {}▏", filter.query),
+                    (false, true) => label,
+                    (false, false) => format!("{label} — filter: {}", filter.query),
                 };
                 // TF-617 review fix: `matching_issue_indices` silently falls back to a
                 // free-text search for a recognized-but-malformed `key:value` term (e.g.
@@ -965,6 +981,17 @@ fn settings_lines_from(
         lines.push("project_overrides:".to_string());
         for (repo, project_id) in &summary.project_overrides {
             lines.push(format!("  {repo:<15} = {project_id}"));
+        }
+    }
+
+    // TF-647: named filter presets, in declaration order — mirrors project_overrides'
+    // list-or-"(none)" shape just above.
+    if summary.filter_presets.is_empty() {
+        lines.push("filter_presets: (none)".to_string());
+    } else {
+        lines.push("filter_presets:".to_string());
+        for preset in &summary.filter_presets {
+            lines.push(format!("  {:<15} = {}", preset.name, preset.query));
         }
     }
 
@@ -1968,6 +1995,56 @@ mod tests {
     }
 
     #[test]
+    fn shows_the_active_presets_name_in_the_list_title() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        app.set_active_preset(Some(ActivePreset {
+            index: 0,
+            name: "Urgent".to_string(),
+        }));
+
+        let text = rendered_text(&app);
+
+        assert!(text.contains("My Issues [Urgent]"));
+    }
+
+    #[test]
+    fn omits_the_preset_bracket_when_no_preset_is_active() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+
+        let text = rendered_text(&app);
+
+        assert!(text.contains("My Issues"));
+        // No `[...]` bracket directly appended to the title — `[ ]`/`[x]` multi-select
+        // markers on the issue rows themselves are unrelated and expected.
+        assert!(!text.contains("My Issues ["));
+    }
+
+    #[test]
+    fn shows_both_the_active_presets_name_and_the_live_filter_query() {
+        // TF-647 AC: presets are independent of the live `/`-filter — it still layers on
+        // top of whichever (preset or default_query) is active.
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        app.set_active_preset(Some(ActivePreset {
+            index: 0,
+            name: "Urgent".to_string(),
+        }));
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        for c in "eng".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        // Wider than the default 60 columns — "My Issues [Urgent] — filter: eng" doesn't
+        // fit the default-size list pane and the title would get truncated by the border.
+        let text = rendered_text_with_size(&app, 100, 20);
+
+        assert!(text.contains("My Issues [Urgent] — filter: eng"));
+    }
+
+    #[test]
     fn shows_the_confirmed_filter_query_without_a_cursor_marker() {
         let mut app = app_in_my_issues_view();
         app.set_issues(vec![sample_issue("ENG-1")]);
@@ -2388,6 +2465,7 @@ mod tests {
             editor: None,
             project_overrides: std::collections::BTreeMap::new(),
             default_query: None,
+            filter_presets: Vec::new(),
         };
 
         let lines = settings_lines_from(&summary, false).join("\n");
@@ -2414,6 +2492,7 @@ mod tests {
             editor: None,
             project_overrides: std::collections::BTreeMap::new(),
             default_query: None,
+            filter_presets: Vec::new(),
         };
 
         let unset = settings_lines_from(&summary, false).join("\n");
@@ -2438,6 +2517,10 @@ mod tests {
             editor: Some("vim".to_string()),
             project_overrides,
             default_query: Some("priority:>=2".to_string()),
+            filter_presets: vec![crate::plugin::config::FilterPreset {
+                name: "Urgent".to_string(),
+                query: "priority:>=2".to_string(),
+            }],
         };
 
         let lines = settings_lines_from(&summary, false).join("\n");
@@ -2451,6 +2534,28 @@ mod tests {
         assert!(lines.contains("default_query    = priority:>=2"));
         assert!(lines.contains("herdr-linear"));
         assert!(lines.contains("proj-1"));
+        assert!(lines.contains("filter_presets:"));
+        assert!(lines.contains("Urgent"));
+        assert!(lines.contains("priority:>=2"));
+    }
+
+    #[test]
+    fn settings_lines_from_found_shows_none_for_no_filter_presets() {
+        let summary = crate::plugin::config::ResolvedConfigSummary {
+            path: "/fake/config.toml".to_string(),
+            status: crate::plugin::config::ConfigFileStatus::Found,
+            api_key_set: true,
+            agent_command: None,
+            team_id: None,
+            editor: None,
+            project_overrides: std::collections::BTreeMap::new(),
+            default_query: None,
+            filter_presets: Vec::new(),
+        };
+
+        let lines = settings_lines_from(&summary, false).join("\n");
+
+        assert!(lines.contains("filter_presets: (none)"));
     }
 
     #[test]
@@ -2464,6 +2569,7 @@ mod tests {
             editor: None,
             project_overrides: std::collections::BTreeMap::new(),
             default_query: None,
+            filter_presets: Vec::new(),
         };
 
         let lines = settings_lines_from(&summary, false).join("\n");

@@ -331,6 +331,19 @@ pub struct HelpOverlayState {
     pub(crate) scroll: u16,
 }
 
+/// A currently active named filter preset (TF-647): its position in the configured
+/// `[[filter_presets]]` list (`index` — used to re-resolve the preset's query fresh from
+/// `config.toml` on every fetch, see `main.rs`'s `resolved_query_for`, rather than trusting
+/// a value cached at cycle time) and its `name` (used only for display — the list title,
+/// mirroring how the live `/`-filter query is already shown there). Distinct from
+/// `default_query`, which has no name and is never shown; `None` (no `ActivePreset`) means
+/// `default_query` (or no query at all) is in effect, exactly as before this feature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivePreset {
+    pub index: usize,
+    pub name: String,
+}
+
 /// The main application state container.
 ///
 /// Manages transitions between the menu and views, and navigation within a loaded
@@ -343,6 +356,12 @@ pub struct App {
     /// The help overlay's state, if open (`?` — TF-585). A pure rendering layer over
     /// `screen`, never `Screen` itself — see [`Self::open_help_overlay`].
     help_overlay: Option<HelpOverlayState>,
+    /// The currently active named filter preset (TF-647), if any. Lives in parallel to
+    /// `screen` (like `status`) rather than nested inside `ViewState::Loaded` — a preset
+    /// is a cross-view, sticky setting (it applies to whichever view is entered next,
+    /// exactly like `default_query` already does), and nesting it would mean threading it
+    /// through `set_issues`'s ~90 existing call sites for no benefit.
+    active_preset: Option<ActivePreset>,
 }
 
 impl App {
@@ -352,6 +371,7 @@ impl App {
             screen: Screen::Menu { selected: 0 },
             status: None,
             help_overlay: None,
+            active_preset: None,
         }
     }
 
@@ -712,6 +732,48 @@ impl App {
         self.status = None;
     }
 
+    /// The currently active named filter preset (TF-647), if any. `None` means
+    /// `default_query` (or no query at all) is in effect — unchanged pre-TF-647 behavior.
+    pub fn active_preset(&self) -> Option<&ActivePreset> {
+        self.active_preset.as_ref()
+    }
+
+    /// Sets the currently active filter preset directly. Used by `main.rs`'s
+    /// `resolved_query_for` to fall back to `None` when the preset at the stored `index`
+    /// no longer exists (`config.toml`'s `[[filter_presets]]` list shrank since it was
+    /// activated) — a targeted correction, not a general-purpose setter for cycling (see
+    /// [`Self::cycle_active_preset`] for that).
+    pub fn set_active_preset(&mut self, preset: Option<ActivePreset>) {
+        self.active_preset = preset;
+    }
+
+    /// Cycles to the next configured filter preset (TF-647): `None` (`default_query`) →
+    /// preset 0 → preset 1 → … → the last preset → back to `None` → preset 0 again — a
+    /// full loop that always includes a "back to baseline" stop, so there's an in-app way
+    /// back to `default_query` alone without editing `config.toml` or restarting.
+    ///
+    /// `presets` is the freshly-read `[[filter_presets]]` list (`main.rs`'s
+    /// `event_loop` reads `config.toml` right before calling this, in response to the `p`
+    /// key) — an empty list always resets to (and stays at) `None`, which is exactly
+    /// TF-647's "no presets configured → unchanged `default_query`-only behavior"
+    /// acceptance criterion. Takes the resolved presets themselves (not just a count) so
+    /// the new `ActivePreset`'s `name` can be filled in immediately, with no placeholder.
+    pub fn cycle_active_preset(&mut self, presets: &[crate::plugin::config::FilterPreset]) {
+        if presets.is_empty() {
+            self.active_preset = None;
+            return;
+        }
+        let next_index = match &self.active_preset {
+            None => Some(0),
+            Some(active) if active.index + 1 < presets.len() => Some(active.index + 1),
+            Some(_) => None,
+        };
+        self.active_preset = next_index.map(|index| ActivePreset {
+            index,
+            name: presets[index].name.clone(),
+        });
+    }
+
     /// The help overlay's state, if open. `None` means closed — the underlying screen
     /// renders exactly as it would without this feature.
     pub fn help_overlay(&self) -> Option<&HelpOverlayState> {
@@ -818,6 +880,14 @@ pub enum Action {
     /// `main.rs`'s `event_loop`, mirroring the existing `OpenInBrowser` → `open::that`
     /// pattern.
     OpenConfig(PathBuf),
+    /// `p` was pressed in a view (TF-647): cycle to the next configured named filter
+    /// preset and refetch with it. Unlike every other `Action`, `handle_key` performs
+    /// *no* state mutation before returning this one — cycling needs the current
+    /// `[[filter_presets]]` list from `config.toml`, and `handle_key` must stay pure/
+    /// I/O-free (see its own doc comment). `main.rs`'s `event_loop` does the actual work:
+    /// read `config.toml`, call [`App::cycle_active_preset`], then [`App::retry`] +
+    /// refetch — a no-op when no presets are configured (TF-647's AC).
+    CyclePreset,
 }
 
 /// Map a key press to an [`Action`], applying any state change (menu navigation,
@@ -989,6 +1059,7 @@ pub fn handle_key(
                 None
             }
         }
+        KeyCode::Char('p') => Some(Action::CyclePreset),
         _ => None,
     }
 }
@@ -1978,6 +2049,115 @@ mod tests {
         app.retry();
 
         assert_eq!(app.status(), None);
+    }
+
+    fn sample_preset(name: &str, query: &str) -> crate::plugin::config::FilterPreset {
+        crate::plugin::config::FilterPreset {
+            name: name.to_string(),
+            query: query.to_string(),
+        }
+    }
+
+    #[test]
+    fn cycle_active_preset_is_a_no_op_when_no_presets_are_configured() {
+        let mut app = App::new();
+
+        app.cycle_active_preset(&[]);
+
+        assert_eq!(app.active_preset(), None);
+    }
+
+    #[test]
+    fn cycle_active_preset_resets_to_none_when_the_preset_list_becomes_empty() {
+        let mut app = App::new();
+        app.cycle_active_preset(&[sample_preset("Urgent", "priority:>=2")]);
+        assert!(app.active_preset().is_some());
+
+        app.cycle_active_preset(&[]);
+
+        assert_eq!(app.active_preset(), None);
+    }
+
+    #[test]
+    fn cycle_active_preset_loops_through_every_preset_then_back_to_none() {
+        let mut app = App::new();
+        let presets = [
+            sample_preset("Urgent", "priority:>=2"),
+            sample_preset("In Review", "state:\"In Review\""),
+        ];
+        assert_eq!(app.active_preset(), None);
+
+        app.cycle_active_preset(&presets);
+        assert_eq!(
+            app.active_preset(),
+            Some(&ActivePreset {
+                index: 0,
+                name: "Urgent".to_string(),
+            })
+        );
+
+        app.cycle_active_preset(&presets);
+        assert_eq!(
+            app.active_preset(),
+            Some(&ActivePreset {
+                index: 1,
+                name: "In Review".to_string(),
+            })
+        );
+
+        app.cycle_active_preset(&presets);
+        assert_eq!(app.active_preset(), None);
+
+        app.cycle_active_preset(&presets);
+        assert_eq!(
+            app.active_preset(),
+            Some(&ActivePreset {
+                index: 0,
+                name: "Urgent".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn set_active_preset_overrides_directly() {
+        let mut app = App::new();
+        app.cycle_active_preset(&[sample_preset("Urgent", "priority:>=2")]);
+
+        app.set_active_preset(None);
+
+        assert_eq!(app.active_preset(), None);
+    }
+
+    #[test]
+    fn p_key_in_a_loaded_view_returns_cycle_preset_without_mutating_app_state() {
+        let mut app = app_in_my_issues_view();
+        let before = app.active_preset().cloned();
+
+        let action = handle_key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
+
+        assert_eq!(action, Some(Action::CyclePreset));
+        assert_eq!(app.active_preset().cloned(), before);
+    }
+
+    #[test]
+    fn p_key_on_the_menu_does_nothing() {
+        let mut app = App::new();
+
+        let action = handle_key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
+
+        assert_eq!(action, None);
+    }
+
+    #[test]
+    fn p_key_while_filtering_is_captured_as_filter_text_not_a_preset_cycle() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        app.start_filtering();
+
+        let action = handle_key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
+
+        assert_eq!(action, None);
+        assert_eq!(app.active_preset(), None);
     }
 
     #[test]

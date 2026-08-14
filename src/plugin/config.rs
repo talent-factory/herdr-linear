@@ -50,6 +50,42 @@ struct ConfigFile {
     /// symmetry with that field, not because it changes behavior.
     #[serde(default)]
     default_query: Option<String>,
+    /// Named query-DSL presets (TF-647): an alternative to (not a replacement for)
+    /// `default_query` above — each entry's `query` uses the exact same grammar and is
+    /// applied through the exact same mechanism (server-side filter terms + client-side
+    /// `sort:`), but multiple can be configured and cycled through at runtime via the `p`
+    /// key, rather than requiring a `config.toml` edit + `r` to switch. Declared as
+    /// `[[filter_presets]]` array-of-tables rather than a `[filter_presets]` map so
+    /// declaration order is preserved without depending on the `toml` crate's
+    /// `preserve_order` feature (not enabled here) — cycling needs a stable, predictable,
+    /// user-authored order. `#[serde(default)]` so a missing `filter_presets` key
+    /// deserializes to an empty `Vec` rather than an error — see [`resolve_filter_presets`]
+    /// for how "no presets configured" (AC: unchanged behavior) falls out of that.
+    #[serde(default)]
+    filter_presets: Vec<FilterPresetEntry>,
+}
+
+/// Raw `[[filter_presets]]` deserialize target — see [`ConfigFile::filter_presets`].
+/// `#[serde(default)]` on both fields so a malformed entry (missing `name` or `query`)
+/// deserializes to an empty string rather than a hard TOML error; [`resolve_filter_presets`]
+/// then drops any entry where either trimmed field is empty, the same "blank means unset"
+/// rule `default_query` already uses.
+#[derive(serde::Deserialize)]
+struct FilterPresetEntry {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    query: String,
+}
+
+/// A single named filter preset (TF-647), resolved and trimmed from `config.toml`'s
+/// `[[filter_presets]]` entries — see [`resolve_filter_presets`]. `index`-free by design:
+/// callers (`main.rs`) address a preset by its position in the `Vec` this is returned in,
+/// which is also what [`crate::plugin::app::ActivePreset::index`] refers back into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilterPreset {
+    pub name: String,
+    pub query: String,
 }
 
 /// Reads and parses `config_dir/config.toml`, if `config_dir` is given and the file
@@ -191,6 +227,36 @@ pub fn resolve_default_query(config_dir: Option<&Path>) -> Result<Option<String>
     Ok(default_query)
 }
 
+/// Resolve the configured named filter presets (TF-647): `config_dir/config.toml`'s
+/// `[[filter_presets]]` entries, in declaration order. An entry whose `name` or `query`
+/// is empty/whitespace-only is dropped — same "blank means unset" rule
+/// [`resolve_default_query`] uses, applied per-entry rather than to a single value.
+/// `Ok(vec![])` means "no presets configured" — everything downstream
+/// (`crate::plugin::app::App::cycle_active_preset`, `main.rs`'s `Action::CyclePreset`
+/// handling) treats that as a no-op, leaving `default_query`-only behavior fully
+/// unchanged (TF-647's AC). Pure function — callers own reading the real environment
+/// (see [`load_filter_presets`]).
+pub fn resolve_filter_presets(config_dir: Option<&Path>) -> Result<Vec<FilterPreset>> {
+    let presets = read_config_file(config_dir)?
+        .map(|file| filter_presets_from_entries(file.filter_presets))
+        .unwrap_or_default();
+    Ok(presets)
+}
+
+/// Drops any `[[filter_presets]]` entry whose `name` or `query` is empty/whitespace-only
+/// and unwraps the rest into [`FilterPreset`]. Shared by [`resolve_filter_presets`] and
+/// [`resolved_summary`] so the "blank means unset" rule can't drift between the two.
+fn filter_presets_from_entries(entries: Vec<FilterPresetEntry>) -> Vec<FilterPreset> {
+    entries
+        .into_iter()
+        .filter(|entry| !entry.name.trim().is_empty() && !entry.query.trim().is_empty())
+        .map(|entry| FilterPreset {
+            name: entry.name,
+            query: entry.query,
+        })
+        .collect()
+}
+
 /// Resolve a `team_id` default (TF-579): `config_dir/config.toml`'s `team_id` field, if
 /// set and non-empty. `Ok(None)` means "no default configured" (callers fall back to
 /// resolving the team from the workspace's team list — see
@@ -254,6 +320,9 @@ pub(crate) struct ResolvedConfigSummary {
     pub project_overrides: BTreeMap<String, String>,
     /// The resolved `default_query` (TF-617), or `None` if unset/empty.
     pub default_query: Option<String>,
+    /// The resolved named filter presets (TF-647), in declaration order — empty means
+    /// none configured. See [`resolve_filter_presets`].
+    pub filter_presets: Vec<FilterPreset>,
 }
 
 /// The `[start, end)` 0-based, end-exclusive line-index range that `contents`'s
@@ -376,6 +445,7 @@ pub(crate) fn resolved_summary(
             editor: None,
             project_overrides: BTreeMap::new(),
             default_query: None,
+            filter_presets: Vec::new(),
         },
         Ok(Some(file)) => {
             let has_file_key = file.api_key.as_deref().is_some_and(|key| !key.is_empty());
@@ -391,6 +461,7 @@ pub(crate) fn resolved_summary(
                 editor: file.editor.filter(|ed| !ed.trim().is_empty()),
                 project_overrides: file.project_overrides,
                 default_query: file.default_query.filter(|q| !q.trim().is_empty()),
+                filter_presets: filter_presets_from_entries(file.filter_presets),
             }
         }
         Err(e) => ResolvedConfigSummary {
@@ -402,6 +473,7 @@ pub(crate) fn resolved_summary(
             editor: None,
             project_overrides: BTreeMap::new(),
             default_query: None,
+            filter_presets: Vec::new(),
         },
     }
 }
@@ -439,6 +511,18 @@ pub fn load_default_query() -> Result<Option<String>> {
     resolve_default_query(config_dir.as_deref())
 }
 
+/// Resolve the configured filter presets (TF-647) from the real environment:
+/// `$HERDR_PLUGIN_CONFIG_DIR/config.toml`. Thin wrapper around [`resolve_filter_presets`] —
+/// kept for the same reason [`load_default_query`] is: every config key gets both a pure
+/// `resolve_*(config_dir)` and a real-env `load_*()` wrapper, even though `main.rs` rolls
+/// its own inline `HERDR_PLUGIN_CONFIG_DIR` lookup (for the same testability-via-injection
+/// reason `resolved_default_query`/`resolved_default_query_for` are split) rather than
+/// calling this directly.
+pub fn load_filter_presets() -> Result<Vec<FilterPreset>> {
+    let config_dir = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR").map(std::path::PathBuf::from);
+    resolve_filter_presets(config_dir.as_deref())
+}
+
 /// Resolve the `team_id` default (TF-579) from the real environment:
 /// `$HERDR_PLUGIN_CONFIG_DIR/config.toml`. Thin wrapper around
 /// [`resolve_team_id_override`]; called from
@@ -471,8 +555,8 @@ mod tests {
     use super::{
         api_key_value_line_range, config_path_hint, redact_api_key_value_lines,
         resolve_agent_command_override, resolve_api_key, resolve_default_query,
-        resolve_editor_override, resolve_project_id_override, resolve_team_id_override,
-        resolved_summary, ConfigFileStatus,
+        resolve_editor_override, resolve_filter_presets, resolve_project_id_override,
+        resolve_team_id_override, resolved_summary, ConfigFileStatus, FilterPreset,
     };
     use std::fs;
 
@@ -891,6 +975,103 @@ mod tests {
     }
 
     #[test]
+    fn reads_filter_presets_from_config_file_preserving_declaration_order() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.toml"),
+            r#"
+[[filter_presets]]
+name = "Urgent"
+query = "priority:>=2 sort:-priority"
+
+[[filter_presets]]
+name = "In Review"
+query = "state:\"In Review\""
+"#,
+        )
+        .unwrap();
+
+        let presets = resolve_filter_presets(Some(dir.path())).unwrap();
+
+        assert_eq!(
+            presets,
+            vec![
+                FilterPreset {
+                    name: "Urgent".to_string(),
+                    query: "priority:>=2 sort:-priority".to_string(),
+                },
+                FilterPreset {
+                    name: "In Review".to_string(),
+                    query: "state:\"In Review\"".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn returns_empty_vec_when_config_file_missing_for_filter_presets() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let presets = resolve_filter_presets(Some(dir.path())).unwrap();
+
+        assert!(presets.is_empty());
+    }
+
+    #[test]
+    fn returns_empty_vec_when_config_file_has_no_filter_presets() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.toml"), "api_key = \"lin_api_x\"\n").unwrap();
+
+        let presets = resolve_filter_presets(Some(dir.path())).unwrap();
+
+        assert!(presets.is_empty());
+    }
+
+    #[test]
+    fn drops_filter_preset_entries_with_empty_or_whitespace_name_or_query() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.toml"),
+            r#"
+[[filter_presets]]
+name = "   "
+query = "priority:>=2"
+
+[[filter_presets]]
+name = "No Query"
+query = ""
+
+[[filter_presets]]
+name = "Kept"
+query = "sort:-updated"
+"#,
+        )
+        .unwrap();
+
+        let presets = resolve_filter_presets(Some(dir.path())).unwrap();
+
+        assert_eq!(
+            presets,
+            vec![FilterPreset {
+                name: "Kept".to_string(),
+                query: "sort:-updated".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn errors_immediately_on_malformed_toml_for_filter_presets() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.toml"), "this is [invalid toml\n").unwrap();
+
+        let err = resolve_filter_presets(Some(dir.path())).unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("not valid TOML"));
+        assert!(message.contains(dir.path().to_str().unwrap()));
+    }
+
+    #[test]
     fn reads_team_id_from_config_file() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("config.toml"), "team_id = \"team-123\"\n").unwrap();
@@ -1049,7 +1230,8 @@ mod tests {
             dir.path().join("config.toml"),
             "api_key = \"lin_api_x\"\nagent_command = \"my-agent\"\nteam_id = \"team-123\"\neditor = \"nvim\"\n\
              default_query = \"priority:>=2\"\n\
-             [project_overrides]\n\"herdr-linear\" = \"proj-1\"\n",
+             [project_overrides]\n\"herdr-linear\" = \"proj-1\"\n\n\
+             [[filter_presets]]\nname = \"Urgent\"\nquery = \"priority:>=2\"\n",
         )
         .unwrap();
 
@@ -1064,6 +1246,13 @@ mod tests {
         assert_eq!(
             summary.project_overrides.get("herdr-linear"),
             Some(&"proj-1".to_string())
+        );
+        assert_eq!(
+            summary.filter_presets,
+            vec![FilterPreset {
+                name: "Urgent".to_string(),
+                query: "priority:>=2".to_string(),
+            }]
         );
     }
 

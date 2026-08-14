@@ -86,6 +86,11 @@ pub static KEYBINDINGS: &[KeyBinding] = &[
         context: BindingContext::View,
     },
     KeyBinding {
+        keys: "p",
+        action: "Cycle named filter preset (config.toml's [[filter_presets]])",
+        context: BindingContext::View,
+    },
+    KeyBinding {
         keys: "o",
         action: "Open selected issue in browser",
         context: BindingContext::View,

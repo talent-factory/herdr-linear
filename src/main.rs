@@ -144,22 +144,15 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
 /// the event loop) already clears status before triggering a fetch, so a stale banner
 /// from a previous failed load never lingers past the next retry/view-entry.
 ///
-/// Thin wrapper around [`resolved_default_query_for`], which takes `config_dir` as a
-/// parameter instead of reading `$HERDR_PLUGIN_CONFIG_DIR` here — the same pure-core/
-/// real-env-wrapper split `plugin::config::resolve_default_query`/`load_default_query`
-/// already use, and for the same reason `plugin::app::open_config_action` is split from
-/// its real-environment caller: it lets tests exercise this function's actual
-/// filters/sort/status-banner decisions against a real (tempdir) `config.toml` without
-/// mutating process-global environment state that every other test in this binary runs
-/// concurrently against.
-fn resolved_default_query(app: &mut plugin::app::App) -> plugin::query::ParsedQuery {
-    let config_dir = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR").map(std::path::PathBuf::from);
-    resolved_default_query_for(app, config_dir.as_deref())
-}
-
-/// The pure core of [`resolved_default_query`] — see its doc for the full behavior and
-/// rationale; this just takes `config_dir` as a parameter rather than reading the real
-/// environment.
+/// Takes `config_dir` as a parameter instead of reading `$HERDR_PLUGIN_CONFIG_DIR`
+/// directly — the same pure-core/real-env-wrapper split
+/// `plugin::config::resolve_default_query`/`load_default_query` already use, and for the
+/// same reason `plugin::app::open_config_action` is split from its real-environment
+/// caller: it lets tests exercise this function's actual filters/sort/status-banner
+/// decisions against a real (tempdir) `config.toml` without mutating process-global
+/// environment state that every other test in this binary runs concurrently against.
+/// [`resolved_query`] is the real-env wrapper (TF-647's entry point, folding in the
+/// active-preset check ahead of this `default_query`-only fallback).
 fn resolved_default_query_for(
     app: &mut plugin::app::App,
     config_dir: Option<&std::path::Path>,
@@ -186,6 +179,67 @@ fn resolved_default_query_for(
     }
 }
 
+/// Resolves the query to fetch issues with — the real-environment wrapper around
+/// [`resolved_query_for`], reading `$HERDR_PLUGIN_CONFIG_DIR` the same way
+/// [`resolved_default_query_for`]'s own (removed by TF-647, folded in here) real-env
+/// wrapper used to.
+fn resolved_query(app: &mut plugin::app::App) -> plugin::query::ParsedQuery {
+    let config_dir = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR").map(std::path::PathBuf::from);
+    resolved_query_for(app, config_dir.as_deref())
+}
+
+/// The pure core of [`resolved_query`] (TF-647): the active named filter preset
+/// (`app.active_preset()`) if one is set, otherwise the plain `default_query` —
+/// delegating to the unchanged [`resolved_default_query_for`] for that fallback, so
+/// TF-647's "no preset active → unchanged behavior" acceptance criterion holds by
+/// construction rather than by parallel-but-separate logic.
+///
+/// Always re-reads `config.toml` fresh (never trusts a query string cached at cycle
+/// time), so edits made via `c` are picked up on the very next fetch — exactly like
+/// `default_query` already does. A malformed `config.toml`, a preset whose query has
+/// unrecognized terms, or a preset removed from the config since it was activated all
+/// degrade to a status banner (mirroring [`resolved_default_query_for`]'s own error
+/// handling) rather than ever crashing or fetching with an undefined query.
+fn resolved_query_for(
+    app: &mut plugin::app::App,
+    config_dir: Option<&std::path::Path>,
+) -> plugin::query::ParsedQuery {
+    let Some(active) = app.active_preset().cloned() else {
+        return resolved_default_query_for(app, config_dir);
+    };
+
+    match plugin::config::resolve_filter_presets(config_dir) {
+        Ok(presets) => match presets.get(active.index) {
+            Some(preset) => {
+                let parsed = plugin::query::parse_query(&preset.query);
+                if !parsed.rejected.is_empty() {
+                    app.set_status(plugin::app::Status::Error(format!(
+                        "preset \"{}\" in config.toml: {} term(s) not recognized, ignored: {}",
+                        preset.name,
+                        parsed.rejected.len(),
+                        parsed.rejected.join(", ")
+                    )));
+                }
+                parsed
+            }
+            None => {
+                // The preset list shrank since this preset was activated (config.toml
+                // edited mid-session, e.g. via `c`) — fall back to `default_query` rather
+                // than fetching with an undefined query, same "adapt, don't crash" spirit
+                // every other config resolver here follows.
+                app.set_active_preset(None);
+                resolved_default_query_for(app, config_dir)
+            }
+        },
+        Err(err) => {
+            app.set_status(plugin::app::Status::Error(format!(
+                "filter presets in config.toml could not be applied: {err}"
+            )));
+            plugin::query::ParsedQuery::default()
+        }
+    }
+}
+
 /// Sorts `issues` by `sort_keys` (a no-op for an empty slice) and hands them to
 /// [`plugin::app::App::set_issues`] — the shared tail of every `load_issues` fetch arm,
 /// so `default_query`'s `sort:` terms (TF-617) apply identically regardless of which
@@ -200,25 +254,25 @@ fn apply_fetched_issues(
 }
 
 async fn load_issues(app: &mut plugin::app::App, client: &herdr_linear::LinearClient) {
-    let default_query = resolved_default_query(app);
-    let filter_terms = &default_query.filters;
+    let query = resolved_query(app);
+    let filter_terms = &query.filters;
 
     match app.current_view() {
         Some(plugin::app::ViewKind::MyIssues) => {
             match plugin::data::fetch_my_issues(client, filter_terms).await {
-                Ok(issues) => apply_fetched_issues(app, issues, &default_query.sort_keys),
+                Ok(issues) => apply_fetched_issues(app, issues, &query.sort_keys),
                 Err(err) => app.set_error(err.to_string()),
             }
         }
         Some(plugin::app::ViewKind::ProjectIssues) => {
             match plugin::data::fetch_current_project_issues(client, filter_terms).await {
-                Ok(issues) => apply_fetched_issues(app, issues, &default_query.sort_keys),
+                Ok(issues) => apply_fetched_issues(app, issues, &query.sort_keys),
                 Err(err) => app.set_error(err.to_string()),
             }
         }
         Some(plugin::app::ViewKind::TeamIssues) => {
             match plugin::data::fetch_current_team_issues(client, filter_terms).await {
-                Ok(issues) => apply_fetched_issues(app, issues, &default_query.sort_keys),
+                Ok(issues) => apply_fetched_issues(app, issues, &query.sort_keys),
                 Err(err) => app.set_error(err.to_string()),
             }
         }
@@ -1184,8 +1238,9 @@ fn is_buffered_quit_key(
 /// screen state they'd act on has already moved on — but the count is still noted via
 /// `tracing::debug!` (see `main.rs::init_tracing`) so a log-enabled session has a trail instead
 /// of those keypresses vanishing with zero trace anywhere.
-/// Minimum time [`ensure_loaded`] must have actually taken, in the `Action::Retry` /
-/// `Action::EnterView` arm, before a buffered key is discarded via [`flush_buffered_quit`].
+/// Minimum time [`ensure_loaded`] must have actually taken, in [`draw_and_load`] (used by
+/// the `Action::Retry` / `Action::EnterView` arm and, since TF-647, `Action::CyclePreset`),
+/// before a buffered key is discarded via [`flush_buffered_quit`].
 /// The common case is a plain network round-trip well under a second; a key buffered during
 /// that window is exactly the kind of fast, legitimate follow-up keypress (a quick second
 /// `Enter`/`r`) that — before the TF-610-driven flush was added — simply sat in the terminal's
@@ -1216,6 +1271,39 @@ fn flush_buffered_quit() -> std::io::Result<bool> {
         );
     }
     Ok(quit_requested)
+}
+
+/// Draws the just-triggered `Loading` transition, then awaits [`ensure_loaded`] — shared
+/// by the `Action::Retry`/`Action::EnterView` arm and, since TF-647, `Action::CyclePreset`
+/// (both are, at this point, just "the screen moved to `Loading`, now actually go fetch").
+///
+/// `ensure_loaded` can block for up to ~2 minutes riding out TF-610's rate-limit retry (up
+/// to 3 attempts, each waiting up to 60s on the server's Retry-After) with no visible
+/// progress — during that window keys the user presses, including quit, just buffer up in
+/// the terminal instead of being handled. This drains them the same way the
+/// Implement/ImplementMany arms do, so a quit pressed while this was stuck actually takes
+/// effect instead of leaving the app looking hung. But only once the load actually took
+/// long enough to justify it (see `RETRY_OR_ENTER_VIEW_STALE_LOAD_THRESHOLD`) — on the
+/// common fast round-trip, draining unconditionally would silently eat a legitimate
+/// follow-up keypress that the loop's normal poll would otherwise have picked up next
+/// iteration.
+///
+/// Returns `true` if the caller should `break` out of `event_loop` (a quit was buffered
+/// during a slow load).
+async fn draw_and_load(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    app: &mut plugin::app::App,
+    client: &mut Option<herdr_linear::LinearClient>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    terminal.draw(|frame| plugin::ui::draw(frame, app))?;
+
+    let load_started = std::time::Instant::now();
+    ensure_loaded(app, client).await;
+
+    Ok(
+        load_started.elapsed() >= RETRY_OR_ENTER_VIEW_STALE_LOAD_THRESHOLD
+            && flush_buffered_quit()?,
+    )
 }
 
 async fn event_loop(
@@ -1316,30 +1404,43 @@ async fn event_loop(
                             plugin::app::Action::Retry | plugin::app::Action::EnterView => {
                                 // `handle_key` already moved `app` into `Loading` — either
                                 // retrying the current view or entering a newly selected
-                                // one; draw that before the fetch's own round-trip so
-                                // it's visible instead of leaving the stale previous frame.
-                                terminal.draw(|frame| plugin::ui::draw(frame, app))?;
-                                // `ensure_loaded` can block for up to ~2 minutes riding out
-                                // TF-610's rate-limit retry (up to 3 attempts, each waiting up
-                                // to 60s on the server's Retry-After) with no visible progress —
-                                // during that window keys the user presses, including quit, just
-                                // buffer up in the terminal instead of being handled. Drain them
-                                // the same way the Implement/ImplementMany arms below do, so a
-                                // quit pressed while this was stuck actually takes effect instead
-                                // of leaving the app looking hung. But only once the load actually
-                                // took long enough to justify it (see
-                                // `RETRY_OR_ENTER_VIEW_STALE_LOAD_THRESHOLD`) — on the common fast
-                                // round-trip, draining unconditionally would silently eat a
-                                // legitimate follow-up keypress that the loop's normal poll would
-                                // otherwise have picked up next iteration.
-                                let load_started = std::time::Instant::now();
-                                ensure_loaded(app, client).await;
-
-                                if load_started.elapsed()
-                                    >= RETRY_OR_ENTER_VIEW_STALE_LOAD_THRESHOLD
-                                    && flush_buffered_quit()?
-                                {
+                                // one. `draw_and_load` draws that before the fetch's own
+                                // round-trip (so it's visible instead of leaving the stale
+                                // previous frame) and drains a buffered quit if the load
+                                // ran long — see its own doc comment for why.
+                                if draw_and_load(terminal, app, client).await? {
                                     break;
+                                }
+                            }
+                            plugin::app::Action::CyclePreset => {
+                                // TF-647: unlike `Retry`/`EnterView` above, `handle_key`
+                                // deliberately did *not* move `app` into `Loading` — it
+                                // can't know the configured preset count without reading
+                                // `config.toml`, and must stay pure/I/O-free (see
+                                // `Action::CyclePreset`'s own doc comment). Do that read
+                                // here, then mirror `Retry`: cycle, transition to
+                                // `Loading`, and reuse `draw_and_load`.
+                                let config_dir = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR")
+                                    .map(std::path::PathBuf::from);
+                                match plugin::config::resolve_filter_presets(config_dir.as_deref())
+                                {
+                                    Ok(presets) if !presets.is_empty() => {
+                                        app.cycle_active_preset(&presets);
+                                        app.retry();
+                                        if draw_and_load(terminal, app, client).await? {
+                                            break;
+                                        }
+                                    }
+                                    // No presets configured — TF-647's AC: behavior stays
+                                    // unchanged (only `default_query` applies), so `p`
+                                    // does nothing rather than triggering a pointless
+                                    // refetch.
+                                    Ok(_) => {}
+                                    Err(err) => {
+                                        app.set_status(plugin::app::Status::Error(format!(
+                                            "filter presets in config.toml could not be applied: {err}"
+                                        )));
+                                    }
                                 }
                             }
                             plugin::app::Action::Implement(issue) => {
@@ -2243,30 +2344,32 @@ exit 1
     }
 
     #[test]
-    fn resolved_default_query_is_empty_without_a_readable_default_query() {
-        // TF-617: deliberately doesn't set HERDR_PLUGIN_CONFIG_DIR itself — true whether
-        // it's unset, or (as plugin::app's own tests transiently do, concurrently, in
-        // this same test binary) pointed at the nonexistent literal path
-        // "/fake/config/dir" — since either way `resolve_default_query` hits a
-        // `NotFound` reading the file and resolves to `None`, exactly like a real
-        // missing config.toml would. See plugin::config's test suite for
-        // `resolve_default_query`/`load_default_query` coverage against a real
-        // config.toml, via the pure, env-free variant `resolved_default_query_for`
-        // (tested directly below) also uses.
+    fn resolved_query_is_empty_without_a_readable_default_query_or_active_preset() {
+        // TF-617/TF-647: deliberately doesn't set HERDR_PLUGIN_CONFIG_DIR itself — true
+        // whether it's unset, or (as plugin::app's own tests transiently do, concurrently,
+        // in this same test binary) pointed at the nonexistent literal path
+        // "/fake/config/dir" — since either way `resolve_default_query`/
+        // `resolve_filter_presets` hit a `NotFound` reading the file and resolve to
+        // `None`/`vec![]`, exactly like a real missing config.toml would. With no active
+        // preset (the default for a freshly-created `App`), `resolved_query` delegates
+        // straight to `resolved_default_query_for`. See plugin::config's test suite for
+        // `resolve_default_query`/`load_default_query`/`resolve_filter_presets`/
+        // `load_filter_presets` coverage against a real config.toml, via the pure,
+        // env-free variant `resolved_default_query_for` (tested directly below) also uses.
         let mut app = plugin::app::App::new();
         app.enter_selected_menu_option();
 
-        let parsed = resolved_default_query(&mut app);
+        let parsed = resolved_query(&mut app);
 
         assert!(parsed.filters.is_empty());
         assert!(parsed.sort_keys.is_empty());
         assert!(app.status().is_none());
     }
 
-    // TF-617 review fixes: `resolved_default_query_for` (the pure core of
-    // `resolved_default_query`, taking `config_dir` directly so these tests never touch
-    // the process-global `HERDR_PLUGIN_CONFIG_DIR` every other test in this binary runs
-    // concurrently against) — covering the composition this function exists for (one
+    // TF-617 review fixes: `resolved_default_query_for` (the pure core `resolved_query`
+    // falls back to when there's no active preset, taking `config_dir` directly so these
+    // tests never touch the process-global `HERDR_PLUGIN_CONFIG_DIR` every other test in
+    // this binary runs concurrently against) — covering the composition this function exists for (one
     // `default_query` string populating both filters *and* sort_keys) and the two
     // previously-silent failure modes it now surfaces via `app.set_status`.
 
@@ -2360,6 +2463,151 @@ exit 1
             .expect("malformed config.toml should set a status");
         assert!(status.is_error());
         assert!(status.text().contains("default_query"));
+    }
+
+    // TF-647: `resolved_query_for` — the active-preset layer in front of
+    // `resolved_default_query_for` above. Same "adapt, don't crash" error-handling
+    // philosophy, extended with a preset name in the status banner and a fallback to
+    // `default_query` when the active preset can no longer be resolved.
+
+    #[test]
+    fn resolved_query_for_uses_the_active_presets_query_when_one_is_set() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "default_query = \"sort:created\"\n\n\
+             [[filter_presets]]\nname = \"Urgent\"\nquery = \"priority:>=2 sort:-priority\"\n",
+        )
+        .unwrap();
+        let mut app = plugin::app::App::new();
+        app.enter_selected_menu_option();
+        app.set_active_preset(Some(plugin::app::ActivePreset {
+            index: 0,
+            name: "Urgent".to_string(),
+        }));
+
+        let parsed = resolved_query_for(&mut app, Some(dir.path()));
+
+        // The active preset's query wins over `default_query` entirely — not merged.
+        assert_eq!(
+            parsed.filters,
+            vec![plugin::query::FilterTerm::Priority {
+                op: plugin::query::PriorityOp::Ge,
+                value: plugin::query::Priority::new(2).unwrap(),
+            }]
+        );
+        assert_eq!(
+            parsed.sort_keys,
+            vec![plugin::query::SortKey {
+                field: plugin::query::SortField::Priority,
+                ascending: false,
+            }]
+        );
+        assert!(app.status().is_none());
+    }
+
+    #[test]
+    fn resolved_query_for_delegates_to_default_query_when_no_preset_is_active() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "default_query = \"sort:created\"\n\n\
+             [[filter_presets]]\nname = \"Urgent\"\nquery = \"priority:>=2\"\n",
+        )
+        .unwrap();
+        let mut app = plugin::app::App::new();
+        app.enter_selected_menu_option();
+
+        let parsed = resolved_query_for(&mut app, Some(dir.path()));
+
+        // `App::new()` starts with no active preset — TF-647's AC: unchanged
+        // `default_query`-only behavior when no preset has been cycled to.
+        assert!(parsed.filters.is_empty());
+        assert_eq!(
+            parsed.sort_keys,
+            vec![plugin::query::SortKey {
+                field: plugin::query::SortField::Created,
+                ascending: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn resolved_query_for_surfaces_unrecognized_terms_in_the_active_preset_with_its_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[[filter_presets]]\nname = \"Urgent\"\nquery = \"priority:notanumber\"\n",
+        )
+        .unwrap();
+        let mut app = plugin::app::App::new();
+        app.enter_selected_menu_option();
+        app.set_active_preset(Some(plugin::app::ActivePreset {
+            index: 0,
+            name: "Urgent".to_string(),
+        }));
+
+        let parsed = resolved_query_for(&mut app, Some(dir.path()));
+
+        assert!(parsed.filters.is_empty());
+        let status = app.status().expect("a rejected term should set a status");
+        assert!(status.is_error());
+        assert!(status.text().contains("Urgent"));
+        assert!(status.text().contains("priority:notanumber"));
+    }
+
+    #[test]
+    fn resolved_query_for_falls_back_to_default_query_when_the_active_presets_index_is_out_of_range(
+    ) {
+        // The preset list shrank since this index was activated (e.g. `config.toml`
+        // edited via `c` mid-session) — fall back to `default_query` rather than fetch
+        // with an undefined query, and clear the now-invalid active preset.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "default_query = \"priority:>=2\"\n\n\
+             [[filter_presets]]\nname = \"Only One Left\"\nquery = \"sort:created\"\n",
+        )
+        .unwrap();
+        let mut app = plugin::app::App::new();
+        app.enter_selected_menu_option();
+        app.set_active_preset(Some(plugin::app::ActivePreset {
+            index: 5,
+            name: "Stale".to_string(),
+        }));
+
+        let parsed = resolved_query_for(&mut app, Some(dir.path()));
+
+        assert_eq!(
+            parsed.filters,
+            vec![plugin::query::FilterTerm::Priority {
+                op: plugin::query::PriorityOp::Ge,
+                value: plugin::query::Priority::new(2).unwrap(),
+            }]
+        );
+        assert_eq!(app.active_preset(), None);
+    }
+
+    #[test]
+    fn resolved_query_for_surfaces_malformed_toml_for_filter_presets_as_a_status_banner() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), "this is [invalid toml\n").unwrap();
+        let mut app = plugin::app::App::new();
+        app.enter_selected_menu_option();
+        app.set_active_preset(Some(plugin::app::ActivePreset {
+            index: 0,
+            name: "Urgent".to_string(),
+        }));
+
+        let parsed = resolved_query_for(&mut app, Some(dir.path()));
+
+        assert!(parsed.filters.is_empty());
+        assert!(parsed.sort_keys.is_empty());
+        let status = app
+            .status()
+            .expect("malformed config.toml should set a status");
+        assert!(status.is_error());
+        assert!(status.text().contains("filter presets"));
     }
 
     /// A `herdr` fake script that dispatches on `$1 $2` so [`implement_one`]'s whole

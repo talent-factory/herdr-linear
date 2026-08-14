@@ -465,6 +465,36 @@ free-text search instead of being applied; the currently-active filter's title b
 `(⚠ not recognized: ...)` when that happens, and a `default_query` with the same problem
 shows a status message under the loaded list.
 
+`config.toml` only reads one `default_query`, though — for switching between a handful of
+go-to queries throughout the day (e.g. "just what's urgent" vs. "what's in review right
+now") without editing `config.toml` and pressing `r` every time, set multiple named
+presets and press `p` to cycle through them:
+
+```toml
+[[filter_presets]]
+name = "Urgent"
+query = "priority:>=2 sort:-priority"
+
+[[filter_presets]]
+name = "In Review"
+query = "state:\"In Review\" sort:created"
+```
+
+Each preset's `query` uses the exact same DSL as `default_query` above, applied through
+the exact same mechanism (server-side filter terms, client-side `sort:`) — a preset is
+just a named, switchable alternative to it, not a different feature. Pressing `p` on a
+loaded view cycles: `default_query` (the plain view, no bracket shown) → `Urgent` →
+`In Review` → back to `default_query` → `Urgent` again, and so on — a full loop that
+always includes a stop back at the baseline. Whichever preset is active is shown in the
+list title next to the view name (`My Issues [Urgent]`), the same way an active
+`/`-filter's query text already is; the fetch itself refetches server-side on every
+switch, exactly like pressing `r` after editing `default_query` would. An unrecognized
+term in a preset's `query` behaves exactly like one in `default_query` — dropped, with a
+status message naming the preset. Presets are independent of the live `/`-filter, which
+still layers on top of whichever one (a preset, or plain `default_query`) is currently
+active — declare zero `[[filter_presets]]` entries (the default) and nothing about
+`default_query`'s own behavior changes; `p` simply does nothing.
+
 Every key above lives in the one `config.toml`, so a real one ends up with several set at
 once. A minimal setup — just enough to get going, letting everything else fall back to
 its default:
@@ -475,8 +505,8 @@ default_query = "priority:>=2 sort:-priority"
 ```
 
 A more filled-in one — multiple repos overridden to their Linear projects, a specific
-team picked for "Team Issues", a custom editor and agent, and a `default_query` that
-only shows what's actively being worked on:
+team picked for "Team Issues", a custom editor and agent, a `default_query` that only
+shows what's actively being worked on, and two named presets to switch to with `p`:
 
 ```toml
 api_key = "lin_api_your_key_here"
@@ -488,6 +518,14 @@ default_query = "state:\"In Progress\" sort:-updated"
 [project_overrides]
 "herdr-linear" = "proj-abc123"
 "some-other-repo" = "proj-def456"
+
+[[filter_presets]]
+name = "Urgent"
+query = "priority:>=2 sort:-priority"
+
+[[filter_presets]]
+name = "In Review"
+query = "state:\"In Review\" sort:created"
 ```
 
 ### Use

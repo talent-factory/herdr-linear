@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Named filter presets: `config.toml` now supports multiple `[[filter_presets]]` entries
+  (each a `name` + a `query` in the exact same DSL `default_query` already uses) alongside
+  the existing single `default_query`, and a new `p` key cycles a loaded view through them
+  — `default_query` (no bracket shown) → preset 0 → preset 1 → … → the last preset → back
+  to `default_query` → preset 0 again, applying whichever is active via the exact same
+  mechanism `default_query`/the `/`-filter already use (server-side filter terms,
+  client-side `sort:`), refetching on every switch just like `r` after editing
+  `default_query` would. The active preset's name is shown in the list title next to the
+  view name (`My Issues [Urgent]`), the same way an active `/`-filter's query text already
+  is; presets are independent of that live `/`-filter, which still layers on top of
+  whichever is active. `App::cycle_active_preset`/`active_preset`/`set_active_preset`
+  (`plugin::app`) hold the cycling state (a new `ActivePreset { index, name }`, parallel to
+  `status` rather than nested in `ViewState::Loaded`, so `set_issues`'s ~90 existing call
+  sites didn't need to change); `plugin::config::resolve_filter_presets`/
+  `load_filter_presets` resolve the configured list (empty when none configured — TF-647's
+  AC: `p` is then a no-op and behavior is unchanged); `main.rs::resolved_query_for` (the
+  new query-resolution entry point in front of the unchanged `resolved_default_query_for`
+  fallback) re-reads `config.toml` fresh on every fetch, same as `default_query`, and
+  degrades a malformed config, an unrecognized term in a preset's query, or a preset
+  removed from the config since it was activated to a status banner rather than crashing.
+  `handle_key`'s `p` binding stays pure/I/O-free like every other key — it returns a new
+  `Action::CyclePreset` and leaves the actual `config.toml` read + cycle + refetch to
+  `main.rs`'s `event_loop` (whose shared "draw `Loading`, await the fetch, drain a
+  buffered quit if it ran long" tail is now a reusable `draw_and_load` helper, also used by
+  `Action::Retry`/`Action::EnterView`). Settings (`s`) now also lists configured presets.
+  ⚠️ Breaking (semver, `plugin` feature): adds a `filter_presets` field to the `pub`
+  `ResolvedConfigSummary` struct and a `CyclePreset` variant to the `pub` `Action` enum —
+  breaking changes for any downstream consumer of that feature, same precedent as TF-617's
+  `default_query` field addition below (TF-647)
 - `src/plugin/query.rs` — a hand-rolled parser for the plugin's query DSL: `priority:`/`state:`/`label:` filter terms (with `=`/`>=`/`<=` comparisons and named priority levels) and `sort:field,...` sort keys (with `-` for descending), plus a stable multi-key `sort_issues` helper. Double-quoted values (`state:"In Review"`) support multi-word names. Parsing never errors — unrecognized or malformed terms fall back to free text for the existing substring matcher (TF-580), with recognized-but-malformed terms additionally recorded in `ParsedQuery::rejected` for a future caller to surface as a hint. Not yet wired into the running plugin — server-side filter application is TF-616, `default_query`/`/`-filter integration is TF-617 (TF-615)
 - `default_query` in `config.toml`: a query-DSL string (same grammar as TF-615/616) applied automatically on every view load. Filter terms narrow the fetch server-side via TF-616's `IssueFilter` merge; `sort:` terms order the fetched issues client-side via a new `main.rs::apply_fetched_issues` (shared by every view's load-issues arm). The `/`-filter is now DSL-aware too, via new `plugin::query::matches_filter_term`/`compare_issues`: a query with no recognized `key:value` tokens still takes the exact pre-existing substring-match path, but one that does narrows the already-loaded, already-`default_query`-filtered/sorted issue list client-side. A `/`-filter composes with `default_query` rather than replacing it — it can only narrow further within whatever `default_query` already fetched, and inherits `default_query`'s sort order unless the typed query has its own `sort:` — see README's "query DSL" section for the full user-facing semantics, including the caveat that `state:` can never match a terminal (`Done`/`Cancelled`) issue, since every view's base filter excludes those from the fetch entirely. Repeated same-kind filter terms (two `state:` terms, two same-comparator `priority:` terms) are now deduped by the parser itself (`push_filter_term`/`filter_terms_collide` in `query.rs`) before they reach either consumer, so the server-side merge and the client-side `/`-filter can no longer disagree on a colliding repeat; `state:`/`label:` matching is Unicode-aware (`str::to_lowercase`, not `eq_ignore_ascii_case`) to stay consistent with Linear's own `eqIgnoreCase`. A malformed `config.toml`, or a `default_query` with unrecognized DSL terms, is now surfaced as a status banner under the loaded list rather than silently applying no filter/sort; an unrecognized term typed into a `/`-filter is shown in that filter's title bar. Settings (`s`) now shows the resolved `default_query` — ⚠️ breaking (semver, `plugin` feature): adds a `default_query` field to the `pub` `ResolvedConfigSummary` struct, a breaking change for any downstream consumer of that feature, same as TF-616's `filter_terms` parameter addition above (TF-617)
 - `j`/`k` now scroll the Detail pane's content, which previously had no way to reveal anything past the bottom of a long issue description — only the list pane's `↑`/`↓` scrolled (via `ratatui::List`'s own viewport tracking). `App::detail_scroll` (per-view state) is clamped in `App::detail_scroll_down` against a new `ui::detail_line_count` — the same "clamp the stored offset in `App`, estimate the real wrapped row count in `ui.rs`" split TF-585's help overlay already established, reusing its `word_wrapped_row_count` estimator against a Detail-pane-specific conservative width. Resets to `0` whenever the selected issue changes (arrow-key navigation, or a filter narrowing the list) so a new issue's description never opens mid-scroll
