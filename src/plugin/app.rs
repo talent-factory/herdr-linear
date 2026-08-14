@@ -61,6 +61,11 @@ pub const MENU_OPTIONS: [MenuOption; 3] = [
 ///
 /// Note: `ViewState` deliberately does NOT derive `PartialEq` because `Issue`
 /// doesn't derive it either. Tests use `matches!` for state comparisons instead.
+// `Loaded` carries a `CommentState`, which (since TF-648's PR #53 review fix) embeds a
+// full `Issue` by value in its `Editing`/`Failed` variants — the same "boxing would ripple
+// into every call site" tradeoff `Action`'s own `#[allow(clippy::large_enum_variant)]`
+// already accepts for the exact same reason, and for consistency with it.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum ViewState {
     /// The view is loading its issues.
@@ -115,21 +120,57 @@ pub struct FilterState {
 }
 
 /// Comment-composition state for a loaded view's issue list (TF-648). A dedicated key
-/// (`m`) opens editing on the currently selected issue; `Enter` confirms and submits a
-/// non-empty comment via `client.add_comment()`, `Esc` cancels without sending — the same
-/// interaction shape as [`FilterState`]. Unlike [`FilterState`], `Up`/`Down` are *not*
-/// passed through while editing: the comment targets whichever issue was selected when
-/// editing started ([`App::start_commenting`] refuses to open without one), and letting
-/// navigation continue underneath it would let a still-open draft silently end up posted
-/// to a different issue than the one shown when composition began.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CommentState {
-    /// True while `m` has been pressed and not yet confirmed (`Enter`) or cancelled
-    /// (`Esc`) — character keys are captured into `body` instead of triggering their
-    /// usual view bindings while this is set.
-    pub editing: bool,
-    /// The comment text composed so far. Cleared on cancel and on a successful confirm.
-    pub body: String,
+/// (`m`) opens editing on the currently selected issue; `Enter` confirms — handing the
+/// draft to [`Action::AddComment`] for `main.rs`'s `event_loop` to actually submit via
+/// `client.add_comment()` — and `Esc` cancels without sending, the same interaction shape
+/// as [`FilterState`]. Unlike [`FilterState`], `Up`/`Down` (and the mouse wheel — see
+/// `handle_mouse`) are *not* passed through while editing.
+///
+/// Modeled as a small state machine rather than `FilterState`'s independent
+/// flag-plus-buffer shape, because the two fields here *aren't* independent: `body` is
+/// only ever meaningful while a draft is open, so `{editing: false, body: "stale"}` would
+/// be a representable-but-illegal state under that shape (nothing enforces the pairing
+/// beyond every mutator happening to clear both together). `Idle`/`Editing`/`Failed` make
+/// the illegal combination unrepresentable instead of merely avoided by convention.
+///
+/// `Editing` additionally captures its target `issue` once, at [`App::start_commenting`]
+/// time, rather than leaving [`App::confirm_comment`] to re-resolve "whichever issue is
+/// selected" when the draft is confirmed. That's a second, independent defense for the
+/// same goal `Up`/`Down` exclusion serves: a still-open draft must never end up posted to
+/// a different issue than the one shown when composition began — captured once, that's
+/// true no matter what moves the selection underneath it later (PR #53 review: the mouse
+/// wheel used to be able to, since `Up`/`Down` exclusion alone didn't cover it).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum CommentState {
+    /// No draft in progress, and nothing to resume.
+    #[default]
+    Idle,
+    /// `m` has been pressed and not yet confirmed (`Enter`) or cancelled (`Esc`) —
+    /// character keys are captured into `body` instead of triggering their usual view
+    /// bindings while this variant is active.
+    Editing {
+        /// The issue this draft will be attached to when confirmed — fixed for the
+        /// draft's lifetime, never re-read from `selected` at confirm time.
+        issue: Issue,
+        /// The comment text composed so far.
+        body: String,
+    },
+    /// A confirmed draft that failed to send — network error, Linear API error, or (in
+    /// principle; see `main.rs`'s `event_loop`) no client connected yet. Resumable: if
+    /// `m` is pressed again while the *same* issue is still selected, `start_commenting`
+    /// restores `body` here instead of starting blank, so a transient failure doesn't
+    /// mean retyping the whole comment (PR #53 review — previously the draft was simply
+    /// discarded on any send failure). Deliberately not the state shown by the draft
+    /// banner (`plugin::ui::draw`'s `CommentState::Editing` match arm) — staying out of
+    /// `Editing` here means the send failure's `Status::Error` banner stays visible
+    /// instead of being immediately overwritten by a reopened draft.
+    Failed {
+        /// The issue the failed draft was for. Only resumed by `start_commenting` when
+        /// this still matches the currently selected issue.
+        issue: Issue,
+        /// The comment text that failed to send.
+        body: String,
+    },
 }
 
 /// Returns the indices into `issues` matching `query`, in the order they should be
@@ -234,6 +275,9 @@ fn strip_surrounding_quotes(query: &str) -> &str {
 }
 
 /// What the UI should currently display: the view-selection menu, or an entered view.
+// See `ViewState`'s own `#[allow(clippy::large_enum_variant)]` comment — `View`'s size is
+// dominated by the same `ViewState::Loaded`/`CommentState` chain.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Screen {
     /// The view-selection menu. `selected` indexes into [`MENU_OPTIONS`].
@@ -751,81 +795,124 @@ impl App {
     }
 
     /// True while the current view's comment draft is being edited (`m` pressed, not
-    /// yet confirmed or cancelled). False outside a loaded view.
+    /// yet confirmed or cancelled). False outside a loaded view, and false for a
+    /// [`CommentState::Failed`] draft — resumable, but not itself "being edited" until
+    /// `m` reopens it.
     fn is_commenting(&self) -> bool {
         matches!(
             &self.screen,
-            Screen::View(_, ViewState::Loaded { comment, .. }) if comment.editing
+            Screen::View(_, ViewState::Loaded { comment, .. })
+                if matches!(comment, CommentState::Editing { .. })
         )
     }
 
     /// Opens comment editing (bound to `m`) for the currently selected issue. No-op if
     /// there is no selected issue — an empty list, or a filter matching nothing (TF-648's
     /// AC) — or outside a loaded view, since there would be nothing to attach the comment
-    /// to.
+    /// to. If the last draft for this same issue failed to send
+    /// ([`CommentState::Failed`]), resumes it with its text intact instead of starting
+    /// blank (PR #53 review) — a transient send failure shouldn't mean retyping the whole
+    /// comment. A failed draft for a *different* issue than the one now selected is
+    /// simply replaced by a fresh blank draft, not resumed.
     pub fn start_commenting(&mut self) {
-        if self.selected_issue().is_none() {
+        let Some(selected) = self.selected_issue().cloned() else {
             return;
-        }
+        };
         if let Screen::View(_, ViewState::Loaded { comment, .. }) = &mut self.screen {
-            comment.editing = true;
+            let body = match comment {
+                CommentState::Failed { issue, body } if issue.id == selected.id => {
+                    std::mem::take(body)
+                }
+                _ => String::new(),
+            };
+            *comment = CommentState::Editing {
+                issue: selected,
+                body,
+            };
         }
     }
 
     /// Appends `c` to the comment draft. No-op unless currently editing.
     pub fn push_comment_char(&mut self, c: char) {
-        if let Screen::View(_, ViewState::Loaded { comment, .. }) = &mut self.screen {
-            if comment.editing {
-                comment.body.push(c);
-            }
+        if let Screen::View(
+            _,
+            ViewState::Loaded {
+                comment: CommentState::Editing { body, .. },
+                ..
+            },
+        ) = &mut self.screen
+        {
+            body.push(c);
         }
     }
 
     /// Removes the last character of the comment draft, if any. No-op unless currently
     /// editing.
     pub fn pop_comment_char(&mut self) {
-        if let Screen::View(_, ViewState::Loaded { comment, .. }) = &mut self.screen {
-            if comment.editing {
-                comment.body.pop();
-            }
+        if let Screen::View(
+            _,
+            ViewState::Loaded {
+                comment: CommentState::Editing { body, .. },
+                ..
+            },
+        ) = &mut self.screen
+        {
+            body.pop();
         }
     }
 
     /// Confirms the comment draft (bound to `Enter` while editing) and, if non-empty once
     /// trimmed, returns an [`Action::AddComment`] for `event_loop` to submit via
-    /// `client.add_comment()`. A blank draft is *not* sent (TF-648's AC) — editing simply
-    /// stays open rather than discarding whatever (nothing) was typed, mirroring how
-    /// `Esc` is the explicit way to abandon a draft. No-op (returns `None`) unless
-    /// currently editing.
+    /// `client.add_comment()`. Returns `None` in two distinct cases, neither of which
+    /// sends anything: outside `Editing` (nothing to confirm), and *while* `Editing` with
+    /// a blank draft (TF-648's AC) — the latter leaves editing open rather than
+    /// discarding whatever (nothing) was typed, mirroring how `Esc` is the explicit way
+    /// to abandon a draft. Only a non-blank confirm transitions `comment` to
+    /// [`CommentState::Idle`] — not cleared-in-place — handing the target `issue` and
+    /// trimmed `body` to the returned `Action` rather than re-resolving `selected_issue`
+    /// here (see [`CommentState::Editing`]'s doc for why that matters).
     pub fn confirm_comment(&mut self) -> Option<Action> {
-        let body = if let Screen::View(_, ViewState::Loaded { comment, .. }) = &mut self.screen {
-            if !comment.editing {
-                return None;
+        if let Screen::View(_, ViewState::Loaded { comment, .. }) = &mut self.screen {
+            if let CommentState::Editing { body, .. } = comment {
+                let trimmed = body.trim().to_string();
+                if trimmed.is_empty() {
+                    return None;
+                }
+                let CommentState::Editing { issue, .. } =
+                    std::mem::replace(comment, CommentState::Idle)
+                else {
+                    unreachable!("just matched CommentState::Editing above");
+                };
+                return Some(Action::AddComment {
+                    issue,
+                    body: trimmed,
+                });
             }
-            let trimmed = comment.body.trim().to_string();
-            if trimmed.is_empty() {
-                return None;
-            }
-            comment.editing = false;
-            comment.body.clear();
-            trimmed
-        } else {
-            return None;
-        };
-
-        self.selected_issue()
-            .cloned()
-            .map(|issue| Action::AddComment(issue, body))
+        }
+        None
     }
 
     /// Cancels comment editing (bound to `Esc` while editing): stops capturing keystrokes
-    /// and discards the draft. No-op unless currently editing.
+    /// and discards the draft entirely (not resumable — unlike a send failure, an
+    /// explicit `Esc` means the user chose to abandon it). No-op unless currently editing.
     pub fn cancel_comment(&mut self) {
         if let Screen::View(_, ViewState::Loaded { comment, .. }) = &mut self.screen {
-            if comment.editing {
-                comment.editing = false;
-                comment.body.clear();
+            if matches!(comment, CommentState::Editing { .. }) {
+                *comment = CommentState::Idle;
             }
+        }
+    }
+
+    /// Reopens a confirmed comment as a resumable [`CommentState::Failed`] draft after it
+    /// failed to send — network/API error, or (see `main.rs`'s `event_loop`) no client
+    /// connected yet (PR #53 review: previously the typed text was simply lost on either
+    /// path). No-op outside a loaded view; harmless if the user has since navigated
+    /// elsewhere within it, since `start_commenting` only resumes a `Failed` draft that
+    /// still matches the currently selected issue; a stale one is just never resumed and
+    /// is overwritten by the next `set_issues` reload, same as any other draft.
+    pub fn restore_failed_comment_draft(&mut self, issue: Issue, body: String) {
+        if let Screen::View(_, ViewState::Loaded { comment, .. }) = &mut self.screen {
+            *comment = CommentState::Failed { issue, body };
         }
     }
 
@@ -1001,13 +1088,23 @@ pub enum Action {
     /// read `config.toml`, call [`App::cycle_active_preset`], then [`App::retry`] +
     /// refetch — a no-op when no presets are configured (TF-647's AC).
     CyclePreset,
-    /// `Enter` confirmed a non-empty comment draft (bound to `m`, see
-    /// [`App::confirm_comment`], TF-648): submit it for the issue selected when editing
-    /// started via `client.add_comment()`. Orchestrated in `main.rs`'s `event_loop`,
-    /// mirroring `Action::Implement`'s status-banner pattern (an interim `Status::Ok`
-    /// while the request is in flight, then `Status::Ok`/`Status::Error` once it
-    /// resolves).
-    AddComment(Issue, String),
+    /// Comment composition (bound to `m`, TF-648) reached `Enter` with a non-empty draft
+    /// — see [`App::confirm_comment`]: submit `body` on `issue` via `client.add_comment()`.
+    /// A named-field variant rather than a positional tuple, unlike this enum's other
+    /// multi-field variants, specifically because `issue`/`body` are two same-shaped-enough
+    /// values (both ultimately just data attached to a request) that a positional swap at
+    /// a call site wouldn't necessarily look wrong at a glance, even though the compiler
+    /// would still catch it (the two types differ). Orchestrated in `main.rs`'s
+    /// `event_loop`, mirroring `Action::Implement`'s status-banner pattern (an interim
+    /// `Status::Ok` while the request is in flight, then `Status::Ok`/`Status::Error` once
+    /// it resolves).
+    AddComment {
+        /// The issue to attach the comment to — captured once when editing started (see
+        /// [`CommentState::Editing`]), not re-resolved from the current selection.
+        issue: Issue,
+        /// The trimmed, non-empty comment text to submit.
+        body: String,
+    },
 }
 
 /// Map a key press to an [`Action`], applying any state change (menu navigation,
@@ -1264,6 +1361,19 @@ pub fn handle_mouse(
             MouseEventKind::ScrollUp => app.help_overlay_scroll_up(),
             _ => {}
         }
+        return;
+    }
+
+    // While composing a comment, the wheel is a no-op — same "owns the wheel exactly like
+    // it already owns the keyboard" rule as the help-overlay branch above, and for the
+    // same reason `handle_key`'s commenting branch doesn't forward `Up`/`Down`: moving
+    // `selected` out from under an open draft would visually disagree with which issue
+    // `App::confirm_comment` will actually post to (PR #53 review — `CommentState::
+    // Editing` now captures its target issue once, so a stray scroll can no longer
+    // *mis*target the draft, but letting the highlighted row silently drift away from it
+    // while the banner still reads "Comment on <the original issue>" would still be a
+    // confusing, needless surprise).
+    if app.is_commenting() {
         return;
     }
 
@@ -3545,7 +3655,10 @@ mod tests {
 
         assert_eq!(
             action,
-            Some(Action::AddComment(sample_issue("ENG-1"), "hi".to_string()))
+            Some(Action::AddComment {
+                issue: sample_issue("ENG-1"),
+                body: "hi".to_string()
+            })
         );
     }
 
@@ -3592,10 +3705,10 @@ mod tests {
 
         assert_eq!(
             action,
-            Some(Action::AddComment(
-                sample_issue("ENG-1"),
-                "Looks good".to_string()
-            ))
+            Some(Action::AddComment {
+                issue: sample_issue("ENG-1"),
+                body: "Looks good".to_string()
+            })
         );
         assert!(!app.is_commenting());
     }
@@ -3613,10 +3726,10 @@ mod tests {
 
         assert_eq!(
             action,
-            Some(Action::AddComment(
-                sample_issue("ENG-1"),
-                "padded".to_string()
-            ))
+            Some(Action::AddComment {
+                issue: sample_issue("ENG-1"),
+                body: "padded".to_string()
+            })
         );
     }
 
@@ -3666,6 +3779,125 @@ mod tests {
         app.set_issues(vec![sample_issue("ENG-1")]);
 
         assert!(!app.is_commenting());
+    }
+
+    #[test]
+    fn mouse_wheel_while_commenting_does_not_move_the_selection() {
+        // Regression test (PR #53 review): `handle_mouse` used to have no
+        // `is_commenting()` guard, so a wheel scroll during comment composition could
+        // move `selected` out from under an open draft — even though `CommentState::
+        // Editing` now captures its target issue up front and can no longer be
+        // *mis*targeted by it (see that type's doc comment), letting the highlighted row
+        // silently drift away from the issue the banner names would still be a confusing,
+        // needless surprise. Mirrors `up_and_down_while_commenting_do_not_move_the_
+        // selection`, but for the wheel instead of the arrow keys.
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
+        handle_key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+
+        handle_mouse(
+            &mut app,
+            MouseEventKind::ScrollDown,
+            LIST_COLUMN,
+            TERMINAL_WIDTH,
+        );
+
+        assert_eq!(app.selected_issue().unwrap().identifier, "ENG-1");
+        assert!(app.is_commenting());
+    }
+
+    #[test]
+    fn m_while_filtering_is_captured_as_filter_text_not_commenting() {
+        // Reverse case of `c_while_commenting_is_captured_as_draft_text_not_open_config`
+        // and `question_mark_while_commenting_types_into_the_draft_instead_of_opening_
+        // the_overlay` (PR #53 review): those guard `is_filtering()`'s precedence over
+        // the commenting branch below it in `handle_key`. This guards the other
+        // direction — `is_filtering()` is checked *first*, so a bare `m` typed into an
+        // in-progress filter query must stay filter text, not fall through to `start_
+        // commenting` and open a second, conflicting input mode on top of the filter.
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+
+        let action = handle_key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+
+        assert_eq!(action, None);
+        assert!(app.is_filtering());
+        assert!(!app.is_commenting());
+    }
+
+    #[test]
+    fn confirming_a_comment_while_filtered_targets_the_filtered_selection() {
+        // Integration test (PR #53 review): `App::start_commenting` captures its target
+        // via `selected_issue()`, which itself indexes the *filtered* subset
+        // (`matching_issue_indices`), not raw `issues` — prove the two features actually
+        // compose, not just that each is independently correct, by filtering
+        // `[ENG-1, ENG-2]` down to `ENG-2` and confirming the resulting
+        // `Action::AddComment` names `ENG-2`.
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        for c in "ENG-2".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE); // confirm filter
+        handle_key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+        for c in "lgtm".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+
+        let action = handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(
+            action,
+            Some(Action::AddComment {
+                issue: sample_issue("ENG-2"),
+                body: "lgtm".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn m_key_resumes_a_failed_draft_for_the_same_issue() {
+        // PR #53 review: a comment that fails to send (network/API error, or — per
+        // `main.rs`'s `add_comment_unavailable_status` — no client yet) is reopened as
+        // `CommentState::Failed` by `App::restore_failed_comment_draft` rather than
+        // discarded. Pressing `m` again on the *same* issue should resume it instead of
+        // starting blank.
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        app.restore_failed_comment_draft(sample_issue("ENG-1"), "half-typed".to_string());
+
+        handle_key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('!'), KeyModifiers::NONE);
+        let action = handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(
+            action,
+            Some(Action::AddComment {
+                issue: sample_issue("ENG-1"),
+                body: "half-typed!".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn m_key_does_not_resume_a_failed_draft_for_a_different_issue() {
+        // A `Failed` draft is scoped to the issue it was for — selecting a different
+        // issue and pressing `m` must start a fresh, blank draft, not silently attach the
+        // old failed text to the wrong issue.
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
+        app.restore_failed_comment_draft(sample_issue("ENG-1"), "half-typed".to_string());
+        app.move_selection_down(); // ENG-2 now selected
+
+        handle_key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+        // A blank draft doesn't send — this only passes if the ENG-1 body above was
+        // *not* carried over into the new draft.
+        let action = handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(action, None);
+        assert!(app.is_commenting());
     }
 
     #[test]
