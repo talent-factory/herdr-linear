@@ -806,7 +806,7 @@ async fn implement_one(
     client: &herdr_linear::LinearClient,
     issue: &herdr_linear::Issue,
     command: &plugin::implement::ValidatedAgentCommand,
-    notify: &tokio::sync::mpsc::UnboundedSender<plugin::app::Status>,
+    notify: &StatusNotifier,
     mut on_prompt_attempt: impl FnMut(u32, u32) + Send,
 ) -> ImplementOutcome {
     let cwd = plugin::host::resolve_cwd();
@@ -925,6 +925,13 @@ async fn implement_one(
 /// closed one out from under a still-working agent.
 const AGENT_DONE_WAIT_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000; // 24h
 
+/// TF-653: the channel `event_loop` drains (via [`drain_notifications`]) each tick to surface a
+/// `Status` once a background watcher — currently only
+/// [`close_tab_once_agent_is_done`]/[`spawn_tab_close_when_agent_is_done`] — has something to
+/// report. Named for readability at the six call sites that thread it through the implement-flow
+/// call chain; not a semantic wrapper, just `tokio::sync::mpsc::UnboundedSender<plugin::app::Status>`.
+type StatusNotifier = tokio::sync::mpsc::UnboundedSender<plugin::app::Status>;
+
 /// Status banner shown once [`close_tab_once_agent_is_done`] (TF-649) actually closes a tab —
 /// the only user-visible sign that "the tab is gone" means "the agent finished", not "lost" or
 /// "crashed" (TF-653: two tabs vanished mid-session with no such signal, which led to re-running
@@ -961,15 +968,15 @@ fn tab_auto_closed_status(identifier: &str) -> plugin::app::Status {
 /// underlying mechanism.
 ///
 /// `identifier` and `notify` are TF-653 additions: once `tab_close` actually succeeds, this
-/// sends [`tab_auto_closed_status`] through `notify` so `event_loop` can surface it — a
-/// `send` on an already-dropped receiver (the plugin quit) is silently ignored, same fail-open
-/// spirit as everything else in this function.
+/// sends [`tab_auto_closed_status`] through `notify` so `event_loop` can surface it. A `send` on
+/// an already-dropped receiver (the plugin quit) is silently ignored — consistent with this
+/// function's fail-open stance throughout.
 async fn close_tab_once_agent_is_done(
     herdr_bin: &str,
     identifier: &str,
     tab: &plugin::herdr_cli::TabCreated,
     timeout_ms: u64,
-    notify: &tokio::sync::mpsc::UnboundedSender<plugin::app::Status>,
+    notify: &StatusNotifier,
 ) {
     if let Err(err) = plugin::herdr_cli::agent_wait(
         herdr_bin,
@@ -1019,7 +1026,7 @@ fn spawn_tab_close_when_agent_is_done(
     herdr_bin: String,
     identifier: String,
     tab: plugin::herdr_cli::TabCreated,
-    notify: tokio::sync::mpsc::UnboundedSender<plugin::app::Status>,
+    notify: StatusNotifier,
 ) {
     tokio::spawn(async move {
         close_tab_once_agent_is_done(
@@ -1351,7 +1358,7 @@ async fn start_implementation(
     app: &mut plugin::app::App,
     client: &herdr_linear::LinearClient,
     issue: herdr_linear::Issue,
-    notify: &tokio::sync::mpsc::UnboundedSender<plugin::app::Status>,
+    notify: &StatusNotifier,
 ) {
     let herdr_bin = plugin::herdr_cli::herdr_bin();
     let command = match resolve_validated_agent_command(&herdr_bin).await {
@@ -1490,7 +1497,7 @@ async fn implement_many(
     client: &herdr_linear::LinearClient,
     issues: Vec<herdr_linear::Issue>,
     command: &plugin::implement::ValidatedAgentCommand,
-    notify: &tokio::sync::mpsc::UnboundedSender<plugin::app::Status>,
+    notify: &StatusNotifier,
 ) -> Vec<(String, ImplementOutcome)> {
     let requests = issues.into_iter().map(|issue| async move {
         let identifier = issue.identifier.clone();
@@ -1523,7 +1530,7 @@ async fn start_implementation_many(
     app: &mut plugin::app::App,
     client: &herdr_linear::LinearClient,
     issues: Vec<herdr_linear::Issue>,
-    notify: &tokio::sync::mpsc::UnboundedSender<plugin::app::Status>,
+    notify: &StatusNotifier,
 ) -> bool {
     let herdr_bin = plugin::herdr_cli::herdr_bin();
     let total = issues.len();
@@ -1745,6 +1752,25 @@ fn apply_cycle_preset(
     false
 }
 
+/// Drains any [`plugin::app::Status`] notices queued by `event_loop`'s background tab-close
+/// watchers (TF-653, via [`spawn_tab_close_when_agent_is_done`]) into `app`'s status.
+///
+/// `try_recv` never blocks, so this never stalls the render/input loop whether or not anything
+/// is queued. If more than one notice is queued, only the last one survives — `App::set_status`
+/// overwrites rather than accumulates, the same class as every other `set_status` overwrite
+/// already in this codebase; an accepted tradeoff for a transient banner.
+///
+/// Split out as a pure function, mirroring [`tab_auto_closed_status`], so this is unit-testable
+/// without a running `event_loop` or a real terminal.
+fn drain_notifications(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<plugin::app::Status>,
+    app: &mut plugin::app::App,
+) {
+    while let Ok(status) = rx.try_recv() {
+        app.set_status(status);
+    }
+}
+
 async fn event_loop(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     app: &mut plugin::app::App,
@@ -1766,12 +1792,13 @@ async fn event_loop(
     loop {
         // Drained before the draw below so a tab that auto-closed while this loop was blocked
         // on `crossterm::event::poll` shows up in the very next frame, not one frame later.
-        // `try_recv` never blocks; if two notices land in the same ~200ms poll window, only the
-        // last survives — an accepted tradeoff for a transient banner, same class as every other
-        // `set_status` overwrite already in this codebase.
-        while let Ok(status) = notify_rx.try_recv() {
-            app.set_status(status);
-        }
+        // Safe to run unconditionally at the top of every iteration only because every action
+        // handler below that `.await`s a background result (`Action::Implement`,
+        // `Action::ImplementMany`) draws immediately after that `.await` returns — so a status
+        // those handlers just set is always rendered at least once before this drain gets a
+        // chance to overwrite it with a queued notice (TF-653; previously this drain could
+        // clobber a just-set, never-yet-drawn `Status::Error` with a benign "tab closed" banner).
+        drain_notifications(&mut notify_rx, app);
 
         terminal.draw(|frame| plugin::ui::draw(frame, app))?;
 
@@ -1933,6 +1960,11 @@ async fn event_loop(
                                         issue.identifier
                                     ))),
                                 }
+                                // TF-653: draw the outcome status right away so the next loop
+                                // iteration's `drain_notifications` can't overwrite it — a
+                                // background tab-close notice queued during the `.await` above
+                                // must never clobber a status that hasn't been shown even once.
+                                terminal.draw(|frame| plugin::ui::draw(frame, app))?;
 
                                 if flush_buffered_quit()? {
                                     break;
@@ -1961,6 +1993,10 @@ async fn event_loop(
                                         "not connected to Linear yet — try again.".to_string(),
                                     )),
                                 }
+                                // TF-653: same reasoning as the single-issue `Action::Implement`
+                                // arm above — draw the outcome now so a queued notify-drain on
+                                // the next iteration can't clobber it before it's ever shown.
+                                terminal.draw(|frame| plugin::ui::draw(frame, app))?;
 
                                 if flush_buffered_quit()? {
                                     break;
@@ -2697,6 +2733,49 @@ exit 1
         assert_eq!(
             tab_auto_closed_status("TF-641"),
             plugin::app::Status::Ok("TF-641: agent finished, tab closed.".to_string())
+        );
+    }
+
+    #[test]
+    fn drain_notifications_applies_a_single_queued_status() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = plugin::app::App::new();
+        tx.send(tab_auto_closed_status("TF-649")).unwrap();
+
+        drain_notifications(&mut rx, &mut app);
+
+        assert_eq!(app.status(), Some(&tab_auto_closed_status("TF-649")));
+    }
+
+    #[test]
+    fn drain_notifications_on_an_empty_channel_leaves_status_untouched() {
+        let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = plugin::app::App::new();
+        app.set_status(plugin::app::Status::Ok("still here".to_string()));
+
+        drain_notifications(&mut rx, &mut app);
+
+        assert_eq!(
+            app.status(),
+            Some(&plugin::app::Status::Ok("still here".to_string()))
+        );
+    }
+
+    #[test]
+    fn drain_notifications_keeps_only_the_last_of_several_queued_statuses() {
+        // TF-653: `drain_notifications`'s own doc comment claims this — if two notices land in
+        // the same poll window, only the last survives. Prove it rather than just asserting it.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = plugin::app::App::new();
+        tx.send(tab_auto_closed_status("TF-641")).unwrap();
+        tx.send(tab_auto_closed_status("TF-642")).unwrap();
+
+        drain_notifications(&mut rx, &mut app);
+
+        assert_eq!(
+            app.status(),
+            Some(&tab_auto_closed_status("TF-642")),
+            "only the most recently queued notice should survive the drain"
         );
     }
 

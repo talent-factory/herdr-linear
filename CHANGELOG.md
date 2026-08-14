@@ -75,15 +75,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `spawn_tab_close_when_agent_is_done`, its `tokio::spawn` wrapper) now take the issue identifier
   plus an `mpsc::UnboundedSender<plugin::app::Status>`; on a successful `tab_close` only, it sends
   the new pure `tab_auto_closed_status(identifier)` — `"{identifier}: agent finished, tab
-  closed."` — through it. `event_loop` owns the matching receiver and drains it (non-blocking
-  `try_recv`, so it can never stall the render/input loop) once per tick, before `terminal.draw`,
-  turning any pending notice into a `Status` banner the same way every other action already
-  reports through `App::set_status`. Neither existing fail-open branch (`agent_wait` timing out,
-  `tab_close` itself failing) sends anything — a notice on either would falsely claim "finished"
-  for a tab that's still open. The channel is threaded through `implement_one`/`implement_many`/
-  `start_implementation`/`start_implementation_many`, all of which gain a required parameter — a
-  breaking change for any downstream consumer of the `plugin` feature, matching this codebase's
-  established precedent for threading a new cross-cutting parameter through the implement-flow
+  closed."` — through it. `event_loop` owns the matching receiver and drains it, via the new pure
+  `drain_notifications` helper (non-blocking `try_recv`, so it can never stall the render/input
+  loop), once per tick, before `terminal.draw`, turning any pending notice into a `Status` banner
+  the same way every other action already reports through `App::set_status`. Both
+  `Action::Implement` and `Action::ImplementMany` now draw once more immediately after their
+  blocking implement call returns, before looping back to that per-tick drain — otherwise a
+  notice queued during that call could silently overwrite a same-tick outcome status (including a
+  `Status::Error`) before it had ever been rendered, which is exactly the class of invisible-
+  outcome bug this ticket exists to fix, just inverted. Neither existing fail-open branch
+  (`agent_wait` timing out, `tab_close` itself failing) sends anything — a notice on either would
+  falsely claim "finished" for a tab that's still open. The channel is threaded through
+  `implement_one`/`implement_many`/`start_implementation`/`start_implementation_many`, all of
+  which gain a required parameter; all four are private functions in the `herdr-linear` binary
+  target, so this has no public API impact — the parameter-threading pattern itself matches this
+  codebase's established precedent for a new cross-cutting parameter through the implement-flow
   call chain (see TF-650's `on_attempt` above). Investigated and explicitly dropped from this
   ticket's scope: distinguishing a clean exit from a crash before auto-closing — verified via
   `herdr api schema --json` that herdr exposes no exit code/signal anywhere in its socket API
