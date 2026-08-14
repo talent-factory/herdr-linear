@@ -1221,11 +1221,13 @@ fn osc52_copy_sequence(text: &str) -> String {
 
 /// Handles the `o` key's `Action::OpenInBrowser(url)`. Minimal-diff by design (TF-652):
 /// the local branch is untouched — `open::that(url)`'s result is still discarded exactly as
-/// before, matching the existing "same status as `open::that`" rationale in `herdr_cli.rs`. Only
-/// the remote branch is new, since that's the one that's actually broken (see module docs on
-/// `is_remote_session`): it can't call the local OS opener at all, so it copies the URL via OSC
-/// 52 instead and returns a status so the user knows to paste it — unlike the local branch, this
-/// has no working fallback if silently discarded.
+/// before, preserving pre-TF-652 behaviour (silent no-op on failure; there's no useful recovery
+/// action to offer for "the OS couldn't open a browser"). Only the remote branch is new, since
+/// that's the one that's actually broken (see module docs on `is_remote_session`): it can't call
+/// the local OS opener at all, so it copies the URL via OSC 52 instead. Unlike the local branch,
+/// a failed clipboard write here has no other fallback the user could fall back on, so — unlike
+/// `open::that`'s discarded result above — it's surfaced as `Status::Error` rather than assumed
+/// to have succeeded.
 fn open_issue_url(
     url: &str,
     is_remote: bool,
@@ -1233,10 +1235,12 @@ fn open_issue_url(
     write_clipboard_sequence: impl FnOnce(&str) -> std::io::Result<()>,
 ) -> Option<plugin::app::Status> {
     if is_remote {
-        let _ = write_clipboard_sequence(&osc52_copy_sequence(url));
-        Some(plugin::app::Status::Ok(
-            "Issue-URL kopiert – in Safari einfügen".to_string(),
-        ))
+        Some(match write_clipboard_sequence(&osc52_copy_sequence(url)) {
+            Ok(()) => plugin::app::Status::Ok("Issue-URL kopiert – in Safari einfügen".to_string()),
+            Err(e) => {
+                plugin::app::Status::Error(format!("Issue-URL konnte nicht kopiert werden: {e}"))
+            }
+        })
     } else {
         let _ = opener(url);
         None
@@ -1720,7 +1724,9 @@ async fn event_loop(
                                     |u| open::that(u),
                                     |seq| {
                                         use std::io::Write as _;
-                                        std::io::stdout().write_all(seq.as_bytes())
+                                        let mut stdout = std::io::stdout();
+                                        stdout.write_all(seq.as_bytes())?;
+                                        stdout.flush()
                                     },
                                 ) {
                                     app.set_status(status);
@@ -2329,8 +2335,33 @@ mod tests {
     }
 
     #[test]
+    fn is_remote_session_is_true_when_both_ssh_vars_are_set() {
+        // The realistic case for a Mosh-over-SSH session: mosh-server inherits both from the
+        // bootstrap SSH connection and never unsets them (see module docs on `is_remote_session`).
+        assert!(is_remote_session(
+            Some("10.0.0.1 1234 10.0.0.2 22"),
+            Some("/dev/pts/0")
+        ));
+    }
+
+    #[test]
+    fn is_remote_session_is_true_when_a_var_is_set_but_empty() {
+        // Pins down the doc comment's claim that presence, not content, is what matters: even an
+        // empty (but present) value counts as "set".
+        assert!(is_remote_session(Some(""), None));
+        assert!(is_remote_session(None, Some("")));
+    }
+
+    #[test]
     fn osc52_copy_sequence_wraps_base64_of_the_input_in_the_osc52_escape_codes() {
         assert_eq!(osc52_copy_sequence("hello"), "\x1b]52;c;aGVsbG8=\x07");
+    }
+
+    #[test]
+    fn osc52_copy_sequence_handles_empty_and_unicode_input() {
+        assert_eq!(osc52_copy_sequence(""), "\x1b]52;c;\x07");
+        // Multi-byte UTF-8 (ü) must be base64-encoded byte-for-byte, not per-`char`.
+        assert_eq!(osc52_copy_sequence("für"), "\x1b]52;c;ZsO8cg==\x07");
     }
 
     #[test]
@@ -2378,6 +2409,29 @@ mod tests {
             opener_calls.into_inner(),
             vec!["https://linear.app/team/issue/TF-1".to_string()]
         );
+    }
+
+    #[test]
+    fn open_issue_url_returns_an_error_status_when_the_clipboard_write_fails_remotely() {
+        // Unlike the local branch (which has no working fallback to fall back on if
+        // `open::that` fails either), a failed OSC 52 write must not be reported as success —
+        // there's no other signal the user could use to notice the copy didn't happen.
+        let status = open_issue_url(
+            "https://linear.app/team/issue/TF-1",
+            true,
+            |_url| panic!("opener must not be called for a remote session"),
+            |_seq| Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+        );
+
+        match status {
+            Some(plugin::app::Status::Error(message)) => {
+                assert!(
+                    message.contains("Issue-URL"),
+                    "expected the error message to mention the issue URL, got: {message}"
+                );
+            }
+            other => panic!("expected Some(Status::Error(_)) on a failed write, got: {other:?}"),
+        }
     }
 
     #[cfg(unix)]
