@@ -67,7 +67,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   multi-issue path (`implement_many`, TF-622) passes a no-op — several of its futures can be
   mid-flight at once and none of them owns the one shared terminal safely, so it's unchanged. This
   does not change the resend/confirmation logic or its timing budgets, only what's visible while
-  it runs
+  it runs (TF-650)
+- `HERDR_LINEAR_LOG_FILE`-based logging (`main.rs::init_tracing`) now actually emits `debug!`-level
+  records — every `tracing::debug!` call this crate has ever shipped (`send_prompt_until_visible_with`'s
+  attempt-failure logging, `flush_buffered_quit`'s discarded-key count, and the mid-flight
+  redraw-failure log added above) was silently dropped before reaching the log file, even with the
+  env var set and pointing at a writable path: `tracing_subscriber::fmt()` with no explicit level
+  defaults to `INFO`, and `init_tracing` never overrode it (unlike `examples/tracing_demo.rs`'s own
+  `EnvFilter`-based setup, which this function doesn't share). Caught while verifying the
+  mid-flight-redraw fix above actually left a trace — it didn't, for the same reason. Now sets
+  `.with_max_level(tracing::Level::DEBUG)`; opting into this diagnostic mode at all (setting the
+  env var) is already the signal that debug-level detail is wanted (TF-650)
 
 ### Changed
 

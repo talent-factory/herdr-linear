@@ -23,6 +23,18 @@ fn dispatch_launch_decision(args: &[String], stdin_content: &str) -> Option<Stri
 /// before this function existed. Best-effort: any failure to open the file or install the
 /// subscriber is swallowed, since logging is a diagnostic aid, not something worth failing
 /// startup over.
+///
+/// Explicitly sets the max level to `DEBUG` (`tracing_subscriber::fmt()` with no filter
+/// defaults to `INFO`, unlike `examples/tracing_demo.rs`'s own `EnvFilter`-based setup, which
+/// this function doesn't share). Caught live: every `tracing::debug!` call this crate has ever
+/// shipped — `send_prompt_until_visible_with`'s attempt-failure logging, `flush_buffered_quit`'s
+/// discarded-key count, and `start_implementation`'s mid-flight redraw-failure log added
+/// alongside this fix — was silently dropped by the unfiltered default even with
+/// `HERDR_LINEAR_LOG_FILE` set and pointed at a real, writable file: the calls execute, the
+/// subscriber is installed, but `INFO`'s floor discards every one of them before they reach the
+/// writer. Opting into this diagnostic mode at all (setting the env var in the first place) is
+/// already the signal that debug-level detail is wanted, so there's no reason for that default
+/// to still apply once a destination has been configured.
 fn init_tracing() {
     let Ok(path) = std::env::var("HERDR_LINEAR_LOG_FILE") else {
         return;
@@ -37,6 +49,7 @@ fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::sync::Mutex::new(file))
         .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
         .try_init();
 }
 
@@ -385,6 +398,23 @@ const PROMPT_SEND_STABILITY_DURATION: std::time::Duration = std::time::Duration:
 /// for a target that's merely slow rather than actually stuck.
 const PROMPT_SEND_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
 
+/// Compile-time enforcement of the same two [`PromptSendPolicy`] invariants
+/// [`send_prompt_until_visible_with`]'s `debug_assert!`s check at the one real call site — but
+/// unconditionally, in every profile including `--release` (`debug_assert!` compiles out
+/// entirely there; this crate's `[profile.release]` doesn't override `debug-assertions`, and
+/// `cargo build --release`/`plugin-reinstall` — see `justfile` — is the only build the actual
+/// shipped plugin binary ever comes from, so a debug-only check alone would never protect it).
+/// This only covers these four production constants, not the two test-constructed
+/// `PromptSendPolicy` values in `send_prompt_until_visible_with`'s own tests — those stay
+/// hand-verified, same as before.
+const _: () = assert!(
+    PROMPT_SEND_ATTEMPTS >= 1
+        && PROMPT_SEND_ATTEMPT_TIMEOUT.as_nanos() > PROMPT_SEND_STABILITY_DURATION.as_nanos(),
+    "PROMPT_SEND_ATTEMPTS must be >= 1 and PROMPT_SEND_ATTEMPT_TIMEOUT must exceed \
+     PROMPT_SEND_STABILITY_DURATION, or every implement attempt would silently degrade into \
+     always timing out without ever reaching PromptPollStep::Stable"
+);
+
 /// Starter content written to `config.toml` by the `c` keybinding when the file doesn't
 /// exist yet, so pressing `c` never fails with "file not found" and always opens something
 /// editable. Comments out every field rather than pre-filling one, since none has a
@@ -525,10 +555,17 @@ async fn wait_for_prompt_stable(
 /// progress hook (see [`send_prompt_until_visible`]'s doc) pushed the parameter count past
 /// clippy's `too_many_arguments` threshold. Fields mirror the `PROMPT_SEND_*` constants exactly;
 /// [`send_prompt_until_visible`] is the only real (non-test) caller and always passes those.
-/// `attempts` must be at least 1 and `attempt_timeout` must exceed `stability_duration` for the
-/// loop below to ever have a chance at reaching [`PromptPollStep::Stable`] — see the
-/// `debug_assert!` at the top of [`send_prompt_until_visible_with`] rather than duplicating that
-/// reasoning here.
+///
+/// `attempts` must be at least 1 and `attempt_timeout` must exceed `stability_duration`, or
+/// [`send_prompt_until_visible_with`]'s retry loop can never reach [`PromptPollStep::Stable`] —
+/// this struct itself has no constructor to enforce that (see its own fields being plain and
+/// public-within-module below), so two things check it instead, at different strengths: a
+/// `const _: () = assert!(...)` right after the `PROMPT_SEND_*` constants covers the one real
+/// (non-test) construction unconditionally, in every build profile including `--release`; a
+/// pair of `debug_assert!`s at the top of `send_prompt_until_visible_with` additionally cover
+/// every construction, including the two test ones, but only in debug/test builds — the
+/// `--release` binary `justfile`'s `build`/`plugin-reinstall` actually produce gets no
+/// protection from those.
 #[derive(Debug, Clone, Copy)]
 struct PromptSendPolicy {
     attempts: u32,
@@ -618,8 +655,13 @@ async fn send_prompt_until_visible_with(
     } = policy;
     // `PromptSendPolicy` is a plain data bag with no constructor to enforce this at
     // construction time (see its own doc) — catch a nonsensical policy here instead, in debug
-    // builds only, rather than let it silently degrade into "every attempt always times out
-    // without ever reaching Stable" with no indication why.
+    // builds only (the top-level `const _: () = assert!(...)` right after the `PROMPT_SEND_*`
+    // constants is what actually protects the `--release` binary). `attempts == 0` doesn't
+    // "silently degrade into always timing out" the way a too-short `attempt_timeout` does — the
+    // `for attempt in 1..=attempts` loop below just never runs, and this returns its generic
+    // "failed to send implement command" fallback immediately — but it's just as nonsensical a
+    // policy and just as worth catching here rather than downstream as a confusing one-line
+    // failure with no indication why every attempt was skipped.
     debug_assert!(
         attempts >= 1,
         "PromptSendPolicy::attempts must be at least 1"
@@ -2351,9 +2393,11 @@ exit 1
 
     #[test]
     fn prompt_attempt_status_is_none_on_the_first_attempt() {
-        // Attempt 1 fires the instant `Action::Implement`'s own "Starting implementation…"
-        // status is already on screen — redrawing identical information would be a no-op
-        // flicker, not new signal, so this must stay silent.
+        // Attempt 1 fires before any status other than `Action::Implement`'s own "Starting
+        // implementation…" has been drawn — redrawing identical information at that point would
+        // be a no-op flicker, not new signal, so this must stay silent. See
+        // `prompt_attempt_status`'s own doc for why "before any other status" isn't the same as
+        // "the instant that status is drawn" (`implement_one` still does real work first).
         assert_eq!(prompt_attempt_status("TF-579", 1, 5), None);
     }
 
@@ -3594,17 +3638,15 @@ esac
             matches!(outcome, ImplementOutcome::StartedWithWarnings(_)),
             "expected StartedWithWarnings (the mocked workflow-state failure), got {outcome:?}"
         );
-        let seen = seen_attempts.lock().unwrap();
+        // Asserted against the whole vector, not just first()/get(1) — stronger than checking
+        // each position individually, since it also catches a spurious extra callback (e.g. a
+        // duplicate forward) that per-index checks alone would miss.
         assert_eq!(
-            seen.first(),
-            Some(&(1, PROMPT_SEND_ATTEMPTS)),
-            "implement_one must forward the caller's callback for attempt 1: {seen:?}"
-        );
-        assert_eq!(
-            seen.get(1),
-            Some(&(2, PROMPT_SEND_ATTEMPTS)),
-            "implement_one must forward the caller's callback for the resend (attempt 2), \
-             proving it's the caller's real closure and not a dropped/no-op forward: {seen:?}"
+            *seen_attempts.lock().unwrap(),
+            vec![(1, PROMPT_SEND_ATTEMPTS), (2, PROMPT_SEND_ATTEMPTS)],
+            "implement_one must forward the caller's callback for both attempt 1 and the resend \
+             (attempt 2), in order, proving it's the caller's real closure and not a \
+             dropped/no-op forward"
         );
     }
 
@@ -4185,5 +4227,57 @@ esac
             outcome,
             Err("attempt 2: the implement command never appeared in the pane".to_string())
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[should_panic(expected = "PromptSendPolicy::attempts must be at least 1")]
+    async fn send_prompt_until_visible_with_asserts_attempts_is_at_least_one() {
+        // Review gap: the `debug_assert!`s guarding `PromptSendPolicy`'s invariants (added
+        // alongside the `const _: () = assert!(...)` right after the `PROMPT_SEND_*` constants,
+        // which covers the one real call site unconditionally) had nothing proving they actually
+        // fire — a typo in either condition would have passed every other test in this file.
+        let (dir, script) = write_prompt_read_always_script("echo '❯ \n'; exit 0");
+        let tab = plugin::herdr_cli::tab_create(script.to_str().unwrap(), dir.path(), "TF-579")
+            .await
+            .expect("stub tab_create must succeed");
+
+        let _ = send_prompt_until_visible_with(
+            script.to_str().unwrap(),
+            &tab.root_pane_id,
+            "irrelevant — must panic before ever sending it",
+            PromptSendPolicy {
+                attempts: 0,
+                poll_interval: std::time::Duration::from_millis(5),
+                stability_duration: std::time::Duration::from_millis(20),
+                attempt_timeout: std::time::Duration::from_millis(30),
+            },
+            |_, _| {},
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[should_panic(expected = "PromptSendPolicy::attempt_timeout must exceed stability_duration")]
+    async fn send_prompt_until_visible_with_asserts_attempt_timeout_exceeds_stability_duration() {
+        let (dir, script) = write_prompt_read_always_script("echo '❯ \n'; exit 0");
+        let tab = plugin::herdr_cli::tab_create(script.to_str().unwrap(), dir.path(), "TF-579")
+            .await
+            .expect("stub tab_create must succeed");
+
+        let _ = send_prompt_until_visible_with(
+            script.to_str().unwrap(),
+            &tab.root_pane_id,
+            "irrelevant — must panic before ever sending it",
+            PromptSendPolicy {
+                attempts: 2,
+                poll_interval: std::time::Duration::from_millis(5),
+                stability_duration: std::time::Duration::from_millis(30),
+                attempt_timeout: std::time::Duration::from_millis(30),
+            },
+            |_, _| {},
+        )
+        .await;
     }
 }
