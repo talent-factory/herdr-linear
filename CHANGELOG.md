@@ -46,6 +46,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Mouse wheel support, matching `herdr-file-viewer`'s own "keyboard-first, mouse additive" design: `main.rs::run_tui` now requests `EnableMouseCapture` on startup (herdr forwards mouse events to a pane that requests it) and a new `plugin::app::handle_mouse` dispatches the wheel — scrolling the List (moves `selected`, one issue per notch) or the Detail pane (scrolls `DETAIL_WHEEL_STEP` = 3 rows per notch, via the same clamped path `j`/`k` use), whichever half of the terminal the pointer is over. The help overlay, while open, owns the wheel exactly like it already owns the keyboard, instead of letting it leak through to the hidden view underneath. Clicks and drags are a deliberate no-op for now — not requested, and `App` has no click-target/divider-drag state to act on one with
 - Leftover idle tab after an implement agent finishes now closes itself: `implement_one` starts a detached background watcher (`main.rs::spawn_tab_close_when_agent_is_done`) right after its prompt lands, which runs `herdr agent wait --until done` and then `herdr tab close` (new `herdr_cli::tab_close`) — this never blocks `implement_one`'s own return, so single-implement (`<Enter>`) and parallel multi-implement (`start_implementation_many`/`execute_batch`, TF-622) both return to the caller immediately regardless of how long the agent actually runs. Fails open on any `agent_wait` timeout or error (agent still working, herdr losing track of the pane, its heuristic status detection missing the "done" transition) and on a `tab_close` failure afterwards — the tab is simply left open rather than risk closing out a still-useful or failed agent's output. If the plugin quits before the agent finishes, the detached task is dropped along with the rest of the tokio runtime — and, via a new `herdr_cli::OnAbandon` parameter on `agent_wait` (defaulting to the pre-existing behavior everywhere else), this "done" wait's underlying `herdr agent wait` subprocess is now `kill_on_drop`'d too, so it doesn't linger as an orphaned process for up to its full 24h timeout after the plugin itself has already exited; no cleanup across plugin/herdr-server restarts is attempted (TF-649)
 
+### Fixed
+
+- Single-issue `<Enter>` implement now shows visible progress while `send_prompt_until_visible` is
+  (re)confirming the prompt landed, instead of leaving the screen looking unchanged for the whole
+  wait. Diagnosed live against a real `headroom wrap claude ...`-style multi-process
+  `agent_command`: `agent_wait`'s "idle" status resolves in single-digit milliseconds, long before
+  the target's own input loop has attached, so the *first* (re)send is a near-certain miss rather
+  than an occasional one — every single-issue implement already paid a mandatory multi-second wait
+  for the second (re)send (typically the one that lands) with zero on-screen indication anything
+  was still happening. That's the exact shape of "prompt not injected, but a manual second
+  `<Enter>` usually works": the user is very plausibly looking at this same silent,
+  already-in-progress wait and giving up on it early. `send_prompt_until_visible`/`_with` now take an
+  `on_attempt(attempt, attempts)` progress hook, called once per (re)send; `implement_one` forwards
+  it, and the new `PromptSendPolicy` struct bundles the four retry-tuning parameters that hook
+  would otherwise have pushed past clippy's `too_many_arguments` threshold. `start_implementation`
+  (single-issue only) wires it to redraw the status via the new pure `prompt_attempt_status`
+  helper, skipping attempt 1 (redundant with the "Starting implementation for X…" status already
+  on screen) and showing "…confirming attempt N of M…" from attempt 2 on. The concurrent
+  multi-issue path (`implement_many`, TF-622) passes a no-op — several of its futures can be
+  mid-flight at once and none of them owns the one shared terminal safely, so it's unchanged. This
+  does not change the resend/confirmation logic or its timing budgets, only what's visible while
+  it runs (TF-650)
+- `HERDR_LINEAR_LOG_FILE`-based logging (`main.rs::init_tracing`) now actually emits `debug!`-level
+  records — every `tracing::debug!` call this crate has ever shipped (`send_prompt_until_visible_with`'s
+  attempt-failure logging, `flush_buffered_quit`'s discarded-key count, and the mid-flight
+  redraw-failure log added above) was silently dropped before reaching the log file, even with the
+  env var set and pointing at a writable path: `tracing_subscriber::fmt()` with no explicit level
+  defaults to `INFO`, and `init_tracing` never overrode it (unlike `examples/tracing_demo.rs`'s own
+  `EnvFilter`-based setup, which this function doesn't share). Caught while verifying the
+  mid-flight-redraw fix above actually left a trace — it didn't, for the same reason. Now sets
+  `.with_max_level(tracing::Level::DEBUG)`; opting into this diagnostic mode at all (setting the
+  env var) is already the signal that debug-level detail is wanted (TF-650)
+
 ### Changed
 
 - `c` (open `config.toml`) no longer opens a separate herdr tab for the editor. It used to create a fresh pane and type `nvim '<path>'` into its shell (`herdr pane run`) — after quitting `nvim`, that pane's shell was left behind, requiring a manual close. Now, mirroring `herdr-file-viewer`'s own editor hand-off, herdr-linear's own TUI steps aside in-place (leaves raw mode/the alternate screen, drops mouse capture) and runs the editor as a direct child process taking over the same pane; quitting the editor returns straight to the plugin's own screen, with nothing left to close. `main.rs`'s `open_config_in_herdr_pane`/`HerdrPaneError`/`editor_tab_is_alive` and the now-unused `herdr_cli::tab_list`/`tab_focus`/`pane_list`/`pane_process_info`/`find_existing_editor_tab`/`find_root_pane_for_tab`/`is_pane_alive` are all removed — this specific flow no longer talks to the herdr CLI at all. `editor.rs`'s `EDITOR_AGENT_NAME`/`build_editor_command` are removed too (no more herdr pane to label, no more shell-quoted command to type); the `editor`-resolution logic itself (`config.toml` override, else `nvim` on `PATH`, else the OS opener) is unchanged. `suspend_tui`/`resume_tui` attempt every step regardless of an earlier one's failure (mirroring `run_tui`'s own teardown discipline), and a new `EditorOutcome::TerminalNotRestored` means a failed terminal restore is now always surfaced as a status error instead of the previous behavior — a resume failure after a successful edit silently cleared the status bar with no indication anything went wrong. `run_editor_in_terminal_with` is the new pure, injectable-closure core this composition runs through, unit-tested independently of the real terminal/subprocess
