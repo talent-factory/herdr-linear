@@ -37,6 +37,8 @@ Thumbs.db
 # Agent tooling caches
 .headroom/
 .serena/
+.claude/
+skills-lock.json
 
 # Per-task git worktrees (implement-task workflow)
 /.worktrees/
