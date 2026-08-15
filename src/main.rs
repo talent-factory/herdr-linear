@@ -1405,6 +1405,63 @@ async fn start_implementation(
     }
 }
 
+/// `Enter`-while-commenting flow ([`plugin::app::Action::AddComment`], TF-648): submit
+/// `body` on `issue` via `client.add_comment()` and report the outcome as a status
+/// banner, the same `"<identifier>: <detail>"` wording and `Ok`/`Error` split
+/// `start_implementation` uses. `client.add_comment`'s `Err` is interpolated via
+/// `Display` (`{err}`), the same convention `load_issues`'/`ensure_loaded`'s
+/// `err.to_string()` calls surface `herdr_linear::Error` with — both just invoke the same
+/// `Display` impl, so no detail differs between the two spellings.
+///
+/// On failure, the draft is *not* discarded (PR #53 review): `app.restore_failed_comment_
+/// draft` reopens it as a resumable [`plugin::app::CommentState::Failed`], and the
+/// failure is additionally logged via `tracing::warn!` so it's recoverable from a log
+/// file (see `main.rs::init_tracing`) even after the status banner is next overwritten.
+async fn start_add_comment(
+    app: &mut plugin::app::App,
+    client: &herdr_linear::LinearClient,
+    issue: herdr_linear::Issue,
+    body: String,
+) {
+    match client.add_comment(&issue.id, &body).await {
+        Ok(_) => {
+            app.set_status(plugin::app::Status::Ok(format!(
+                "{}: comment added.",
+                issue.identifier
+            )));
+        }
+        Err(err) => {
+            tracing::warn!(
+                "start_add_comment: failed to add comment to {} ({err})",
+                issue.identifier
+            );
+            app.set_status(plugin::app::Status::Error(format!(
+                "{}: failed to add comment — {err} (draft kept, press m to resume it)",
+                issue.identifier
+            )));
+            app.restore_failed_comment_draft(issue, body);
+        }
+    }
+}
+
+/// The status shown when [`plugin::app::Action::AddComment`] reaches `event_loop` before
+/// a client has ever connected (`client.as_ref() == None`) — pulled into a pure function
+/// so it's directly unit-testable despite `event_loop` itself not being drivable by
+/// `TestBackend` (same rationale `apply_cycle_preset` was extracted for). In practice
+/// unreachable today: `client` only ever transitions `None` → `Some` (`ensure_loaded`'s
+/// success path, never reset back), and reaching `Action::AddComment` at all requires an
+/// already-`Loaded` view, which itself requires `load_issues` — and therefore a connected
+/// client — to have already succeeded (verified by reading every `client` assignment in
+/// this file). Kept as a real, honest branch rather than `unreachable!()` anyway: trusting
+/// that cross-module invariant here would turn a future change to the client lifecycle
+/// into a panic instead of a message.
+fn add_comment_unavailable_status(issue: &herdr_linear::Issue) -> plugin::app::Status {
+    plugin::app::Status::Error(format!(
+        "{}: not connected to Linear yet — draft kept, press m to resume it.",
+        issue.identifier
+    ))
+}
+
 /// Max per-issue detail segments [`summarize_many`] includes verbatim in the status banner
 /// before switching to a `"(+K more)"` suffix. `plugin::ui::draw`'s banner area grows with the
 /// message (see `status_banner_height`), but an unmarked/unbounded number of marked issues
@@ -1997,6 +2054,24 @@ async fn event_loop(
                                 // arm above — draw the outcome now so a queued notify-drain on
                                 // the next iteration can't clobber it before it's ever shown.
                                 terminal.draw(|frame| plugin::ui::draw(frame, app))?;
+
+                                if flush_buffered_quit()? {
+                                    break;
+                                }
+                            }
+                            plugin::app::Action::AddComment { issue, body } => {
+                                app.set_status(plugin::app::Status::Ok(format!(
+                                    "{}: posting comment…",
+                                    issue.identifier
+                                )));
+                                terminal.draw(|frame| plugin::ui::draw(frame, app))?;
+                                match client.as_ref() {
+                                    Some(c) => start_add_comment(app, c, issue, body).await,
+                                    None => {
+                                        app.set_status(add_comment_unavailable_status(&issue));
+                                        app.restore_failed_comment_draft(issue, body);
+                                    }
+                                }
 
                                 if flush_buffered_quit()? {
                                     break;
@@ -3021,6 +3096,149 @@ exit 1
             labels: herdr_linear::LabelConnection { nodes: vec![] },
             url: format!("https://linear.app/team/issue/{identifier}"),
         }
+    }
+
+    /// TF-648: `Action::AddComment`'s handler — success path. Verifies the exact status
+    /// text `event_loop` ends up showing, not just "some Ok status got set" (a
+    /// swapped-in-a-different-issue or dropped-identifier regression would still leave
+    /// `status().is_some()` true).
+    #[tokio::test]
+    async fn start_add_comment_reports_success_status() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "data": {
+                        "commentCreate": {
+                            "comment": {
+                                "id": "comment-1",
+                                "body": "Looks good",
+                                "user": {
+                                    "id": "user-1",
+                                    "email": "alice@example.com",
+                                    "name": "Alice",
+                                    "avatarUrl": null,
+                                    "createdAt": "2026-01-01T00:00:00Z",
+                                    "updatedAt": "2026-01-01T00:00:00Z"
+                                },
+                                "createdAt": "2026-01-01T00:00:00Z",
+                                "updatedAt": "2026-01-01T00:00:00Z"
+                            }
+                        }
+                    },
+                    "errors": null
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let client = herdr_linear::LinearClient::with_endpoint(
+            "lin_api_test",
+            format!("{}/graphql", server.url()),
+        )
+        .unwrap();
+        let mut app = plugin::app::App::new();
+        let issue = sample_issue("TF-648");
+
+        start_add_comment(&mut app, &client, issue, "Looks good".to_string()).await;
+
+        let status = app.status().unwrap();
+        assert!(!status.is_error());
+        assert_eq!(status.text(), "TF-648: comment added.");
+        mock.assert_async().await;
+    }
+
+    /// TF-648: `Action::AddComment`'s handler — a GraphQL-level failure (bad auth,
+    /// validation, ...) must surface as an `Error` status naming the issue, mirroring
+    /// `load_issues`'/`ensure_loaded`'s existing `err.to_string()` convention rather than
+    /// swallowing the underlying `herdr_linear::Error`.
+    #[tokio::test]
+    async fn start_add_comment_reports_error_status_on_failure() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(json!({"data": null, "errors": [{"message": "not authorized"}]}).to_string())
+            .create_async()
+            .await;
+        let client = herdr_linear::LinearClient::with_endpoint(
+            "lin_api_test",
+            format!("{}/graphql", server.url()),
+        )
+        .unwrap();
+        let mut app = plugin::app::App::new();
+        let issue = sample_issue("TF-648");
+
+        start_add_comment(&mut app, &client, issue, "Looks good".to_string()).await;
+
+        let status = app.status().unwrap();
+        assert!(status.is_error());
+        assert!(status.text().contains("TF-648"));
+        assert!(status.text().contains("failed to add comment"));
+        assert!(status.text().contains("not authorized"));
+    }
+
+    /// PR #53 review: a comment that fails to send must not simply vanish — it should be
+    /// resumable via `m` rather than requiring the user to retype it from memory.
+    /// `start_add_comment`'s `Err` branch restores it as `CommentState::Failed`, which
+    /// `App::start_commenting` (see its own doc) resumes for the same issue. Proven
+    /// end-to-end here through the same public API `handle_key`/`event_loop` themselves
+    /// use, not by reaching into `App`'s private fields.
+    #[tokio::test]
+    async fn start_add_comment_restores_a_resumable_draft_on_failure() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(json!({"data": null, "errors": [{"message": "not authorized"}]}).to_string())
+            .create_async()
+            .await;
+        let client = herdr_linear::LinearClient::with_endpoint(
+            "lin_api_test",
+            format!("{}/graphql", server.url()),
+        )
+        .unwrap();
+        let mut app = plugin::app::App::new();
+        app.enter_selected_menu_option();
+        app.set_issues(vec![sample_issue("TF-648")]);
+        let issue = sample_issue("TF-648");
+
+        start_add_comment(&mut app, &client, issue, "half-typed".to_string()).await;
+
+        // Resuming with `m` should pick the failed text back up rather than starting
+        // blank — proven by appending one more character and confirming, then checking
+        // the *whole* resulting body rather than just "editing became true".
+        app.start_commenting();
+        app.push_comment_char('!');
+        let action = app.confirm_comment();
+
+        assert_eq!(
+            action,
+            Some(plugin::app::Action::AddComment {
+                issue: sample_issue("TF-648"),
+                body: "half-typed!".to_string()
+            })
+        );
+    }
+
+    /// PR #53 review: `add_comment_unavailable_status` names the issue and, unlike the
+    /// pre-fix wording ("try again"), doesn't imply a free/cheap retry — the caller
+    /// (`event_loop`) separately calls `App::restore_failed_comment_draft` so the draft
+    /// really is kept, and this message should say so honestly rather than by accident.
+    #[test]
+    fn add_comment_unavailable_status_names_the_issue_and_is_an_error() {
+        let issue = sample_issue("TF-648");
+
+        let status = add_comment_unavailable_status(&issue);
+
+        assert!(status.is_error());
+        assert!(status.text().contains("TF-648"));
+        assert!(status.text().contains("draft kept"));
     }
 
     /// TF-617: `apply_fetched_issues` is `load_issues`'s shared post-fetch step —

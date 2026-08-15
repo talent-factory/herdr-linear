@@ -2,8 +2,8 @@
 //! message with a retry hint, or a two-pane issue list + detail view.
 
 use crate::plugin::app::{
-    matching_issue_indices, ActivePreset, App, HelpOverlayState, HelpTab, Screen, Status, ViewKind,
-    ViewState, MENU_OPTIONS,
+    matching_issue_indices, ActivePreset, App, CommentState, HelpOverlayState, HelpTab, Screen,
+    Status, ViewKind, ViewState, MENU_OPTIONS,
 };
 use crate::Issue;
 use ratatui::{
@@ -91,6 +91,14 @@ const STATUS_BANNER_MAX_HEIGHT: u16 = 10;
 /// for one short message, not TF-590's multi-issue failure banner, which can carry one
 /// `"<identifier>: <message>"` segment per failed issue.
 fn status_banner_height(text: &str, width: u16) -> u16 {
+    estimated_banner_lines(text, width).clamp(STATUS_BANNER_MIN_HEIGHT, STATUS_BANNER_MAX_HEIGHT)
+}
+
+/// The unclamped estimate `status_banner_height` clamps into `[STATUS_BANNER_MIN_HEIGHT,
+/// STATUS_BANNER_MAX_HEIGHT]`, exposed separately so a caller that deliberately wants a taller
+/// banner than that range — see [`comment_banner_height`] — can still size against the same
+/// conservative estimate rather than reimplementing it.
+fn estimated_banner_lines(text: &str, width: u16) -> u16 {
     if width == 0 {
         return STATUS_BANNER_MIN_HEIGHT;
     }
@@ -100,8 +108,20 @@ fn status_banner_height(text: &str, width: u16) -> u16 {
     // otherwise wrap `as u16` around to a small number and *under*-estimate, which is exactly
     // the failure mode this function's own doc says it deliberately avoids.
     let chars = text.chars().count().min(u16::MAX as usize) as u16;
-    let estimated = chars.div_ceil(width).saturating_add(2);
-    estimated.clamp(STATUS_BANNER_MIN_HEIGHT, STATUS_BANNER_MAX_HEIGHT)
+    chars.div_ceil(width).saturating_add(2)
+}
+
+/// Like [`status_banner_height`], but for the comment-draft banner specifically (PR #53
+/// review fix): a comment is free-form user text the user is actively typing, not a short
+/// status/error message, so clamping it to `STATUS_BANNER_MAX_HEIGHT` (10 rows) silently
+/// scrolled the live cursor off-screen past ~a few sentences — the opposite of what a text
+/// composer needs. Grows up to roughly half the terminal height instead (still leaving the
+/// list/detail panes below their own `Constraint::Min(3)` floor), and `draw_view`'s caller
+/// additionally scrolls the `Paragraph` for the rare draft that's still too long even for
+/// that generous cap, rather than relying on height alone.
+fn comment_banner_height(text: &str, width: u16, terminal_height: u16) -> u16 {
+    let generous_max = (terminal_height / 2).max(STATUS_BANNER_MIN_HEIGHT);
+    estimated_banner_lines(text, width).clamp(STATUS_BANNER_MIN_HEIGHT, generous_max)
 }
 
 fn draw_view(
@@ -134,9 +154,61 @@ fn draw_view(
             selected,
             marked,
             filter,
+            comment,
             detail_scroll,
         } => {
-            let area = if let Some(status) = status {
+            // `selected` indexes this filtered subset, not `issues` directly — see
+            // `matching_issue_indices`'s doc comment and `App::selected_issue`, which the
+            // detail pane below mirrors exactly so the two can never disagree about which
+            // issue is highlighted. Computed once, up here, rather than at each call site,
+            // so there's exactly one place that answers "which issue is selected". The
+            // comment-draft banner (TF-648) deliberately does *not* read from this — see
+            // `CommentState::Editing`'s doc — it renders whichever issue its own draft was
+            // captured against instead, precisely so it can't be swayed by this.
+            let matched_indices = matching_issue_indices(issues, &filter.query);
+            let selected_issue = matched_indices
+                .get(*selected)
+                .and_then(|&index| issues.get(index));
+
+            let area = if let CommentState::Editing { issue, body } = comment {
+                // TF-648: while composing a comment, the banner area shows the live
+                // draft instead of any stale `status` — the same live-cursor (`▏`)
+                // convention the `/`-filter uses in the list title below, just in the
+                // banner rather than the title, since (unlike the filter query) the
+                // draft has no live effect on the list itself to show inline. `issue`
+                // is the target captured once when `m` was pressed
+                // (`App::start_commenting`) and read from the draft itself rather than
+                // re-resolved from `selected_issue` — so this banner (and what
+                // `App::confirm_comment` actually posts to) can never disagree with
+                // each other, even if some input path moves the selection afterward
+                // (PR #53 review: this used to be possible via the mouse wheel).
+                let draft = format!(
+                    "Comment on {} (Enter to send, Esc to cancel): {body}▏",
+                    issue.identifier
+                );
+                // Comment drafts are free-form text, not a short status message, so this
+                // grows well past `STATUS_BANNER_MAX_HEIGHT` (see `comment_banner_height`'s
+                // doc) — and, for the rare draft that's still too long even for that
+                // generous cap, scrolls so the tail (including the live cursor) stays
+                // visible instead of silently rendering off the bottom of the banner
+                // (PR #53 review fix for the original hard-clipped, unscrolled banner).
+                let banner_height =
+                    comment_banner_height(&draft, frame.area().width, frame.area().height);
+                let total_lines = estimated_banner_lines(&draft, frame.area().width);
+                let scroll_y = total_lines.saturating_sub(banner_height);
+                let outer = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(3), Constraint::Length(banner_height)])
+                    .split(frame.area());
+                frame.render_widget(
+                    Paragraph::new(draft)
+                        .style(Style::default().fg(Color::Cyan))
+                        .wrap(Wrap { trim: false })
+                        .scroll((scroll_y, 0)),
+                    outer[1],
+                );
+                outer[0]
+            } else if let Some(status) = status {
                 let banner_height = status_banner_height(status.text(), frame.area().width);
                 let outer = Layout::default()
                     .direction(Direction::Vertical)
@@ -167,12 +239,6 @@ fn draw_view(
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .split(area);
-
-            // `selected` indexes this filtered subset, not `issues` directly — see
-            // `matching_issue_indices`'s doc comment and `App::selected_issue`, which the
-            // detail pane below mirrors exactly so the two panes never disagree about
-            // which issue is highlighted.
-            let matched_indices = matching_issue_indices(issues, &filter.query);
 
             // `▏` marks the live cursor position while editing, so it's visually
             // distinct from a confirmed-but-inactive filter shown without one.
@@ -244,9 +310,6 @@ fn draw_view(
             let detail_area = detail_block.inner(chunks[1]);
             frame.render_widget(detail_block, chunks[1]);
 
-            let selected_issue = matched_indices
-                .get(*selected)
-                .and_then(|&index| issues.get(index));
             if let Some(issue) = selected_issue {
                 // Header (identifier/title/Status/Assignee/Project) and body
                 // (the Markdown description) are rendered as one continuous
@@ -762,8 +825,8 @@ fn about_lines() -> Vec<String> {
 /// (the single source of truth — see that module's doc comment), grouped under a
 /// heading each time `context` changes. Relies on `KEYBINDINGS` grouping same-context
 /// entries contiguously (an invariant that table's own tests guard) rather than
-/// re-sorting, so the table's declared order (Menu, View, Filtering, Error screen,
-/// Global) is what's shown, not an alphabetized one.
+/// re-sorting, so the table's declared order (Menu, View, Filtering, Commenting, Error
+/// screen, Global) is what's shown, not an alphabetized one.
 ///
 /// Cached in a `OnceLock` for the same reason as [`about_lines`]: `KEYBINDINGS` is a
 /// `static` table that never changes within a running process, so recomputing this on
@@ -1302,6 +1365,23 @@ mod tests {
             .collect()
     }
 
+    /// Like [`rendered_cells_with_size`], but keeps each cell's foreground [`Color`]
+    /// instead of its [`Modifier`] — needed to verify the comment-draft banner's distinct
+    /// `Color::Cyan` styling (PR #53 review), which neither `rendered_text_with_size` nor
+    /// `rendered_cells_with_size` can represent.
+    fn rendered_fg_colors_with_size(app: &App, width: u16, height: u16) -> Vec<(String, Color)> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| (cell.symbol().to_string(), cell.fg))
+            .collect()
+    }
+
     /// The start index of the first contiguous run of `symbols` matching `needle`,
     /// character by character — used to locate a known label (e.g. a tab name) within
     /// [`rendered_cells_with_size`]'s output so its cells' styling can be inspected.
@@ -1483,6 +1563,62 @@ mod tests {
         let text = rendered_text(&app);
         assert!(text.contains("ENG-1"));
         assert!(text.contains("Title for ENG-1"));
+    }
+
+    #[test]
+    fn renders_the_comment_draft_banner_while_commenting() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        handle_key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+        for c in "lgtm".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+
+        let text = rendered_text(&app);
+        assert!(text.contains("Comment on ENG-1"));
+        assert!(text.contains("lgtm"));
+    }
+
+    #[test]
+    fn comment_draft_banner_takes_precedence_over_a_stale_status_banner() {
+        // A leftover `status` from a previous action (e.g. a prior implement run) must
+        // not bleed into view while a comment draft is open — the banner area can only
+        // show one or the other, and TF-648's draft is deliberately the one shown.
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        app.set_status(Status::Ok("ENG-1: tab opened.".to_string()));
+        handle_key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+
+        let text = rendered_text(&app);
+        assert!(text.contains("Comment on ENG-1"));
+        assert!(!text.contains("tab opened."));
+    }
+
+    #[test]
+    fn comment_draft_banner_renders_in_cyan() {
+        // PR #53 review: `renders_the_comment_draft_banner_while_commenting` only
+        // asserts the banner's *text* (via `rendered_text`, which flattens styling
+        // away). A regression that silently dropped the draft `Paragraph`'s
+        // `Style::default().fg(Color::Cyan)` — the whole point of which is to visually
+        // distinguish "you're composing" from a normal `Status::Ok`/`Status::Error`
+        // banner — would still pass that test. Assert the actual rendered cell color
+        // instead.
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        handle_key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+        for c in "lgtm".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+
+        let cells = rendered_fg_colors_with_size(&app, 60, 15);
+        let symbols: Vec<String> = cells.iter().map(|(symbol, _)| symbol.clone()).collect();
+        let needle = "Comment on ENG-1";
+        let start = find_cell_run(&symbols, needle)
+            .expect("the draft banner's text should be in the rendered buffer");
+
+        for (symbol, fg) in &cells[start..start + needle.chars().count()] {
+            assert_eq!(*fg, Color::Cyan, "expected {symbol:?} to be styled Cyan");
+        }
     }
 
     #[test]
@@ -2676,7 +2812,12 @@ mod tests {
         handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
         handle_key(&mut app, KeyCode::Char('2'), KeyModifiers::NONE); // -> Keybindings
 
-        let text = rendered_text_with_size(&app, 100, 40);
+        // Tall enough that the whole registry renders without scrolling — bumped from 40
+        // to 60 by TF-648, which added a new context (`Commenting`, the table's 4th,
+        // inserted between `Filtering` and `ErrorScreen` — 4 entries plus a heading and
+        // a separator) on top of a new `m` binding in `View`. Bump again, generously,
+        // next time this starts failing rather than shaving off the minimum.
+        let text = rendered_text_with_size(&app, 100, 60);
 
         assert!(text.contains("Keybindings"));
         for binding in crate::plugin::keybindings::KEYBINDINGS {
