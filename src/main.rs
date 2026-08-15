@@ -936,7 +936,7 @@ type StatusNotifier = tokio::sync::mpsc::UnboundedSender<plugin::app::Status>;
 /// the only user-visible sign that "the tab is gone" means "the agent finished", not "lost" or
 /// "crashed" (TF-653: two tabs vanished mid-session with no such signal, which led to re-running
 /// an already-finished implementation). Split out as a pure function, mirroring
-/// [`prompt_attempt_status`] above, purely so the wording is unit-testable without a channel or
+/// [`prompt_attempt_status`] below, purely so the wording is unit-testable without a channel or
 /// background task in the loop.
 fn tab_auto_closed_status(identifier: &str) -> plugin::app::Status {
     plugin::app::Status::Ok(format!("{identifier}: agent finished, tab closed."))
@@ -1815,15 +1815,40 @@ fn apply_cycle_preset(
 /// `try_recv` never blocks, so this never stalls the render/input loop whether or not anything
 /// is queued. If more than one notice is queued, only the last one survives — `App::set_status`
 /// overwrites rather than accumulates, the same class as every other `set_status` overwrite
-/// already in this codebase; an accepted tradeoff for a transient banner.
+/// already in this codebase; an accepted tradeoff for a transient banner. Any notice replaced
+/// this way (unlike one merely superseded by a later, unrelated action) is logged via
+/// `tracing::debug!` (PR #57 review) — silently dropping *this specific* kind of status is what
+/// TF-653 exists to prevent in the first place, so even though the last-wins behavior itself is
+/// staying, it shouldn't also be unrecoverable from a log file if it ever matters (e.g. several
+/// of `implement_many`'s concurrently-running tabs closing within the same poll window).
 ///
-/// Split out as a pure function, mirroring [`tab_auto_closed_status`], so this is unit-testable
-/// without a running `event_loop` or a real terminal.
+/// Callers matter for correctness here, not just as an implementation detail: this only avoids
+/// TF-653's original clobber bug (a notice overwriting a just-set, never-yet-drawn outcome
+/// status before the user ever saw it) because `event_loop` no longer calls this unconditionally
+/// every tick — see its `skip_drain_this_tick` mechanism, which this function relies on but
+/// cannot enforce or verify itself. Extracted into its own function anyway (not a "pure"
+/// function — it mutates both `rx` and `app` — mirroring [`tab_auto_closed_status`]'s *reason*
+/// for being split out, not its purity) purely so its own drain/overwrite semantics are
+/// unit-testable without a running `event_loop` or a real terminal; the loop-level ordering
+/// itself is not covered by an automated test (`event_loop` is hardcoded to a real
+/// `CrosstermBackend` terminal, so it can't be driven by `TestBackend` — same limitation
+/// `apply_cycle_preset` was extracted to work around, which doesn't help here since the property
+/// under test is the *ordering* of two loop-level statements, not a pure computation) — reasoned
+/// about via this doc comment and the one on `skip_drain_this_tick` instead.
 fn drain_notifications(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<plugin::app::Status>,
     app: &mut plugin::app::App,
 ) {
+    let mut pending: Option<plugin::app::Status> = None;
     while let Ok(status) = rx.try_recv() {
+        if let Some(replaced) = pending.replace(status) {
+            tracing::debug!(
+                "drain_notifications: replaced a queued status before it was ever drawn: {}",
+                replaced.text()
+            );
+        }
+    }
+    if let Some(status) = pending {
         app.set_status(status);
     }
 }
@@ -1846,20 +1871,40 @@ async fn event_loop(
     // screen at all.
     let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel::<plugin::app::Status>();
 
+    // TF-653 review (PR #57): whether the *previous* iteration's `poll` returned because an
+    // event arrived (`true`) rather than timing out (`false`) — read at the top of this
+    // iteration to decide whether `drain_notifications` is safe to run yet, then overwritten
+    // with this iteration's own `poll` result at the bottom. Starts `false`: nothing has been
+    // set by an event handler before the first iteration, so there's nothing to protect yet.
+    //
+    // A first version of this fix (PR #56) drew once, inline, right after `Action::Implement`/
+    // `Action::ImplementMany`'s blocking calls returned — closing the race for those two arms
+    // only, and only in the narrow sense of "drawn at all": a `terminal.draw()` immediately
+    // followed by *another* `terminal.draw()` (the next iteration's, once `drain_notifications`
+    // had overwritten the status) can both reach the terminal within the same tick, with no
+    // guarantee an emulator ever painted the first one before the second arrived. Deferring
+    // `drain_notifications` until a `poll` genuinely times out — meaning the terminal has been
+    // sitting on the current draw, undisturbed, for up to the full `poll` duration — reuses the
+    // exact mechanism that already gives every other status banner its real, human-observable
+    // dwell time, rather than inventing a separate minimum-display-duration timer. It also
+    // protects *every* action arm uniformly (`OpenInBrowser`, `OpenConfig`, `CyclePreset`, ...),
+    // not just the two that happened to `.await` a background result — those two are no
+    // longer special-cased at all; see `drain_notifications`'s own doc for the property this
+    // guarantees, and its "not unit-tested" note for what this ordering still relies on being
+    // gotten right by inspection rather than a driven `event_loop` test.
+    let mut skip_drain_this_tick = false;
+
     loop {
-        // Drained before the draw below so a tab that auto-closed while this loop was blocked
-        // on `crossterm::event::poll` shows up in the very next frame, not one frame later.
-        // Safe to run unconditionally at the top of every iteration only because every action
-        // handler below that `.await`s a background result (`Action::Implement`,
-        // `Action::ImplementMany`) draws immediately after that `.await` returns — so a status
-        // those handlers just set is always rendered at least once before this drain gets a
-        // chance to overwrite it with a queued notice (TF-653; previously this drain could
-        // clobber a just-set, never-yet-drawn `Status::Error` with a benign "tab closed" banner).
-        drain_notifications(&mut notify_rx, app);
+        // See `skip_drain_this_tick`'s declaration above for why this is conditional now
+        // (TF-653 review, PR #57) rather than unconditional.
+        if !skip_drain_this_tick {
+            drain_notifications(&mut notify_rx, app);
+        }
 
         terminal.draw(|frame| plugin::ui::draw(frame, app))?;
 
-        if crossterm::event::poll(std::time::Duration::from_millis(200))? {
+        skip_drain_this_tick = crossterm::event::poll(std::time::Duration::from_millis(200))?;
+        if skip_drain_this_tick {
             match crossterm::event::read()? {
                 crossterm::event::Event::Mouse(mouse) => {
                     // Real-time, not cached from the last `terminal.draw` — cheap (a single
@@ -2017,11 +2062,11 @@ async fn event_loop(
                                         issue.identifier
                                     ))),
                                 }
-                                // TF-653: draw the outcome status right away so the next loop
-                                // iteration's `drain_notifications` can't overwrite it — a
-                                // background tab-close notice queued during the `.await` above
-                                // must never clobber a status that hasn't been shown even once.
-                                terminal.draw(|frame| plugin::ui::draw(frame, app))?;
+                                // TF-653 (PR #57 review): no explicit draw here anymore — the
+                                // loop-top `skip_drain_this_tick` mechanism now guarantees the
+                                // status just set above renders, protected from
+                                // `drain_notifications`, on the very next iteration regardless
+                                // of which action arm set it. See that mechanism's doc.
 
                                 if flush_buffered_quit()? {
                                     break;
@@ -2050,10 +2095,8 @@ async fn event_loop(
                                         "not connected to Linear yet — try again.".to_string(),
                                     )),
                                 }
-                                // TF-653: same reasoning as the single-issue `Action::Implement`
-                                // arm above — draw the outcome now so a queued notify-drain on
-                                // the next iteration can't clobber it before it's ever shown.
-                                terminal.draw(|frame| plugin::ui::draw(frame, app))?;
+                                // TF-653 (PR #57 review): see the single-issue `Action::Implement`
+                                // arm above — same reasoning, no explicit draw needed here either.
 
                                 if flush_buffered_quit()? {
                                     break;

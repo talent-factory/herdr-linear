@@ -97,6 +97,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`AgentStatus` is a 5-value screen-content heuristic, `PaneInfo`/the `pane_exited` event carry
   neither), so there is currently no reliable, non-heuristic way to make that distinction; tracked
   separately as TF-654, blocked on herdr (TF-653)
+- Review follow-up on the entry above: the notify-drain clobber it fixed for `Action::Implement`/
+  `Action::ImplementMany` (an explicit `terminal.draw()` immediately after each blocking call
+  returns) was itself both too narrow and, in the strict sense, still racy. Too narrow because
+  every other `event_loop` arm that sets a status without `.await`ing anything first — `Action::
+  OpenInBrowser`'s clipboard-copy failure, both of `Action::OpenConfig`'s branches (its post-editor
+  one worst of all: the external-editor hand-off blocks for however long the user is in their
+  editor, a far wider window for a notice to land in than either implement call), `Action::
+  CyclePreset`'s error branch — had exactly the same unprotected shape and simply hadn't been
+  named in the original bug report. Still racy because "drawn once" isn't "seen": two
+  `terminal.draw()` calls with no real wait between them (an outcome status's draw, immediately
+  followed by the next tick's drain-then-redraw once `flush_buffered_quit`'s non-blocking poll
+  returns) can both reach the terminal within the same tick, with no guarantee an emulator ever
+  painted the first before the second arrived. `event_loop` now tracks whether the *previous*
+  `crossterm::event::poll` returned because an event arrived, and skips that tick's
+  `drain_notifications` when it did — deferring the drain until a `poll` genuinely times out, i.e.
+  until the terminal has been sitting on the current draw, undisturbed, for a real dwell time (up
+  to the full 200ms `poll` window) — reusing the exact mechanism that already gives every other
+  status banner its dwell time, rather than inventing a separate minimum-display-duration timer.
+  This protects every action arm uniformly, so the two explicit post-`.await` draws this ticket
+  originally added are gone; nothing arm-specific replaces them. `drain_notifications` additionally
+  logs (`tracing::debug!`) any notice it discards before ever drawing it — the "only the last
+  survives" tradeoff itself is unchanged (an accepted class of overwrite, same as every other
+  `set_status` call), but with `implement_many`'s concurrency it's plausible for more than one tab
+  to auto-close within a single poll window, and a dropped notice from *this* class shouldn't also
+  be unrecoverable from a log file, since a tab silently vanishing with no signal is the exact bug
+  TF-653 exists to prevent. The loop-level ordering this relies on is still not covered by an
+  automated test — `event_loop` remains hardcoded to a real `CrosstermBackend` terminal and can't
+  be driven by `TestBackend` — reasoned about via the (now single, non-duplicated) doc comment on
+  `event_loop`'s `skip_drain_this_tick` instead, same as before (TF-653)
 - `HERDR_LINEAR_LOG_FILE`-based logging (`main.rs::init_tracing`) now actually emits `debug!`-level
   records — every `tracing::debug!` call this crate has ever shipped (`send_prompt_until_visible_with`'s
   attempt-failure logging, `flush_buffered_quit`'s discarded-key count, and the mid-flight
