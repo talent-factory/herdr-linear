@@ -80,12 +80,23 @@ pub fn team_open_filter(team_id: &str, filter_terms: &[FilterTerm]) -> Value {
 /// and what keeps every existing caller (none of which have a query yet) byte-identical
 /// to pre-TF-616 behavior.
 ///
-/// Two terms of the same kind combine only when their fragments touch *different* leaf
-/// keys under a shared object — e.g. `priority:>=2` and `priority:<=4` fold into one
-/// `{"gte":2,"lte":4}` range, since `>=`/`<=` map to distinct comparator keys (see
+/// **`FilterTerm::State` is the one exception to "merge": it *replaces* `base`'s
+/// entire `"state"` key rather than deep-merging under it.** Every `*_open_filter`
+/// base starts with `state.type.nin: ["completed", "canceled"]` (the "open issues
+/// only" default). Naming an explicit state — e.g. a `state:"Done"` preset — expresses
+/// a *complete* answer to "which state," so ANDing that name onto the still-present
+/// type exclusion produced a self-contradictory filter for any state whose type
+/// actually is completed/canceled: "type is not completed" AND "name is Done" matches
+/// nothing, because "Done" *is* a completed-type state. Regression:
+/// `project_open_filter_state_term_naming_a_completed_state_is_not_excluded_by_the_open_type_filter`.
+///
+/// Terms of any other kind still combine only when their fragments touch *different*
+/// leaf keys under a shared object — e.g. `priority:>=2` and `priority:<=4` fold into
+/// one `{"gte":2,"lte":4}` range, since `>=`/`<=` map to distinct comparator keys (see
 /// [`filter_term_fragment`]). When two terms land on the *same* leaf key instead (two
-/// `priority:>=` terms, two `state:` terms, two `label:` terms), the later term wins and
-/// the earlier one is silently dropped — ordinary last-write-wins map-insert semantics.
+/// `priority:>=` terms, two `label:` terms — or two `state:` terms, which now each
+/// replace `"state"` wholesale in turn), the later term wins and the earlier one is
+/// silently dropped — ordinary last-write-wins map-insert/replace semantics.
 /// `query.rs`'s `ParsedQuery::filters` doc left this an open question for TF-616 to
 /// settle; this is the answer, and it's deliberately simple: no attempt is made here to
 /// combine same-key repeats into an `and`/`or` group. TF-617 settled where the fix
@@ -100,7 +111,16 @@ pub fn team_open_filter(team_id: &str, filter_terms: &[FilterTerm]) -> Value {
 /// through `parse_query`.
 fn merge_filter_terms(mut base: Value, filter_terms: &[FilterTerm]) -> Value {
     for term in filter_terms {
-        merge_json_object(&mut base, filter_term_fragment(term));
+        if let FilterTerm::State(name) = term {
+            if let Some(map) = base.as_object_mut() {
+                map.insert(
+                    "state".to_string(),
+                    json!({ "name": { "eqIgnoreCase": name } }),
+                );
+            }
+        } else {
+            merge_json_object(&mut base, filter_term_fragment(term));
+        }
     }
     base
 }
@@ -592,25 +612,46 @@ mod tests {
     }
 
     #[test]
-    fn project_open_filter_merges_a_single_state_term_alongside_the_base_state_filter() {
+    fn project_open_filter_state_term_replaces_the_base_state_filter_wholesale() {
         // The base filter already has a `"state"` key (`type: { nin: [...] }`); a
-        // `state:` term must merge its `name` constraint into that same object rather
-        // than replacing it.
+        // `state:` term replaces that key entirely with its own `name` constraint
+        // rather than merging alongside it — see `merge_filter_terms`'s doc for why
+        // ANDing the two would silently zero out results for completed/canceled-type
+        // states.
         let filter = project_open_filter("project-123", &[FilterTerm::State("In Review".into())]);
 
         assert_eq!(filter["project"]["id"]["eq"], "project-123");
-        assert_eq!(
-            filter["state"]["type"]["nin"],
-            json!(["completed", "canceled"])
-        );
         assert_eq!(filter["state"]["name"]["eqIgnoreCase"], "In Review");
+        assert!(filter["state"].get("type").is_none());
+    }
+
+    #[test]
+    fn project_open_filter_state_term_naming_a_completed_state_is_not_excluded_by_the_open_type_filter(
+    ) {
+        // Regression test: filtering by a named `completed`/`canceled`-type state (e.g.
+        // a "Done" preset — `state:"Done" sort:-updated`) must actually return that
+        // state's issues. Before this fix, `state:` terms were merged *alongside* the
+        // base filter's `state.type.nin: ["completed", "canceled"]` exclusion instead
+        // of replacing it, producing a self-contradictory server-side filter — "state
+        // type is not completed/canceled" AND "state name is Done" — that Linear's API
+        // resolves to zero results for any state whose type actually is completed or
+        // canceled. Live team data confirmed "Done" is `type: "completed"`.
+        let filter = project_open_filter("project-123", &[FilterTerm::State("Done".into())]);
+
+        assert_eq!(filter["state"]["name"]["eqIgnoreCase"], "Done");
+        assert!(
+            filter["state"].get("type").is_none(),
+            "a state: term must replace the open/not-completed type exclusion, not AND \
+             with it — otherwise naming a completed-type state matches nothing: {filter:?}"
+        );
     }
 
     #[test]
     fn open_filter_second_of_two_colliding_state_terms_silently_wins() {
-        // Two `state:` terms collide on the same leaf key ("state.name.eqIgnoreCase").
-        // Documents the current last-write-wins behavior of merge_json_object's
-        // non-object-leaf collision branch.
+        // Two `state:` terms collide: each replaces the whole "state" key in turn
+        // (merge_filter_terms' special case), so the second wins wholesale — the
+        // first's replacement is simply overwritten, same last-write-wins spirit as
+        // every other same-leaf-key collision this module documents.
         let filter = project_open_filter(
             "project-123",
             &[
@@ -620,12 +661,7 @@ mod tests {
         );
 
         assert_eq!(filter["state"]["name"]["eqIgnoreCase"], "Done");
-        // The base filter's own "state.type" constraint must survive the collision on
-        // the sibling "state.name" key — it's a different leaf under the same object.
-        assert_eq!(
-            filter["state"]["type"]["nin"],
-            json!(["completed", "canceled"])
-        );
+        assert!(filter["state"].get("type").is_none());
     }
 
     #[test]
@@ -662,11 +698,8 @@ mod tests {
         let filter = assignee_open_filter("user-123", &terms);
 
         assert_eq!(filter["assignee"]["id"]["eq"], "user-123");
-        assert_eq!(
-            filter["state"]["type"]["nin"],
-            json!(["completed", "canceled"])
-        );
         assert_eq!(filter["state"]["name"]["eqIgnoreCase"], "In Review");
+        assert!(filter["state"].get("type").is_none());
         assert_eq!(filter["priority"]["gte"], 2);
         assert_eq!(filter["labels"]["name"]["eqIgnoreCase"], "urgent-fix");
     }
