@@ -242,10 +242,13 @@ fn is_agent_not_found_response(error: &Error) -> bool {
 }
 
 /// Wall-clock ceiling for `herdr` subprocess calls that don't carry their own `--timeout`
-/// argument (everything routed through [`run`]: `agent_list`, `tab_create`, `agent_prompt`,
-/// `agent_read`, `pane_run`, `agent_rename`). Without this, a hung `herdr` daemon blocks the
-/// single-threaded TUI's event loop indefinitely — `agent_wait` is the exception, since it
-/// computes its own call-specific bound in [`agent_wait`] instead of using this constant.
+/// argument. Reached two ways: routed through [`run`] for most subcommands (`agent_list`,
+/// `tab_create`, `agent_prompt`, `agent_read`, `pane_run`, `agent_rename`), and passed directly
+/// to [`run_with_timeout`] by [`agent_wait_for_exit`]'s per-poll `agent get` call, which needs
+/// this same bound but doesn't go through [`run`] — see that function's doc. Without this, a
+/// hung `herdr` daemon blocks the single-threaded TUI's event loop indefinitely — `agent_wait` is
+/// the exception, since it computes its own call-specific bound in [`agent_wait`] instead of
+/// using this constant.
 const DEFAULT_CLI_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Max attempts and per-attempt backoff for [`spawn_with_etxtbsy_retry`]'s retry loop —
@@ -262,18 +265,18 @@ const ETXTBSY_RETRY_DELAY: Duration = Duration::from_millis(20);
 /// documented at `main.rs`'s `implement_one` (a `pane_run` client-side timeout doesn't necessarily
 /// mean the server-side action didn't happen — see that comment) — flipping that for every call
 /// risked silently cutting off an in-flight request we can't prove has already reached herdr.
-/// [`agent_wait`]'s up-to-24h "done" wait (`close_tab_once_agent_is_done`, TF-649) is the
-/// exception: nothing is holding a `--timeout`-bounded budget open on its behalf once the
-/// enclosing task is dropped (the plugin quit mid-wait), so leaving its child running would mean
-/// an orphaned `herdr agent wait` process surviving the plugin itself for up to a full day — see
-/// `spawn_with_etxtbsy_retry`'s doc for the mechanism.
+/// [`agent_wait_for_exit`]'s up-to-24h exit-poll (`close_tab_once_agent_has_exited`, TF-649/
+/// TF-668) is the exception: nothing is holding a `--timeout`-bounded budget open on its behalf
+/// once the enclosing task is dropped (the plugin quit mid-wait), so leaving an in-flight poll's
+/// child running would mean an orphaned `herdr agent get` process surviving the plugin itself,
+/// however briefly — see `spawn_with_etxtbsy_retry`'s doc for the mechanism.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnAbandon {
     /// Let the child keep running to completion even if this call is abandoned. The default for
     /// every short-timeout call — see [`OnAbandon`]'s own doc for why.
     LeaveRunning,
-    /// Kill the child as soon as this call is abandoned. Used only by [`agent_wait`]'s "done"
-    /// wait (TF-649) — see [`OnAbandon`]'s own doc for why.
+    /// Kill the child as soon as this call is abandoned. Used only by [`agent_wait_for_exit`]'s
+    /// exit-poll (TF-649/TF-668) — see [`OnAbandon`]'s own doc for why.
     KillChild,
 }
 
@@ -361,7 +364,9 @@ async fn run_with_timeout(
 }
 
 /// [`run_with_timeout`] bounded by [`DEFAULT_CLI_TIMEOUT`] — used by every `herdr` subcommand
-/// except `agent_wait`, which computes its own call-specific budget instead (see [`agent_wait`]).
+/// except `agent_wait`, which computes its own call-specific budget instead (see [`agent_wait`]),
+/// and [`agent_wait_for_exit`]'s per-poll `agent get` call, which calls [`run_with_timeout`]
+/// directly rather than going through this function (see that function's doc).
 async fn run(herdr_bin: &str, args: &[&str]) -> Result<Value> {
     run_with_timeout(
         herdr_bin,
@@ -589,6 +594,96 @@ pub async fn agent_wait(
             }
             None => return Err(err),
         }
+    }
+}
+
+/// Consecutive `agent_not_found` polls [`agent_wait_for_exit`] requires, in a row, before
+/// concluding the pane's agent has genuinely exited, rather than trusting a single observation —
+/// see that function's doc for why.
+const AGENT_EXIT_CONFIRM_POLLS: u32 = 3;
+
+/// Consecutive non-`agent_not_found` poll errors [`agent_wait_for_exit`] tolerates (e.g. a
+/// [`DEFAULT_CLI_TIMEOUT`] expiry under load, a momentary herdr daemon hiccup) before giving up
+/// and returning the error to its caller — see that function's doc for why.
+const AGENT_EXIT_POLL_ERROR_TOLERANCE: u32 = 3;
+
+/// TF-668: waits until herdr no longer recognizes `pane_id` as hosting a live agent — i.e. a
+/// `herdr agent get <pane_id>` call starts failing with the `agent_not_found` error code
+/// `AGENT_EXIT_CONFIRM_POLLS` times in a row — which typically means the interactive
+/// coding-agent process actually terminated (the user or agent typed `/exit`). herdr's own docs
+/// also name two narrower cases producing that same error code — the pane being `release`d, or
+/// replaced by another process — that this module hasn't independently verified live against a
+/// real herdr instance; requiring a run of consecutive polls rather than trusting a single one is
+/// exactly what keeps either of those, or a transient herdr-side identity-tracking blip, from
+/// being mistaken for the pane's agent actually being gone.
+///
+/// Deliberately does *not* poll [`agent_wait`] for herdr's `"done"` status: herdr's own skill doc
+/// defines `done` as "the same underlying idle state [as `idle`] after unseen background work
+/// finishes" — a tab-focus-tracking heuristic with no relationship to whether the agent's actual
+/// work (opening a PR, getting it reviewed, fixing findings, ...) is complete. It fires the
+/// moment the agent goes idle after just the initial implement prompt, long before those manual
+/// steps happen — see `main.rs`'s `close_tab_once_agent_has_exited` for the full TF-668 writeup.
+/// Waiting for the pane's agent to truly disappear ties the wait to something real instead: the
+/// session in that pane is over.
+///
+/// Polls every `poll_interval` while the agent is still present. Any error other than
+/// `agent_not_found` is tolerated up to `AGENT_EXIT_POLL_ERROR_TOLERANCE` times in a row before
+/// propagating: unlike [`agent_wait`]'s single long-lived subprocess call, this function can issue
+/// thousands of individual polls over its up-to-24h budget, so one transient failure shouldn't
+/// abort the whole wait the way it reasonably can for a single call. Both consecutive-count
+/// thresholds reset to zero on every poll that doesn't match them, so only a genuine run of either
+/// kind ever fires — isolated blips scattered across the wait never accumulate toward either
+/// threshold. `on_abandon` is forwarded to each individual poll call — see [`OnAbandon`]'s doc —
+/// though it matters far less here than it did for the `agent_wait(..., "done", ...)` call this
+/// replaces: no single poll here ever blocks longer than `DEFAULT_CLI_TIMEOUT`, rather than one
+/// subprocess held open for the caller's entire (up to 24h) budget.
+pub async fn agent_wait_for_exit(
+    herdr_bin: &str,
+    pane_id: &PaneId,
+    timeout_ms: u64,
+    poll_interval: Duration,
+    on_abandon: OnAbandon,
+) -> Result<()> {
+    let start = std::time::Instant::now();
+    let mut consecutive_not_found: u32 = 0;
+    let mut consecutive_errors: u32 = 0;
+
+    loop {
+        match run_with_timeout(
+            herdr_bin,
+            &["agent", "get", pane_id.as_str()],
+            DEFAULT_CLI_TIMEOUT,
+            on_abandon,
+        )
+        .await
+        {
+            Err(err) if is_agent_not_found_response(&err) => {
+                consecutive_errors = 0;
+                consecutive_not_found += 1;
+                if consecutive_not_found >= AGENT_EXIT_CONFIRM_POLLS {
+                    return Ok(());
+                }
+            }
+            Err(err) => {
+                consecutive_not_found = 0;
+                consecutive_errors += 1;
+                if consecutive_errors >= AGENT_EXIT_POLL_ERROR_TOLERANCE {
+                    return Err(err);
+                }
+            }
+            Ok(_) => {
+                consecutive_not_found = 0;
+                consecutive_errors = 0;
+            }
+        }
+
+        if start.elapsed().as_millis() as u64 >= timeout_ms {
+            return Err(Error::Internal(format!(
+                "agent in {pane_id:?} never exited within {timeout_ms}ms"
+            )));
+        }
+
+        tokio::time::sleep(poll_interval).await;
     }
 }
 
@@ -1011,6 +1106,212 @@ exit 1
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_wait_for_exit_returns_ok_once_agent_not_found_is_confirmed_consecutively() {
+        // `agent get` succeeds (the agent is still there) twice, then reports
+        // `agent_not_found` on `AGENT_EXIT_CONFIRM_POLLS` (3) consecutive polls — simulating
+        // the pane's agent process actually terminating (e.g. `/exit`) partway through the
+        // wait.
+        let counter_dir = tempfile::tempdir().unwrap();
+        let counter_file = counter_dir.path().join("count.txt");
+        std::fs::write(&counter_file, "0").unwrap();
+        let (_dir, script) = write_fake_herdr_script(&format!(
+            r#"
+count_file="{}"
+count=$(cat "$count_file")
+next=$((count + 1))
+echo "$next" > "$count_file"
+if [ "$next" -le 2 ]; then
+  echo '{{"result":{{"agent_status":"idle"}}}}'
+  exit 0
+fi
+echo '{{"error":{{"code":"agent_not_found","message":"agent target wY:p7Z not found"}}}}' >&2
+exit 1
+"#,
+            counter_file.display()
+        ));
+
+        agent_wait_for_exit(
+            script.to_str().unwrap(),
+            &PaneId("wY:p7Z".to_string()),
+            5_000,
+            Duration::from_millis(5),
+            OnAbandon::LeaveRunning,
+        )
+        .await
+        .expect("agent_wait_for_exit should succeed once agent_not_found is confirmed");
+
+        let final_count = std::fs::read_to_string(&counter_file).unwrap();
+        assert_eq!(
+            final_count.trim(),
+            "5",
+            "expected 2 idle polls plus AGENT_EXIT_CONFIRM_POLLS (3) consecutive not-found polls"
+        );
+    }
+
+    /// TF-668 regression test: a *lone* `agent_not_found` poll, surrounded by the agent still
+    /// being reported present, must never be mistaken for the agent having genuinely exited —
+    /// this is exactly the false-positive a single-sample check would fall for (a herdr-side
+    /// identity-tracking blip, a `release`/reclassify race, ...), and is why
+    /// `AGENT_EXIT_CONFIRM_POLLS` requires a *consecutive* run instead of trusting one
+    /// observation. The agent here never actually goes away, so the wait must time out — it
+    /// must never return `Ok`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_wait_for_exit_does_not_return_ok_on_a_single_transient_agent_not_found() {
+        let counter_dir = tempfile::tempdir().unwrap();
+        let counter_file = counter_dir.path().join("count.txt");
+        std::fs::write(&counter_file, "0").unwrap();
+        let (_dir, script) = write_fake_herdr_script(&format!(
+            r#"
+count_file="{}"
+count=$(cat "$count_file")
+next=$((count + 1))
+echo "$next" > "$count_file"
+if [ "$next" -eq 2 ]; then
+  echo '{{"error":{{"code":"agent_not_found","message":"agent target wY:p7Z not found"}}}}' >&2
+  exit 1
+fi
+echo '{{"result":{{"agent_status":"idle"}}}}'
+exit 0
+"#,
+            counter_file.display()
+        ));
+
+        let err = agent_wait_for_exit(
+            script.to_str().unwrap(),
+            &PaneId("wY:p7Z".to_string()),
+            60,
+            Duration::from_millis(10),
+            OnAbandon::LeaveRunning,
+        )
+        .await
+        .expect_err(
+            "a single transient agent_not_found must not be mistaken for the agent having exited",
+        );
+
+        assert!(
+            err.to_string().contains("never exited"),
+            "expected a never-exited timeout error, got: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_wait_for_exit_propagates_a_non_agent_not_found_error_after_the_tolerance_is_exhausted(
+    ) {
+        let capture_dir = tempfile::tempdir().unwrap();
+        let counter_file = capture_dir.path().join("count.txt");
+        std::fs::write(&counter_file, "0").unwrap();
+        let (_dir, script) = write_fake_herdr_script(&format!(
+            r#"
+count_file="{}"
+count=$(cat "$count_file")
+echo $((count + 1)) > "$count_file"
+echo '{{"error":{{"message":"no such pane"}}}}' >&2
+exit 1
+"#,
+            counter_file.display()
+        ));
+
+        let err = agent_wait_for_exit(
+            script.to_str().unwrap(),
+            &PaneId("wY:p7Z".to_string()),
+            5_000,
+            Duration::from_millis(5),
+            OnAbandon::LeaveRunning,
+        )
+        .await
+        .expect_err("agent_wait_for_exit should propagate a persistent non-agent_not_found error");
+
+        assert!(
+            err.to_string().contains("no such pane"),
+            "unexpected message: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&counter_file).unwrap().trim(),
+            "3",
+            "expected exactly AGENT_EXIT_POLL_ERROR_TOLERANCE (3) attempts before giving up"
+        );
+    }
+
+    /// TF-668 regression test for the flip side of the tolerance above: an *isolated* transient
+    /// error, surrounded by successful polls, must not push the wait any closer to giving up —
+    /// only a genuine *run* of `AGENT_EXIT_POLL_ERROR_TOLERANCE` consecutive failures should. The
+    /// agent then genuinely exits, so the wait must still succeed rather than erroring out on an
+    /// error count that never actually reached the threshold in a row.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_wait_for_exit_tolerates_an_isolated_transient_error_and_keeps_polling() {
+        let counter_dir = tempfile::tempdir().unwrap();
+        let counter_file = counter_dir.path().join("count.txt");
+        std::fs::write(&counter_file, "0").unwrap();
+        let (_dir, script) = write_fake_herdr_script(&format!(
+            r#"
+count_file="{}"
+count=$(cat "$count_file")
+next=$((count + 1))
+echo "$next" > "$count_file"
+if [ "$next" -eq 1 ]; then
+  echo '{{"error":{{"message":"herdr daemon hiccup"}}}}' >&2
+  exit 1
+fi
+if [ "$next" -le 4 ]; then
+  echo '{{"result":{{"agent_status":"idle"}}}}'
+  exit 0
+fi
+echo '{{"error":{{"code":"agent_not_found","message":"agent target wY:p7Z not found"}}}}' >&2
+exit 1
+"#,
+            counter_file.display()
+        ));
+
+        agent_wait_for_exit(
+            script.to_str().unwrap(),
+            &PaneId("wY:p7Z".to_string()),
+            5_000,
+            Duration::from_millis(5),
+            OnAbandon::LeaveRunning,
+        )
+        .await
+        .expect("an isolated transient error must not stop the wait from eventually succeeding");
+
+        let final_count = std::fs::read_to_string(&counter_file).unwrap();
+        assert_eq!(
+            final_count.trim(),
+            "7",
+            "expected 1 transient error + 3 idle polls + AGENT_EXIT_CONFIRM_POLLS (3) not-found \
+             polls"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_wait_for_exit_times_out_when_the_agent_never_exits() {
+        let (_dir, script) = write_fake_herdr_script(
+            r#"
+echo '{"result":{"agent_status":"working"}}'
+exit 0
+"#,
+        );
+
+        let err = agent_wait_for_exit(
+            script.to_str().unwrap(),
+            &PaneId("wY:p7Z".to_string()),
+            30,
+            Duration::from_millis(10),
+            OnAbandon::LeaveRunning,
+        )
+        .await
+        .expect_err("agent_wait_for_exit should time out while the agent stays present");
+
+        assert!(
+            err.to_string().contains("never exited"),
+            "expected a never-exited timeout error, got: {err}"
+        );
+    }
+
     /// Polls for `path` to exist, up to `timeout`, checking every 50ms. Used by the
     /// `OnAbandon`/kill-on-drop tests below instead of a single fixed sleep-then-check: under a
     /// full, parallel `cargo test` run, OS scheduling contention can easily push either the fake
@@ -1032,7 +1333,7 @@ exit 1
     /// TF-649 follow-up: verifies [`OnAbandon::KillChild`] actually kills the underlying `herdr`
     /// subprocess when the `agent_wait` call itself is abandoned (here, by racing it against an
     /// outer `tokio::time::timeout` shorter than the fake script's own sleep — the same drop this
-    /// codebase would see if the plugin quit while `close_tab_once_agent_is_done`'s "done" wait
+    /// codebase would see if the plugin quit while `close_tab_once_agent_has_exited`'s exit-poll
     /// was still in flight). The fake script only writes its completion marker *after* sleeping;
     /// if the child is killed mid-sleep, that marker must never appear, even after polling well
     /// past the sleep's own duration.
@@ -1117,6 +1418,51 @@ exit 0
             marker_appears_within(&completed_marker, Duration::from_secs(5)).await,
             "OnAbandon::LeaveRunning should leave the herdr subprocess running detached — \
              expected it to finish its 1s sleep on its own and write the completion marker"
+        );
+    }
+
+    /// TF-668 follow-up: [`agent_wait_with_kill_on_drop_kills_its_child_when_abandoned`] above
+    /// proves the shared `spawn_with_etxtbsy_retry`/[`run_with_timeout`] primitive honors
+    /// [`OnAbandon::KillChild`], but only via [`agent_wait`] — this pins down that
+    /// [`agent_wait_for_exit`]'s own call site forwards it correctly too, since that's the exact
+    /// drop this codebase sees if the plugin quits while `close_tab_once_agent_has_exited`'s
+    /// exit-poll is still in flight.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_wait_for_exit_with_kill_on_drop_kills_its_child_when_abandoned() {
+        let capture_dir = tempfile::tempdir().unwrap();
+        let completed_marker = capture_dir.path().join("completed");
+        let (_dir, script) = write_fake_herdr_script(&format!(
+            r#"
+sleep 1
+touch "{}"
+echo '{{"result":{{"agent_status":"working"}}}}'
+exit 0
+"#,
+            completed_marker.display()
+        ));
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(150),
+            agent_wait_for_exit(
+                script.to_str().unwrap(),
+                &PaneId("wY:p7Z".to_string()),
+                10_000,
+                Duration::from_millis(10),
+                OnAbandon::KillChild,
+            ),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "expected the outer timeout to abandon agent_wait_for_exit before the fake script's \
+             1s sleep completed"
+        );
+
+        assert!(
+            !marker_appears_within(&completed_marker, Duration::from_secs(5)).await,
+            "OnAbandon::KillChild should have killed the herdr subprocess before its 1s sleep \
+             finished, but the completion marker appeared — it ran to completion instead"
         );
     }
 
