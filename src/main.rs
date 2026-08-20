@@ -974,8 +974,8 @@ fn tab_auto_closed_status(identifier: &str) -> plugin::app::Status {
 /// must never silently vanish. A `tab_close` failure afterwards (already closed, herdr restarted
 /// mid-wait, ...) is swallowed too — there is nothing left for this task to usefully do at that
 /// point. Neither fail-open branch sends anything through `notify` (TF-653): a notice on either
-/// would falsely claim "finished" for a tab that's either still open or still open because
-/// closing it failed.
+/// would falsely claim "finished" for a tab that's either still open because the agent hasn't
+/// exited yet, or still open because closing it failed.
 ///
 /// Polls with [`plugin::herdr_cli::OnAbandon::KillChild`], not the
 /// [`plugin::herdr_cli::OnAbandon::LeaveRunning`] every other `agent_wait`/`agent_wait_for_exit`
