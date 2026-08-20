@@ -126,6 +126,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   automated test — `event_loop` remains hardcoded to a real `CrosstermBackend` terminal and can't
   be driven by `TestBackend` — reasoned about via the (now single, non-duplicated) doc comment on
   `event_loop`'s `skip_drain_this_tick` instead, same as before (TF-653)
+- TF-649's leftover-tab auto-close was watching the wrong signal: it closed the tab (and sent the
+  TF-653 "agent finished" notice) once herdr's `agent_status` reported `"done"`, but live use
+  against a real Linear issue showed that firing the moment the initial implement prompt finished
+  — with opening a PR, getting it reviewed, and fixing findings still entirely manual steps meant
+  to happen in that same pane. Root cause, per herdr's own skill doc: `"done"` isn't a completion
+  signal at all, it's "the same underlying idle state [as `idle`] after unseen background work
+  finishes" — a tab-focus heuristic that has no relationship to whether the issue itself is
+  actually done. `close_tab_once_agent_is_done`/`spawn_tab_close_when_agent_is_done` are renamed
+  to `close_tab_once_agent_has_exited`/`spawn_tab_close_when_agent_has_exited` and now wait on the
+  new `plugin::herdr_cli::agent_wait_for_exit` instead of `agent_wait(..., "done", ...)`: it polls
+  `herdr agent get <pane_id>` (a new, deliberately coarse `AGENT_EXIT_POLL_INTERVAL`, 10s — this
+  wait can run for the same 24h budget the old one did) and only succeeds once a poll fails with
+  herdr's `agent_not_found` error code, which only happens once the agent process in that pane has
+  actually terminated — typically the user typing `/exit` once every manual step for that issue is
+  genuinely finished, not just the coding agent going idle after the first prompt. Both fail-open
+  paths (a `tab_close` failure, or the exit poll timing out/erroring) are unchanged from TF-649/
+  TF-653: the tab is left exactly as it is, and no notice is sent (TF-668)
 - `HERDR_LINEAR_LOG_FILE`-based logging (`main.rs::init_tracing`) now actually emits `debug!`-level
   records — every `tracing::debug!` call this crate has ever shipped (`send_prompt_until_visible_with`'s
   attempt-failure logging, `flush_buffered_quit`'s discarded-key count, and the mid-flight

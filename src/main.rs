@@ -798,7 +798,7 @@ async fn resolve_validated_agent_command(
 /// several of its futures can be mid-flight at once and none of them owns the one shared
 /// terminal safely.
 ///
-/// `notify` is forwarded to [`spawn_tab_close_when_agent_is_done`] (TF-653) — the channel
+/// `notify` is forwarded to [`spawn_tab_close_when_agent_has_exited`] (TF-653) — the channel
 /// `event_loop` drains each tick to surface a `Status::Ok` once that background watcher actually
 /// closes this issue's tab, so "the tab is gone" never has to be read as "something broke".
 async fn implement_one(
@@ -902,7 +902,7 @@ async fn implement_one(
         ));
     }
 
-    spawn_tab_close_when_agent_is_done(
+    spawn_tab_close_when_agent_has_exited(
         herdr_bin.to_string(),
         issue.identifier.clone(),
         created_tab,
@@ -916,23 +916,33 @@ async fn implement_one(
     }
 }
 
-/// Wall-clock ceiling for [`close_tab_once_agent_is_done`]'s `agent_wait(..., "done", ...)` call
-/// — deliberately generous compared to [`implement_one`]'s own `agent_wait(..., "idle", ...)`
-/// 30s wait for the agent process to *start*: this one instead covers however long the actual
-/// implementation work takes, which for a real coding agent can run for hours. TF-649 requires
-/// fail-open on timeout (see [`close_tab_once_agent_is_done`]), so erring generous here only
-/// costs a leftover tab in the rare case an agent runs unusually long — never a prematurely
-/// closed one out from under a still-working agent.
-const AGENT_DONE_WAIT_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000; // 24h
+/// Wall-clock ceiling for [`close_tab_once_agent_has_exited`]'s exit-poll — deliberately generous
+/// compared to [`implement_one`]'s own `agent_wait(..., "idle", ...)` 30s wait for the agent
+/// process to *start*: this one instead covers however long the whole issue takes in that pane —
+/// implementation, opening a PR, getting it reviewed, and fixing findings are all manual steps
+/// that happen there before anyone types `/exit`, and for a real issue that can run for hours.
+/// TF-649 requires fail-open on timeout (see [`close_tab_once_agent_has_exited`]), so erring
+/// generous here only costs a leftover tab in the rare case that takes unusually long — never a
+/// prematurely closed one out from under a still-open session.
+const AGENT_EXIT_WAIT_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000; // 24h
+
+/// Poll interval for [`close_tab_once_agent_has_exited`]'s exit-poll while the agent is still
+/// present. Coarse on purpose: unlike a "just launched, not yet detected" wait (seconds at most),
+/// this one can run for [`AGENT_EXIT_WAIT_TIMEOUT_MS`]'s full 24h, so a tight interval would mean
+/// tens of thousands of `herdr agent get` calls per watched issue for no benefit — nothing is
+/// listening for the close to happen any sooner than the next tick of a plugin the user isn't
+/// currently looking at.
+const AGENT_EXIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// TF-653: the channel `event_loop` drains (via [`drain_notifications`]) each tick to surface a
 /// `Status` once a background watcher — currently only
-/// [`close_tab_once_agent_is_done`]/[`spawn_tab_close_when_agent_is_done`] — has something to
-/// report. Named for readability at the six call sites that thread it through the implement-flow
-/// call chain; not a semantic wrapper, just `tokio::sync::mpsc::UnboundedSender<plugin::app::Status>`.
+/// [`close_tab_once_agent_has_exited`]/[`spawn_tab_close_when_agent_has_exited`] — has something
+/// to report. Named for readability at the six call sites that thread it through the
+/// implement-flow call chain; not a semantic wrapper, just
+/// `tokio::sync::mpsc::UnboundedSender<plugin::app::Status>`.
 type StatusNotifier = tokio::sync::mpsc::UnboundedSender<plugin::app::Status>;
 
-/// Status banner shown once [`close_tab_once_agent_is_done`] (TF-649) actually closes a tab —
+/// Status banner shown once [`close_tab_once_agent_has_exited`] (TF-649) actually closes a tab —
 /// the only user-visible sign that "the tab is gone" means "the agent finished", not "lost" or
 /// "crashed" (TF-653: two tabs vanished mid-session with no such signal, which led to re-running
 /// an already-finished implementation). Split out as a pure function, mirroring
@@ -942,54 +952,63 @@ fn tab_auto_closed_status(identifier: &str) -> plugin::app::Status {
     plugin::app::Status::Ok(format!("{identifier}: agent finished, tab closed."))
 }
 
-/// TF-649: once [`implement_one`]'s prompt has landed, waits for that issue's agent to reach
-/// herdr's "done" status, then closes its tab — cleaning up the leftover idle tab that would
-/// otherwise sit around after every implement run. Always called through
-/// [`spawn_tab_close_when_agent_is_done`], the fire-and-forget wrapper that keeps this off
-/// `implement_one`'s critical path; split out on its own so it can be driven directly (awaited to
-/// completion) in tests instead of racing a background task's scheduling.
+/// TF-668: once [`implement_one`]'s prompt has landed, waits for that issue's agent pane to
+/// genuinely go away — the agent process exits (typically the user typing `/exit` once they're
+/// truly done with the issue), is released, or is replaced — then closes its tab. Always called
+/// through [`spawn_tab_close_when_agent_has_exited`], the fire-and-forget wrapper that keeps this
+/// off `implement_one`'s critical path; split out on its own so it can be driven directly (awaited
+/// to completion) in tests instead of racing a background task's scheduling.
 ///
-/// Fails open on both steps, matching the ticket's explicit acceptance criteria: a real timeout,
-/// herdr losing track of the pane, or the agent simply never reaching "done" (its status
-/// detection is heuristic — see `agent_wait`'s missing-`result` retry workaround in
-/// `herdr_cli.rs`) all leave the tab exactly as it is, on the theory that a possibly still-useful
-/// (or failed) agent's output must never silently vanish. A `tab_close` failure afterwards
-/// (already closed, herdr restarted mid-wait, ...) is swallowed too — there is nothing left for
-/// this task to usefully do at that point. Neither fail-open branch sends anything through
-/// `notify` (TF-653): a notice on either would falsely claim "finished" for a tab that's either
-/// still working or still open because closing it failed.
+/// TF-649 originally closed the tab once herdr's `agent_status` reported `"done"` instead. That
+/// turned out to be the wrong signal (TF-668): per herdr's own skill doc, `"done"` is just "the
+/// same underlying idle state [as `idle`] after unseen background work finishes" — a tab-focus
+/// heuristic, not a completion signal. It fired the moment the initial implement prompt finished,
+/// long before the issue's actual manual steps (opening a PR, getting it reviewed, fixing
+/// findings) had even started, closing the tab those steps needed. Waiting for the agent to
+/// really exit via [`plugin::herdr_cli::agent_wait_for_exit`] ties the close to something real
+/// instead.
 ///
-/// Waits with [`plugin::herdr_cli::OnAbandon::KillChild`], not the
-/// [`plugin::herdr_cli::OnAbandon::LeaveRunning`] every other `agent_wait` call in this codebase
-/// uses: since nothing else keeps this call's budget alive once its enclosing task is dropped
-/// (the plugin quit mid-wait, per this same ticket's acceptance criteria), leaving its child
-/// `herdr agent wait` process running would let it survive the plugin process itself for up to
-/// [`AGENT_DONE_WAIT_TIMEOUT_MS`]'s full 24h — see [`plugin::herdr_cli::OnAbandon`]'s doc for the
+/// Fails open on both steps, matching TF-649's original acceptance criteria: a real timeout,
+/// herdr losing track of the pane some other way, or the agent simply never exiting all leave the
+/// tab exactly as it is, on the theory that a possibly still-useful (or failed) agent's output
+/// must never silently vanish. A `tab_close` failure afterwards (already closed, herdr restarted
+/// mid-wait, ...) is swallowed too — there is nothing left for this task to usefully do at that
+/// point. Neither fail-open branch sends anything through `notify` (TF-653): a notice on either
+/// would falsely claim "finished" for a tab that's either still open or still open because
+/// closing it failed.
+///
+/// Polls with [`plugin::herdr_cli::OnAbandon::KillChild`], not the
+/// [`plugin::herdr_cli::OnAbandon::LeaveRunning`] every other `agent_wait`/`agent_wait_for_exit`
+/// call in this codebase uses: since nothing else keeps this call's budget alive once its
+/// enclosing task is dropped (the plugin quit mid-wait, per this same ticket's acceptance
+/// criteria), leaving an in-flight `herdr agent get` child running would let it survive the
+/// plugin process itself, if only briefly — see [`plugin::herdr_cli::OnAbandon`]'s doc for the
 /// underlying mechanism.
 ///
 /// `identifier` and `notify` are TF-653 additions: once `tab_close` actually succeeds, this
 /// sends [`tab_auto_closed_status`] through `notify` so `event_loop` can surface it. A `send` on
 /// an already-dropped receiver (the plugin quit) is silently ignored — consistent with this
 /// function's fail-open stance throughout.
-async fn close_tab_once_agent_is_done(
+async fn close_tab_once_agent_has_exited(
     herdr_bin: &str,
     identifier: &str,
     tab: &plugin::herdr_cli::TabCreated,
     timeout_ms: u64,
+    poll_interval: std::time::Duration,
     notify: &StatusNotifier,
 ) {
-    if let Err(err) = plugin::herdr_cli::agent_wait(
+    if let Err(err) = plugin::herdr_cli::agent_wait_for_exit(
         herdr_bin,
         &tab.root_pane_id,
-        "done",
         timeout_ms,
+        poll_interval,
         plugin::herdr_cli::OnAbandon::KillChild,
     )
     .await
     {
         tracing::debug!(
-            "close_tab_once_agent_is_done: agent in {:?} never reached \"done\" ({err}), \
-             leaving its tab open",
+            "close_tab_once_agent_has_exited: agent in {:?} never exited ({err}), leaving its \
+             tab open",
             tab.root_pane_id
         );
         return;
@@ -997,7 +1016,7 @@ async fn close_tab_once_agent_is_done(
 
     if let Err(err) = plugin::herdr_cli::tab_close(herdr_bin, &tab.tab_id).await {
         tracing::debug!(
-            "close_tab_once_agent_is_done: agent in {:?} finished but closing its tab failed \
+            "close_tab_once_agent_has_exited: agent in {:?} exited but closing its tab failed \
              ({err})",
             tab.root_pane_id
         );
@@ -1007,33 +1026,34 @@ async fn close_tab_once_agent_is_done(
     let _ = notify.send(tab_auto_closed_status(identifier));
 }
 
-/// Fire-and-forget wrapper around [`close_tab_once_agent_is_done`] (TF-649): detaches it onto the
-/// runtime via `tokio::spawn` and returns immediately, so `implement_one` — and in turn
+/// Fire-and-forget wrapper around [`close_tab_once_agent_has_exited`] (TF-649): detaches it onto
+/// the runtime via `tokio::spawn` and returns immediately, so `implement_one` — and in turn
 /// `start_implementation`/[`implement_many`] — return to their caller as soon as the prompt
-/// lands, regardless of how long the agent actually takes. This is not optional for correctness:
+/// lands, regardless of how long the issue actually takes. This is not optional for correctness:
 /// `implement_many`'s parallel multi-issue flow (TF-622) must not have one issue's close-watcher
 /// block starting, or waiting on, any of the others.
 ///
 /// Deliberately detached rather than tracked/joined anywhere — if the user quits the plugin
-/// before the agent finishes, tokio drops this task along with the rest of the runtime on exit:
-/// no cleanup hook, no panic, just a task that silently stops existing (see TF-649's "out of
-/// scope" on guaranteed cleanup across plugin/herdr-server restarts).
+/// before the agent exits, tokio drops this task along with the rest of the runtime on exit: no
+/// cleanup hook, no panic, just a task that silently stops existing (see TF-649's "out of scope"
+/// on guaranteed cleanup across plugin/herdr-server restarts).
 ///
-/// `identifier` and `notify` (TF-653) are forwarded verbatim to [`close_tab_once_agent_is_done`];
-/// `notify` is an owned clone rather than a borrow because this closure must be `'static` to
-/// satisfy `tokio::spawn`.
-fn spawn_tab_close_when_agent_is_done(
+/// `identifier` and `notify` (TF-653) are forwarded verbatim to
+/// [`close_tab_once_agent_has_exited`]; `notify` is an owned clone rather than a borrow because
+/// this closure must be `'static` to satisfy `tokio::spawn`.
+fn spawn_tab_close_when_agent_has_exited(
     herdr_bin: String,
     identifier: String,
     tab: plugin::herdr_cli::TabCreated,
     notify: StatusNotifier,
 ) {
     tokio::spawn(async move {
-        close_tab_once_agent_is_done(
+        close_tab_once_agent_has_exited(
             &herdr_bin,
             &identifier,
             &tab,
-            AGENT_DONE_WAIT_TIMEOUT_MS,
+            AGENT_EXIT_WAIT_TIMEOUT_MS,
+            AGENT_EXIT_POLL_INTERVAL,
             &notify,
         )
         .await;
@@ -1810,7 +1830,7 @@ fn apply_cycle_preset(
 }
 
 /// Drains any [`plugin::app::Status`] notices queued by `event_loop`'s background tab-close
-/// watchers (TF-653, via [`spawn_tab_close_when_agent_is_done`]) into `app`'s status.
+/// watchers (TF-653, via [`spawn_tab_close_when_agent_has_exited`]) into `app`'s status.
 ///
 /// `try_recv` never blocks, so this never stalls the render/input loop whether or not anything
 /// is queued. If more than one notice is queued, only the last one survives — `App::set_status`
@@ -1865,7 +1885,7 @@ async fn event_loop(
         std::env::var("SSH_TTY").ok().as_deref(),
     );
 
-    // TF-653: fed by `spawn_tab_close_when_agent_is_done`'s background watchers (TF-649), one
+    // TF-653: fed by `spawn_tab_close_when_agent_has_exited`'s background watchers (TF-649), one
     // clone per implement call — `event_loop` is the only place `App::set_status` can be called
     // from, so this is how a detached `tokio::spawn`ed task gets a status banner onto the
     // screen at all.
@@ -4275,15 +4295,15 @@ esac
         );
     }
 
-    /// [`close_tab_once_agent_is_done`] is tested directly (awaited to completion) rather than
-    /// through [`spawn_tab_close_when_agent_is_done`]'s `tokio::spawn` — a fire-and-forget task
+    /// [`close_tab_once_agent_has_exited`] is tested directly (awaited to completion) rather than
+    /// through [`spawn_tab_close_when_agent_has_exited`]'s `tokio::spawn` — a fire-and-forget task
     /// spawned from a synchronous tail with no further `.await` in between (as `implement_one`'s
     /// call site is) has no guaranteed opportunity to actually run before a `#[tokio::test]`'s
     /// single-threaded runtime tears down at the end of the test function, making it an unreliable
     /// thing to assert on directly (TF-649).
     #[cfg(unix)]
     #[tokio::test]
-    async fn close_tab_once_agent_is_done_closes_the_tab_once_the_agent_reports_done() {
+    async fn close_tab_once_agent_has_exited_closes_the_tab_once_the_agent_is_gone() {
         let capture_dir = tempfile::tempdir().unwrap();
         let close_args_file = capture_dir.path().join("close_args.txt");
         let (_dir, script) = write_fake_herdr_script(&format!(
@@ -4293,9 +4313,9 @@ case "$1 $2" in
     echo '{{"result":{{"tab":{{"tab_id":"t1","label":"TF-649"}},"root_pane":{{"pane_id":"p1"}}}}}}'
     exit 0
     ;;
-  "agent wait")
-    echo '{{"result":{{}}}}'
-    exit 0
+  "agent get")
+    echo '{{"error":{{"code":"agent_not_found","message":"agent target p1 not found"}}}}' >&2
+    exit 1
     ;;
   "tab close")
     printf '%s\n' "$@" > "{}"
@@ -4320,11 +4340,18 @@ esac
         .expect("tab_create should succeed");
 
         let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel();
-        close_tab_once_agent_is_done(script.to_str().unwrap(), "TF-649", &tab, 5_000, &notify_tx)
-            .await;
+        close_tab_once_agent_has_exited(
+            script.to_str().unwrap(),
+            "TF-649",
+            &tab,
+            5_000,
+            std::time::Duration::from_millis(5),
+            &notify_tx,
+        )
+        .await;
 
         let captured = std::fs::read_to_string(&close_args_file)
-            .expect("close_tab_once_agent_is_done should have closed the tab");
+            .expect("close_tab_once_agent_has_exited should have closed the tab");
         let args: Vec<&str> = captured.lines().collect();
         assert_eq!(args, vec!["tab", "close", "t1"]);
 
@@ -4339,7 +4366,7 @@ esac
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn close_tab_once_agent_is_done_leaves_the_tab_open_when_agent_wait_fails() {
+    async fn close_tab_once_agent_has_exited_leaves_the_tab_open_when_the_exit_poll_fails() {
         let capture_dir = tempfile::tempdir().unwrap();
         let close_marker = capture_dir.path().join("tab_close_was_called");
         let (_dir, script) = write_fake_herdr_script(&format!(
@@ -4349,7 +4376,7 @@ case "$1 $2" in
     echo '{{"result":{{"tab":{{"tab_id":"t1","label":"TF-649"}},"root_pane":{{"pane_id":"p1"}}}}}}'
     exit 0
     ;;
-  "agent wait")
+  "agent get")
     echo '{{"error":{{"message":"pane not found"}}}}'
     exit 1
     ;;
@@ -4375,34 +4402,41 @@ esac
         .await
         .expect("tab_create should succeed");
 
-        // `agent_wait` fails on its very first attempt: "pane not found" carries neither the
-        // `agent_not_found` code (which would poll-retry) nor a missing-`result` body (which
-        // `next_retry_budget_ms` retries) — see `herdr_cli.rs`'s retry-classification tests. So
-        // this exercises the fail-open path without needing to burn the full timeout budget.
+        // The exit poll fails on its very first attempt: "pane not found" doesn't carry the
+        // `agent_not_found` code, so `agent_wait_for_exit` propagates it immediately instead of
+        // treating it as "the agent exited" — see `herdr_cli.rs`'s own tests for that
+        // classification. This exercises the fail-open path without burning the timeout budget.
         let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel();
-        close_tab_once_agent_is_done(script.to_str().unwrap(), "TF-649", &tab, 5_000, &notify_tx)
-            .await;
+        close_tab_once_agent_has_exited(
+            script.to_str().unwrap(),
+            "TF-649",
+            &tab,
+            5_000,
+            std::time::Duration::from_millis(5),
+            &notify_tx,
+        )
+        .await;
 
         assert!(
             !close_marker.exists(),
-            "tab close must never run once agent_wait has failed (fail-open, TF-649)"
+            "tab close must never run once the exit poll has failed (fail-open, TF-649)"
         );
         // TF-653: the fail-open path must stay silent — a notice here would falsely claim
         // "finished" for a tab that's actually still open because nothing closed it.
         assert!(
             notify_rx.try_recv().is_err(),
-            "agent_wait failing must not send an auto-closed notice"
+            "the exit poll failing must not send an auto-closed notice"
         );
     }
 
-    /// The other half of `close_tab_once_agent_is_done`'s fail-open contract: `agent_wait`
-    /// succeeds (the agent really did reach "done"), but the subsequent `tab_close` call itself
-    /// fails (already closed, herdr restarted mid-wait, ...). Must not panic — the failure is
-    /// swallowed (logged at `debug!`, per the function's own doc), leaving the tab exactly as it
-    /// is, same as the `agent_wait`-fails case above.
+    /// The other half of `close_tab_once_agent_has_exited`'s fail-open contract: the agent really
+    /// did exit, but the subsequent `tab_close` call itself fails (already closed, herdr
+    /// restarted mid-wait, ...). Must not panic — the failure is swallowed (logged at `debug!`,
+    /// per the function's own doc), leaving the tab exactly as it is, same as the exit-poll-fails
+    /// case above.
     #[cfg(unix)]
     #[tokio::test]
-    async fn close_tab_once_agent_is_done_does_not_panic_when_tab_close_fails_after_agent_wait_succeeds(
+    async fn close_tab_once_agent_has_exited_does_not_panic_when_tab_close_fails_after_the_agent_exits(
     ) {
         let (_dir, script) = write_fake_herdr_script(
             r#"
@@ -4411,9 +4445,9 @@ case "$1 $2" in
     echo '{"result":{"tab":{"tab_id":"t1","label":"TF-649"},"root_pane":{"pane_id":"p1"}}}'
     exit 0
     ;;
-  "agent wait")
-    echo '{"result":{}}'
-    exit 0
+  "agent get")
+    echo '{"error":{"code":"agent_not_found","message":"agent target p1 not found"}}' >&2
+    exit 1
     ;;
   "tab close")
     echo '{"error":{"message":"no such tab"}}'
@@ -4437,11 +4471,18 @@ esac
 
         // Reaching this line at all (rather than the test process aborting on an unwind through
         // an `.await` point, or a `#[tokio::test]` failure from a panicking task) is the
-        // assertion: a `tab_close` error after a successful `agent_wait` must be swallowed, not
-        // propagated or panicked on.
+        // assertion: a `tab_close` error after the agent has genuinely exited must be swallowed,
+        // not propagated or panicked on.
         let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel();
-        close_tab_once_agent_is_done(script.to_str().unwrap(), "TF-649", &tab, 5_000, &notify_tx)
-            .await;
+        close_tab_once_agent_has_exited(
+            script.to_str().unwrap(),
+            "TF-649",
+            &tab,
+            5_000,
+            std::time::Duration::from_millis(5),
+            &notify_tx,
+        )
+        .await;
         // TF-653: `tab_close` failing must stay silent too — the tab is still open, so a
         // "finished, tab closed" notice would be actively wrong.
         assert!(
