@@ -244,8 +244,9 @@ fn is_agent_not_found_response(error: &Error) -> bool {
 /// Wall-clock ceiling for `herdr` subprocess calls that don't carry their own `--timeout`
 /// argument. Reached two ways: routed through [`run`] for most subcommands (`agent_list`,
 /// `tab_create`, `agent_prompt`, `agent_read`, `pane_run`, `agent_rename`), and passed directly
-/// to [`run_with_timeout`] by [`agent_wait_for_exit`]'s per-poll `agent get` call, which needs
-/// this same bound but doesn't go through [`run`] — see that function's doc. Without this, a
+/// to [`run_with_timeout`] by [`agent_wait_for_exit`]'s and [`agent_wait_for_start`]'s per-poll
+/// `agent get` calls, which need this same bound but don't go through [`run`] — see those
+/// functions' docs. Without this, a
 /// hung `herdr` daemon blocks the single-threaded TUI's event loop indefinitely — `agent_wait` is
 /// the exception, since it computes its own call-specific bound in [`agent_wait`] instead of
 /// using this constant.
@@ -266,17 +267,20 @@ const ETXTBSY_RETRY_DELAY: Duration = Duration::from_millis(20);
 /// mean the server-side action didn't happen — see that comment) — flipping that for every call
 /// risked silently cutting off an in-flight request we can't prove has already reached herdr.
 /// [`agent_wait_for_exit`]'s up-to-24h exit-poll (`close_tab_once_agent_has_exited`, TF-649/
-/// TF-668) is the exception: nothing is holding a `--timeout`-bounded budget open on its behalf
-/// once the enclosing task is dropped (the plugin quit mid-wait), so leaving an in-flight poll's
-/// child running would mean an orphaned `herdr agent get` process surviving the plugin itself,
-/// however briefly — see `spawn_with_etxtbsy_retry`'s doc for the mechanism.
+/// TF-668) and [`agent_wait_for_start`]'s own poll (TF-669) are the exception: neither is a
+/// mutating call whose in-flight completion we need to protect (both issue read-only `agent get`
+/// requests), and nothing is holding a `--timeout`-bounded budget open on either's behalf once
+/// the enclosing task is dropped (the plugin quit mid-wait), so leaving an in-flight poll's child
+/// running would mean an orphaned `herdr agent get` process surviving the plugin itself, however
+/// briefly — see `spawn_with_etxtbsy_retry`'s doc for the mechanism.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnAbandon {
     /// Let the child keep running to completion even if this call is abandoned. The default for
     /// every short-timeout call — see [`OnAbandon`]'s own doc for why.
     LeaveRunning,
-    /// Kill the child as soon as this call is abandoned. Used only by [`agent_wait_for_exit`]'s
-    /// exit-poll (TF-649/TF-668) — see [`OnAbandon`]'s own doc for why.
+    /// Kill the child as soon as this call is abandoned. Used by [`agent_wait_for_exit`]'s
+    /// exit-poll (TF-649/TF-668) and [`agent_wait_for_start`]'s poll (TF-669) — see
+    /// [`OnAbandon`]'s own doc for why.
     KillChild,
 }
 
@@ -365,8 +369,9 @@ async fn run_with_timeout(
 
 /// [`run_with_timeout`] bounded by [`DEFAULT_CLI_TIMEOUT`] — used by every `herdr` subcommand
 /// except `agent_wait`, which computes its own call-specific budget instead (see [`agent_wait`]),
-/// and [`agent_wait_for_exit`]'s per-poll `agent get` call, which calls [`run_with_timeout`]
-/// directly rather than going through this function (see that function's doc).
+/// and [`agent_wait_for_exit`]'s/[`agent_wait_for_start`]'s per-poll `agent get` calls, which
+/// call [`run_with_timeout`] directly rather than going through this function (see those
+/// functions' docs).
 async fn run(herdr_bin: &str, args: &[&str]) -> Result<Value> {
     run_with_timeout(
         herdr_bin,
@@ -718,7 +723,8 @@ fn agent_identity(result: &serde_json::Value) -> Option<String> {
 /// start sending it input.
 ///
 /// Exists because neither `agent_wait(..., "idle", ...)`'s status nor a purely text-based
-/// "did the prompt land" check (`main.rs`'s `prompt_landed`/`wait_for_prompt_stable`) can tell
+/// "did the prompt land" check (`plugin::implement`'s `prompt_landed`, driven by `main.rs`'s
+/// `wait_for_prompt_stable`) can tell
 /// "a real agent's live input box" apart from "a wrapper's own plain, pre-agent bootstrap output
 /// that just happens to look quiet or contain matching text for a while". Live-reproduced
 /// (TF-669) against a multi-stage `agent_command` alias (`hr` = `headroom wrap claude
@@ -736,17 +742,30 @@ fn agent_identity(result: &serde_json::Value) -> Option<String> {
 /// started (resets the confirmation streak, same as that function's `Ok` branch resetting its
 /// exit-confirmation streak), while a matching identity is the awaited signal. `on_abandon` is
 /// forwarded to each individual poll call — see [`OnAbandon`]'s doc.
+///
+/// `on_poll` fires once per completed poll (1-indexed), regardless of that poll's outcome — a
+/// non-blocking progress hook so a caller with a UI to redraw (`implement_one`, via `main.rs`'s
+/// `agent_start_poll_status`) isn't left with no signal for this wait's own duration the way
+/// `agent_wait`'s "idle" wait once was before `prompt_attempt_status` (TF-650) fixed that for the
+/// *later* prompt-send phase. Pass a no-op (`|_| {}`) if the caller has nothing to redraw.
 pub async fn agent_wait_for_start(
     herdr_bin: &str,
     pane_id: &PaneId,
     timeout_ms: u64,
     poll_interval: Duration,
     on_abandon: OnAbandon,
+    mut on_poll: impl FnMut(u32) + Send,
 ) -> Result<()> {
     let start = std::time::Instant::now();
     let mut consecutive_confirmed: u32 = 0;
     let mut consecutive_errors: u32 = 0;
     let mut last_identity: Option<String> = None;
+    let mut poll_count: u32 = 0;
+    // TF-669: human-readable summary of the *last* poll's outcome, folded into the timeout error
+    // below so a stuck-pane report says *why* the wait never completed (still agent_not_found?
+    // an identity that never stabilized? a response herdr answered but that carried no
+    // identity?) instead of just restating the timeout it hit either way.
+    let mut last_state: String;
 
     loop {
         match run_with_timeout(
@@ -763,23 +782,44 @@ pub async fn agent_wait_for_start(
                     if last_identity.as_deref() == Some(identity.as_str()) {
                         consecutive_confirmed += 1;
                     } else {
-                        last_identity = Some(identity);
+                        last_identity = Some(identity.clone());
                         consecutive_confirmed = 1;
                     }
                     if consecutive_confirmed >= AGENT_START_CONFIRM_POLLS {
                         return Ok(());
                     }
+                    last_state = format!(
+                        "identity {identity:?} seen on {consecutive_confirmed}/\
+                         {AGENT_START_CONFIRM_POLLS} consecutive polls so far"
+                    );
                 }
                 None => {
                     consecutive_errors = 0;
                     consecutive_confirmed = 0;
                     last_identity = None;
+                    // A successful response that carries no identity is a distinct case from
+                    // herdr explicitly reporting `agent_not_found` (see `agent_identity`'s doc)
+                    // — it's also the shape a herdr protocol change would take if the `agent`
+                    // field were ever renamed or retyped. Nothing else in this loop retains the
+                    // raw response, so without this it degrades into indistinguishable
+                    // "not started yet" polling with no trail for a future investigation.
+                    tracing::debug!(
+                        response = %value,
+                        "agent_wait_for_start: `herdr agent get {}` succeeded but the response \
+                         carried no parseable agent identity",
+                        pane_id.as_str()
+                    );
+                    last_state =
+                        "agent get succeeded but returned no parseable identity (see debug log \
+                         for the raw response)"
+                            .to_string();
                 }
             },
             Err(err) if is_agent_not_found_response(&err) => {
                 consecutive_errors = 0;
                 consecutive_confirmed = 0;
                 last_identity = None;
+                last_state = "still agent_not_found".to_string();
             }
             Err(err) => {
                 consecutive_confirmed = 0;
@@ -788,12 +828,19 @@ pub async fn agent_wait_for_start(
                 if consecutive_errors >= AGENT_START_POLL_ERROR_TOLERANCE {
                     return Err(err);
                 }
+                last_state = format!(
+                    "tolerating error {consecutive_errors}/{AGENT_START_POLL_ERROR_TOLERANCE} \
+                     before giving up: {err}"
+                );
             }
         }
 
+        poll_count += 1;
+        on_poll(poll_count);
+
         if start.elapsed().as_millis() as u64 >= timeout_ms {
             return Err(Error::Internal(format!(
-                "agent in {pane_id:?} never started within {timeout_ms}ms"
+                "agent in {pane_id:?} never started within {timeout_ms}ms ({last_state})"
             )));
         }
 
@@ -1460,6 +1507,7 @@ exit 0
             5_000,
             Duration::from_millis(5),
             OnAbandon::LeaveRunning,
+            |_| {},
         )
         .await
         .expect("agent_wait_for_start should succeed once the same identity is confirmed");
@@ -1506,6 +1554,7 @@ exit 0
             5_000,
             Duration::from_millis(5),
             OnAbandon::LeaveRunning,
+            |_| {},
         )
         .await
         .expect("agent_wait_for_start should succeed once the new identity itself stabilizes");
@@ -1535,6 +1584,7 @@ exit 1
             30,
             Duration::from_millis(10),
             OnAbandon::LeaveRunning,
+            |_| {},
         )
         .await
         .expect_err("agent_wait_for_start should time out while no agent is ever recognized");
@@ -1579,9 +1629,151 @@ exit 0
             5_000,
             Duration::from_millis(5),
             OnAbandon::LeaveRunning,
+            |_| {},
         )
         .await
         .expect("an isolated transient error must not stop the wait from eventually succeeding");
+    }
+
+    /// TF-669 regression test: the counterpart to
+    /// `agent_wait_for_exit_propagates_a_non_agent_not_found_error_after_the_tolerance_is_exhausted`
+    /// — a *persistent* run of non-`agent_not_found` errors (not just one, as the isolated-error
+    /// test above covers) must be propagated, and after exactly [`AGENT_START_POLL_ERROR_TOLERANCE`]
+    /// (3) attempts, not fewer (which would abort too eagerly on a transient blip) or more (which
+    /// would leave the caller waiting on a herdr that's genuinely stopped responding).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_wait_for_start_propagates_a_non_agent_not_found_error_after_the_tolerance_is_exhausted(
+    ) {
+        let counter_dir = tempfile::tempdir().unwrap();
+        let counter_file = counter_dir.path().join("count.txt");
+        std::fs::write(&counter_file, "0").unwrap();
+        let (_dir, script) = write_fake_herdr_script(&format!(
+            r#"
+count_file="{}"
+count=$(cat "$count_file")
+echo $((count + 1)) > "$count_file"
+echo '{{"error":{{"message":"no such pane"}}}}' >&2
+exit 1
+"#,
+            counter_file.display()
+        ));
+
+        let err = agent_wait_for_start(
+            script.to_str().unwrap(),
+            &PaneId("wY:p7Z".to_string()),
+            5_000,
+            Duration::from_millis(5),
+            OnAbandon::LeaveRunning,
+            |_| {},
+        )
+        .await
+        .expect_err("agent_wait_for_start should propagate a persistent non-agent_not_found error");
+
+        assert!(
+            err.to_string().contains("no such pane"),
+            "unexpected message: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&counter_file).unwrap().trim(),
+            "3",
+            "expected exactly AGENT_START_POLL_ERROR_TOLERANCE (3) attempts before giving up"
+        );
+    }
+
+    /// TF-669 regression test: a genuine `agent_not_found` interrupting an in-progress
+    /// confirmation streak must force a full recount, not just resume where it left off — the
+    /// pane really did stop reporting an agent, however briefly, so the previously-accumulated
+    /// polls can't be trusted to still describe the current state. Mirrors
+    /// `agent_wait_for_start_resets_the_confirmation_count_when_the_identity_changes`, but for an
+    /// intervening *disappearance* rather than a *different* identity.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_wait_for_start_resets_the_confirmation_count_on_an_intervening_agent_not_found()
+    {
+        let counter_dir = tempfile::tempdir().unwrap();
+        let counter_file = counter_dir.path().join("count.txt");
+        std::fs::write(&counter_file, "0").unwrap();
+        let (_dir, script) = write_fake_herdr_script(&format!(
+            r#"
+count_file="{}"
+count=$(cat "$count_file")
+next=$((count + 1))
+echo "$next" > "$count_file"
+if [ "$next" -eq 2 ]; then
+  echo '{{"error":{{"code":"agent_not_found","message":"agent target wY:p7Z not found"}}}}' >&2
+  exit 1
+fi
+echo '{{"result":{{"agent":{{"agent":"claude"}}}}}}'
+exit 0
+"#,
+            counter_file.display()
+        ));
+
+        agent_wait_for_start(
+            script.to_str().unwrap(),
+            &PaneId("wY:p7Z".to_string()),
+            5_000,
+            Duration::from_millis(5),
+            OnAbandon::LeaveRunning,
+            |_| {},
+        )
+        .await
+        .expect("agent_wait_for_start should still succeed once the identity re-stabilizes");
+
+        let final_count = std::fs::read_to_string(&counter_file).unwrap();
+        assert_eq!(
+            final_count.trim(),
+            "5",
+            "expected 1 confirming poll, 1 intervening agent_not_found (resetting the streak), \
+             then AGENT_START_CONFIRM_POLLS (3) fresh confirming polls"
+        );
+    }
+
+    /// TF-669 regression test: an `Ok` response that parses but carries no identity (the
+    /// `agent_identity` `None` case — a missing/blank `agent.agent` field) must reset the
+    /// confirmation streak exactly like an explicit `agent_not_found` error does, not be treated
+    /// as a match or silently ignored.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_wait_for_start_resets_the_confirmation_count_on_a_blank_identity_response() {
+        let counter_dir = tempfile::tempdir().unwrap();
+        let counter_file = counter_dir.path().join("count.txt");
+        std::fs::write(&counter_file, "0").unwrap();
+        let (_dir, script) = write_fake_herdr_script(&format!(
+            r#"
+count_file="{}"
+count=$(cat "$count_file")
+next=$((count + 1))
+echo "$next" > "$count_file"
+if [ "$next" -eq 2 ]; then
+  echo '{{"result":{{"agent":{{"agent":""}}}}}}'
+  exit 0
+fi
+echo '{{"result":{{"agent":{{"agent":"claude"}}}}}}'
+exit 0
+"#,
+            counter_file.display()
+        ));
+
+        agent_wait_for_start(
+            script.to_str().unwrap(),
+            &PaneId("wY:p7Z".to_string()),
+            5_000,
+            Duration::from_millis(5),
+            OnAbandon::LeaveRunning,
+            |_| {},
+        )
+        .await
+        .expect("agent_wait_for_start should still succeed once a real identity stabilizes");
+
+        let final_count = std::fs::read_to_string(&counter_file).unwrap();
+        assert_eq!(
+            final_count.trim(),
+            "5",
+            "expected 1 confirming poll, 1 blank-identity response (resetting the streak), then \
+             AGENT_START_CONFIRM_POLLS (3) fresh confirming polls"
+        );
     }
 
     /// Polls for `path` to exist, up to `timeout`, checking every 50ms. Used by the
@@ -1884,5 +2076,61 @@ exit 1
 
         assert_eq!(next_retry_budget_ms(&err, 0, 30_000, 30_000), None);
         assert_eq!(next_retry_budget_ms(&err, 0, 40_000, 30_000), None);
+    }
+
+    // TF-669: `agent_identity` is [`agent_wait_for_start`]'s pure extraction step — no
+    // subprocess, no timing — so it's unit-tested directly rather than only indirectly through
+    // the subprocess-scripted `agent_wait_for_start` tests above, mirroring the same rationale
+    // `next_retry_budget_ms` was pulled out and tested for.
+
+    #[test]
+    fn agent_identity_extracts_the_nested_agent_field() {
+        let value = serde_json::json!({"agent": {"agent": "claude"}});
+        assert_eq!(agent_identity(&value), Some("claude".to_string()));
+    }
+
+    #[test]
+    fn agent_identity_trims_surrounding_whitespace() {
+        let value = serde_json::json!({"agent": {"agent": "  claude  "}});
+        assert_eq!(agent_identity(&value), Some("claude".to_string()));
+    }
+
+    #[test]
+    fn agent_identity_is_none_for_a_blank_or_whitespace_only_name() {
+        assert_eq!(
+            agent_identity(&serde_json::json!({"agent": {"agent": ""}})),
+            None
+        );
+        assert_eq!(
+            agent_identity(&serde_json::json!({"agent": {"agent": "   "}})),
+            None
+        );
+    }
+
+    #[test]
+    fn agent_identity_is_none_when_the_inner_agent_field_is_missing() {
+        assert_eq!(agent_identity(&serde_json::json!({"agent": {}})), None);
+    }
+
+    #[test]
+    fn agent_identity_is_none_when_the_outer_agent_field_is_missing() {
+        assert_eq!(agent_identity(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn agent_identity_is_none_for_a_non_string_agent_field() {
+        // A malformed/protocol-changed response (wrong JSON type) must not be mistaken for a
+        // real — if numerically odd — agent name; see `agent_identity`'s own doc.
+        assert_eq!(
+            agent_identity(&serde_json::json!({"agent": {"agent": 42}})),
+            None
+        );
+    }
+
+    #[test]
+    fn agent_identity_is_none_for_a_null_result() {
+        // `interpret_output` maps an empty-but-successful stdout to `Ok(Value::Null)` — confirm
+        // that shape is treated the same as any other response with no identity, not a panic.
+        assert_eq!(agent_identity(&serde_json::Value::Null), None);
     }
 }
