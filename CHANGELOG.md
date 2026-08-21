@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-21
+
+Phase 2a (query DSL / server-side filtering) and Phase 2b (comments, named
+filter presets, implement-flow reliability hardening) in full — the first
+release since 0.2.1 (2026-08-12).
+
+### ⚠️ Breaking changes (semver, `plugin` feature)
+
+Three changes to the `plugin` feature's public API accumulated across this
+release without being versioned individually; bundled here as one migration
+note rather than three separate diffs to reconcile on upgrade:
+
+- **TF-616**: `assignee_open_filter`/`project_open_filter`/`team_open_filter`
+  (`src/plugin/data.rs`) and the `fetch_*` functions built on them now
+  require an additional `filter_terms: &[FilterTerm]` parameter. Pass `&[]`
+  to reproduce the exact pre-0.3.0 filter behavior.
+- **TF-647**: `plugin::app::Action` gained a `CyclePreset` variant. Any
+  exhaustive `match` over `Action` needs a new arm (or a wildcard).
+- **TF-648**: `plugin::app::Action` gained an `AddComment { issue, body }`
+  variant, and `ViewState::Loaded` gained a `comment: CommentState` field.
+  Same exhaustive-match caveat as above; any code constructing
+  `ViewState::Loaded` directly needs the new field.
+
+See this file's TF-616/TF-647/TF-648 entries below for the full detail on
+each.
+
 ### Added
 
 - Named filter presets: `config.toml` now supports multiple `[[filter_presets]]` entries
