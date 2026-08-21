@@ -505,8 +505,11 @@ const AGENT_WAIT_CALL_TIMEOUT_BUFFER: Duration = Duration::from_secs(5);
 /// Pause between `agent_wait` polls when herdr reports `agent_not_found`. `pane_run` only types
 /// a command into the pane; herdr needs time to observe the resulting process and classify it as
 /// a coding agent before `agent wait --until idle` can succeed. A short fixed sleep prevents
-/// spamming herdr while still converging well within the caller's timeout budget.
-const AGENT_NOT_FOUND_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// spamming herdr while still converging well within the caller's timeout budget. `pub` (not
+/// module-private) since TF-669's `main.rs::implement_one` — a separate binary crate from this
+/// module's `herdr_linear` library crate — reuses it as [`agent_wait_for_start`]'s poll interval
+/// too, rather than duplicating the same "how often is it reasonable to ask herdr" magic number.
+pub const AGENT_NOT_FOUND_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Decide whether `agent_wait`'s loop should retry after `err`, and if so, the timeout budget
 /// (in ms) remaining for the next attempt. Pure — no I/O — so the retry decision is
@@ -680,6 +683,117 @@ pub async fn agent_wait_for_exit(
         if start.elapsed().as_millis() as u64 >= timeout_ms {
             return Err(Error::Internal(format!(
                 "agent in {pane_id:?} never exited within {timeout_ms}ms"
+            )));
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+/// Consecutive `herdr agent get` polls reporting the *same* agent identity
+/// [`agent_wait_for_start`] requires before concluding a real, stable coding agent has started —
+/// see that function's doc for why a single matching poll isn't enough.
+const AGENT_START_CONFIRM_POLLS: u32 = 3;
+
+/// Consecutive non-`agent_not_found` poll errors [`agent_wait_for_start`] tolerates before giving
+/// up and returning the error to its caller — mirrors [`AGENT_EXIT_POLL_ERROR_TOLERANCE`].
+const AGENT_START_POLL_ERROR_TOLERANCE: u32 = 3;
+
+/// Extracts the `agent` identity string from a `herdr agent get`/`agent list` entry's `result`
+/// value (e.g. `{"agent": {"agent": "claude", ...}}` — confirmed live against a real herdr 0.8.0
+/// instance). Returns `None` for a missing/blank field rather than treating it as a distinct
+/// identity, so a malformed response can't be mistaken for a real (if odd) agent name.
+fn agent_identity(result: &serde_json::Value) -> Option<String> {
+    let name = result.get("agent")?.get("agent")?.as_str()?.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// TF-669: waits until herdr recognizes `pane_id` as hosting a real, *stable* coding agent — i.e.
+/// `herdr agent get <pane_id>` reports the same non-blank `agent` identity on
+/// [`AGENT_START_CONFIRM_POLLS`] consecutive polls — before the caller trusts the pane enough to
+/// start sending it input.
+///
+/// Exists because neither `agent_wait(..., "idle", ...)`'s status nor a purely text-based
+/// "did the prompt land" check (`main.rs`'s `prompt_landed`/`wait_for_prompt_stable`) can tell
+/// "a real agent's live input box" apart from "a wrapper's own plain, pre-agent bootstrap output
+/// that just happens to look quiet or contain matching text for a while". Live-reproduced
+/// (TF-669) against a multi-stage `agent_command` alias (`hr` = `headroom wrap claude
+/// --memory --code-graph`): its own bootstrap (memory sync, a local proxy check, rtk hook setup)
+/// can run for several seconds of plain shell output *before* `claude` is even exec'd, during
+/// which `herdr agent get` reliably reports `agent_not_found` — confirmed by directly querying a
+/// live pane caught mid-race. Requiring the *same* identity on several consecutive polls, not
+/// just one, additionally guards against herdr transiently misidentifying one of the wrapper's
+/// own intermediate helper processes as "the agent" before the real target takes over: a single
+/// matching poll resets and restarts the count on the next poll's *different* identity, rather
+/// than declaring success on a value that's about to change.
+///
+/// Poll/timeout/tolerance semantics otherwise mirror [`agent_wait_for_exit`] with the transition
+/// inverted: an `agent_not_found` response is the *expected* steady state before the agent has
+/// started (resets the confirmation streak, same as that function's `Ok` branch resetting its
+/// exit-confirmation streak), while a matching identity is the awaited signal. `on_abandon` is
+/// forwarded to each individual poll call — see [`OnAbandon`]'s doc.
+pub async fn agent_wait_for_start(
+    herdr_bin: &str,
+    pane_id: &PaneId,
+    timeout_ms: u64,
+    poll_interval: Duration,
+    on_abandon: OnAbandon,
+) -> Result<()> {
+    let start = std::time::Instant::now();
+    let mut consecutive_confirmed: u32 = 0;
+    let mut consecutive_errors: u32 = 0;
+    let mut last_identity: Option<String> = None;
+
+    loop {
+        match run_with_timeout(
+            herdr_bin,
+            &["agent", "get", pane_id.as_str()],
+            DEFAULT_CLI_TIMEOUT,
+            on_abandon,
+        )
+        .await
+        {
+            Ok(value) => match agent_identity(&value) {
+                Some(identity) => {
+                    consecutive_errors = 0;
+                    if last_identity.as_deref() == Some(identity.as_str()) {
+                        consecutive_confirmed += 1;
+                    } else {
+                        last_identity = Some(identity);
+                        consecutive_confirmed = 1;
+                    }
+                    if consecutive_confirmed >= AGENT_START_CONFIRM_POLLS {
+                        return Ok(());
+                    }
+                }
+                None => {
+                    consecutive_errors = 0;
+                    consecutive_confirmed = 0;
+                    last_identity = None;
+                }
+            },
+            Err(err) if is_agent_not_found_response(&err) => {
+                consecutive_errors = 0;
+                consecutive_confirmed = 0;
+                last_identity = None;
+            }
+            Err(err) => {
+                consecutive_confirmed = 0;
+                last_identity = None;
+                consecutive_errors += 1;
+                if consecutive_errors >= AGENT_START_POLL_ERROR_TOLERANCE {
+                    return Err(err);
+                }
+            }
+        }
+
+        if start.elapsed().as_millis() as u64 >= timeout_ms {
+            return Err(Error::Internal(format!(
+                "agent in {pane_id:?} never started within {timeout_ms}ms"
             )));
         }
 
@@ -1310,6 +1424,164 @@ exit 0
             err.to_string().contains("never exited"),
             "expected a never-exited timeout error, got: {err}"
         );
+    }
+
+    /// TF-669: the counterpart to `agent_wait_for_exit`'s consecutive-poll confirmation, but for
+    /// the opposite transition (an agent appearing rather than disappearing). `agent get` reports
+    /// `agent_not_found` twice (simulating `hr`'s own pre-`claude` bootstrap, which herdr doesn't
+    /// yet recognize as hosting any agent), then the same `"claude"` identity on
+    /// `AGENT_START_CONFIRM_POLLS` (3) consecutive polls.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_wait_for_start_returns_ok_once_the_same_agent_identity_is_confirmed_consecutively(
+    ) {
+        let counter_dir = tempfile::tempdir().unwrap();
+        let counter_file = counter_dir.path().join("count.txt");
+        std::fs::write(&counter_file, "0").unwrap();
+        let (_dir, script) = write_fake_herdr_script(&format!(
+            r#"
+count_file="{}"
+count=$(cat "$count_file")
+next=$((count + 1))
+echo "$next" > "$count_file"
+if [ "$next" -le 2 ]; then
+  echo '{{"error":{{"code":"agent_not_found","message":"agent target wY:p7Z not found"}}}}' >&2
+  exit 1
+fi
+echo '{{"result":{{"agent":{{"agent":"claude"}}}}}}'
+exit 0
+"#,
+            counter_file.display()
+        ));
+
+        agent_wait_for_start(
+            script.to_str().unwrap(),
+            &PaneId("wY:p7Z".to_string()),
+            5_000,
+            Duration::from_millis(5),
+            OnAbandon::LeaveRunning,
+        )
+        .await
+        .expect("agent_wait_for_start should succeed once the same identity is confirmed");
+
+        let final_count = std::fs::read_to_string(&counter_file).unwrap();
+        assert_eq!(
+            final_count.trim(),
+            "5",
+            "expected 2 agent_not_found polls plus AGENT_START_CONFIRM_POLLS (3) matching polls"
+        );
+    }
+
+    /// TF-669 regression test: the failure mode this ticket exists for — a multi-stage wrapper
+    /// (`hr` = `headroom wrap claude ...`) can cause herdr to transiently misidentify one of its
+    /// own intermediate helper processes as "the agent" before the real target agent takes over.
+    /// A single matching poll must not be enough — the identity has to stabilize across
+    /// `AGENT_START_CONFIRM_POLLS` polls in a row, or a stray/incorrect early identification would
+    /// let the caller start sending the implement prompt long before `claude` is actually there.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_wait_for_start_resets_the_confirmation_count_when_the_identity_changes() {
+        let counter_dir = tempfile::tempdir().unwrap();
+        let counter_file = counter_dir.path().join("count.txt");
+        std::fs::write(&counter_file, "0").unwrap();
+        let (_dir, script) = write_fake_herdr_script(&format!(
+            r#"
+count_file="{}"
+count=$(cat "$count_file")
+next=$((count + 1))
+echo "$next" > "$count_file"
+if [ "$next" -le 2 ]; then
+  echo '{{"result":{{"agent":{{"agent":"headroom-rtk-installer"}}}}}}'
+  exit 0
+fi
+echo '{{"result":{{"agent":{{"agent":"claude"}}}}}}'
+exit 0
+"#,
+            counter_file.display()
+        ));
+
+        agent_wait_for_start(
+            script.to_str().unwrap(),
+            &PaneId("wY:p7Z".to_string()),
+            5_000,
+            Duration::from_millis(5),
+            OnAbandon::LeaveRunning,
+        )
+        .await
+        .expect("agent_wait_for_start should succeed once the new identity itself stabilizes");
+
+        let final_count = std::fs::read_to_string(&counter_file).unwrap();
+        assert_eq!(
+            final_count.trim(),
+            "5",
+            "expected 2 polls of the stray identity (reset by the switch) plus \
+             AGENT_START_CONFIRM_POLLS (3) polls of the real one"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_wait_for_start_times_out_when_no_agent_is_ever_recognized() {
+        let (_dir, script) = write_fake_herdr_script(
+            r#"
+echo '{"error":{"code":"agent_not_found","message":"agent target wY:p7Z not found"}}' >&2
+exit 1
+"#,
+        );
+
+        let err = agent_wait_for_start(
+            script.to_str().unwrap(),
+            &PaneId("wY:p7Z".to_string()),
+            30,
+            Duration::from_millis(10),
+            OnAbandon::LeaveRunning,
+        )
+        .await
+        .expect_err("agent_wait_for_start should time out while no agent is ever recognized");
+
+        assert!(
+            err.to_string().contains("never started"),
+            "expected a never-started timeout error, got: {err}"
+        );
+    }
+
+    /// The flip side of the tolerance in `agent_wait_for_exit_tolerates_an_isolated_transient_error_and_keeps_polling`:
+    /// an isolated non-`agent_not_found` error (a `DEFAULT_CLI_TIMEOUT` blip, a momentary herdr
+    /// hiccup) costs the identity-confirmation streak accumulated so far (mirroring
+    /// `agent_wait_for_exit`'s `Err(other)` branch resetting its own streak) but must not abort
+    /// the wait outright — only a genuine run of such errors ([`AGENT_START_POLL_ERROR_TOLERANCE`])
+    /// should.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_wait_for_start_tolerates_an_isolated_non_agent_not_found_error() {
+        let counter_dir = tempfile::tempdir().unwrap();
+        let counter_file = counter_dir.path().join("count.txt");
+        std::fs::write(&counter_file, "0").unwrap();
+        let (_dir, script) = write_fake_herdr_script(&format!(
+            r#"
+count_file="{}"
+count=$(cat "$count_file")
+next=$((count + 1))
+echo "$next" > "$count_file"
+if [ "$next" -eq 2 ]; then
+  echo '{{"error":{{"message":"herdr daemon hiccup"}}}}' >&2
+  exit 1
+fi
+echo '{{"result":{{"agent":{{"agent":"claude"}}}}}}'
+exit 0
+"#,
+            counter_file.display()
+        ));
+
+        agent_wait_for_start(
+            script.to_str().unwrap(),
+            &PaneId("wY:p7Z".to_string()),
+            5_000,
+            Duration::from_millis(5),
+            OnAbandon::LeaveRunning,
+        )
+        .await
+        .expect("an isolated transient error must not stop the wait from eventually succeeding");
     }
 
     /// Polls for `path` to exist, up to `timeout`, checking every 50ms. Used by the

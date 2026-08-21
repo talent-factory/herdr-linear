@@ -398,6 +398,17 @@ const PROMPT_SEND_STABILITY_DURATION: std::time::Duration = std::time::Duration:
 /// for a target that's merely slow rather than actually stuck.
 const PROMPT_SEND_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
 
+/// TF-669: overall wall-clock budget for [`plugin::herdr_cli::agent_wait_for_start`] — how long
+/// `implement_one` waits for herdr to recognize a real, stable coding agent in the pane at all,
+/// *before* even asking `agent_wait` about "idle" status. Live-reproduced against this repo's own
+/// `hr` alias (`headroom wrap claude --memory --code-graph`): its memory-sync/proxy-check/rtk-setup
+/// preamble ran for ~6-7s of plain shell output before `claude` was exec'd (see TF-650's own
+/// diagnosis, and this ticket's live pane inspection). 20s gives roughly 3x that observed
+/// real-world worst case as margin for a slower machine or a colder cache, while still failing in
+/// bounded time — separate from `agent_wait`'s own 30s "idle" budget below, so a pane that
+/// genuinely never starts an agent at all fails close to this bound rather than compounding both.
+const AGENT_START_WAIT_TIMEOUT_MS: u64 = 20_000;
+
 /// Compile-time enforcement of the same two [`PromptSendPolicy`] invariants
 /// [`send_prompt_until_visible_with`]'s `debug_assert!`s check at the one real call site — but
 /// unconditionally, in every profile including `--release` (`debug_assert!` compiles out
@@ -864,6 +875,29 @@ async fn implement_one(
 
     // From here on, every early return must still report `warnings` — a failure below doesn't
     // undo (or excuse hiding) a warning collected above it.
+
+    // TF-669: confirm herdr has recognized a real, *stable* coding agent in this pane before
+    // trusting `agent_wait`'s "idle" status below at all — see `agent_wait_for_start`'s doc for
+    // why that status alone can't be trusted for a multi-stage `agent_command` wrapper (e.g. an
+    // alias like `hr` that runs its own memory-sync/proxy-check/rtk-setup preamble for several
+    // seconds before actually exec'ing the real agent). Without this, the implement prompt can
+    // get typed into that wrapper's own plain bootstrap output instead of the agent's input box —
+    // confirmed live against a real stuck pane during this investigation.
+    if let Err(err) = plugin::herdr_cli::agent_wait_for_start(
+        herdr_bin,
+        &created_tab.root_pane_id,
+        AGENT_START_WAIT_TIMEOUT_MS,
+        plugin::herdr_cli::AGENT_NOT_FOUND_POLL_INTERVAL,
+        plugin::herdr_cli::OnAbandon::LeaveRunning,
+    )
+    .await
+    {
+        return ImplementOutcome::Failed(status_with_warnings(
+            format!("agent never started ({err}) — run manually: {prompt}"),
+            &warnings,
+        ));
+    }
+
     if let Err(err) = plugin::herdr_cli::agent_wait(
         herdr_bin,
         &created_tab.root_pane_id,
@@ -3782,10 +3816,37 @@ exit 1
             r#"
 case "$1 $2" in
   "tab create") {tab_create} ;;
+  "agent get") echo '{{"result":{{"agent":{{"agent":"claude"}}}}}}'; exit 0 ;;
   "pane run") {pane_run} ;;
   "agent wait") {agent_wait} ;;
   "agent rename") {agent_rename} ;;
   "agent prompt") echo '{{"result":{{}}}}'; exit 0 ;;
+  "agent read") echo 'Implement Linear Issue TF-579 using a new git worktree'; exit 0 ;;
+  *)
+    echo '{{"error":{{"message":"unexpected herdr call: $1 $2"}}}}'
+    exit 1
+    ;;
+esac
+"#
+        ))
+    }
+
+    /// A sibling of [`write_dispatching_herdr_script`] (TF-669) for scripting `agent get`'s
+    /// response explicitly — everything else behaves like a normal successful run (`pane run`,
+    /// `agent wait --until idle`, `agent rename`, `agent prompt` all succeed; `agent read` reports
+    /// the prompt landed), so tests using this only need to describe the one behavior under test.
+    fn write_dispatching_herdr_script_with_agent_get(
+        agent_get: &str,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        write_fake_herdr_script(&format!(
+            r#"
+case "$1 $2" in
+  "tab create")
+    echo '{{"result":{{"tab":{{"tab_id":"t1","label":"TF-579"}},"root_pane":{{"pane_id":"p1"}}}}}}'
+    exit 0
+    ;;
+  "agent get") {agent_get} ;;
+  "pane run"|"agent wait"|"agent rename"|"agent prompt") echo '{{"result":{{}}}}'; exit 0 ;;
   "agent read") echo 'Implement Linear Issue TF-579 using a new git worktree'; exit 0 ;;
   *)
     echo '{{"error":{{"message":"unexpected herdr call: $1 $2"}}}}'
@@ -4011,6 +4072,48 @@ esac
         );
     }
 
+    /// TF-669 regression test: `implement_one` must confirm herdr recognizes a real, stable agent
+    /// in the pane (`agent_wait_for_start`) *before* it goes on to `agent_wait(..., "idle", ...)`
+    /// and the prompt-send dance — otherwise a multi-stage `agent_command` wrapper (like the `hr`
+    /// alias this ticket was filed against) can get the prompt injected into its own pre-agent
+    /// bootstrap output. Exercises the error-tolerance-exhausted path (not the full timeout path,
+    /// which is already covered fast/directly by `agent_wait_for_start`'s own unit tests in
+    /// `herdr_cli.rs`) so this test stays quick: three non-`agent_not_found` errors in a row
+    /// exhaust `AGENT_START_POLL_ERROR_TOLERANCE` well before any timeout would.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn implement_one_fails_when_the_agent_never_gets_recognized() {
+        let (_dir, script) = write_dispatching_herdr_script_with_agent_get(
+            r#"echo '{"error":{"message":"boom"}}' >&2; exit 1"#,
+        );
+        let client = herdr_linear::LinearClient::new("lin_api_test_key").unwrap();
+        let issue = sample_issue("TF-579");
+        let command = plugin::implement::ValidatedAgentCommand::parse("hr".to_string()).unwrap();
+        let (notify_tx, _notify_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let outcome = implement_one(
+            script.to_str().unwrap(),
+            &client,
+            &issue,
+            &command,
+            &notify_tx,
+            |_, _| {},
+        )
+        .await;
+
+        let ImplementOutcome::Failed(message) = outcome else {
+            panic!("expected Failed, got {outcome:?}");
+        };
+        assert!(
+            message.contains("agent never started") && message.contains("boom"),
+            "unexpected message: {message}"
+        );
+        assert!(
+            message.contains("Implement Linear Issue TF-579 using a new git worktree"),
+            "failure message should tell the user how to run the prompt manually: {message}"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn implement_one_records_an_agent_rename_failure_as_a_warning_but_continues() {
@@ -4111,6 +4214,10 @@ case "$1 $2" in
     echo '{{"result":{{"tab":{{"tab_id":"t2","label":"TF-579"}},"root_pane":{{"pane_id":"p9"}}}}}}'
     exit 0
     ;;
+  "agent get")
+    echo '{{"result":{{"agent":{{"agent":"claude"}}}}}}'
+    exit 0
+    ;;
   "agent read")
     echo 'Implement Linear Issue TF-579 using a new git worktree'
     exit 0
@@ -4172,6 +4279,14 @@ esac
             rest,
             vec![
                 "CALL: pane run p9 hr",
+                // TF-669: `agent_wait_for_start` confirms the same agent identity on
+                // `AGENT_START_CONFIRM_POLLS` (3) consecutive polls before `implement_one` trusts
+                // `agent_wait`'s "idle" status enough to start the prompt-send dance — this
+                // script's `agent get` always answers "claude" immediately, so the count here is
+                // exactly that constant, not a timing-dependent range.
+                "CALL: agent get p9",
+                "CALL: agent get p9",
+                "CALL: agent get p9",
                 "CALL: agent wait p9 --until idle --timeout 30000",
                 "CALL: agent rename p9 hr--tf-579",
                 "CALL: agent prompt p9 Implement Linear Issue TF-579 using a new git worktree",
@@ -4224,6 +4339,10 @@ esac
 case "$1 $2" in
   "tab create")
     echo '{"result":{"tab":{"tab_id":"t9","label":"TF-579"},"root_pane":{"pane_id":"p9"}}}'
+    exit 0
+    ;;
+  "agent get")
+    echo '{"result":{"agent":{"agent":"claude"}}}'
     exit 0
     ;;
   "pane run"|"agent wait"|"agent rename")

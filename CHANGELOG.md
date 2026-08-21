@@ -49,6 +49,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `implement_one` now confirms herdr actually recognizes a real, *stable* coding agent in the pane
+  before trusting `agent_wait`'s "idle" status enough to start the implement-prompt-send dance.
+  Live-reproduced (not just from the bug report's screenshots): the exact stuck pane from the
+  report was still sitting there, `herdr agent get` on it returning `agent_not_found`, its screen
+  showing the implement prompt spliced mid-way into `hr`'s (`headroom wrap claude --memory
+  --code-graph`) own plain bootstrap log — the prompt had been typed in *before* `claude` was even
+  exec'd, not dropped by the target's own slower startup as TF-587/619/650 diagnosed one layer up.
+  Neither `agent_wait(..., "idle", ...)`'s status nor the purely text-based `prompt_landed`/
+  `wait_for_prompt_stable` check can tell a real agent's live input box apart from a wrapper's own
+  non-repainting scrollback that happens to look quiet, or hold matching text, for a while — a
+  slow multi-stage `agent_command` alias's own preamble can satisfy either well before the real
+  agent starts. New `plugin::herdr_cli::agent_wait_for_start` polls `herdr agent get <pane_id>`
+  and requires the *same* non-blank `agent` identity on `AGENT_START_CONFIRM_POLLS` (3) consecutive
+  polls — not just one — before returning, mirroring `agent_wait_for_exit`'s consecutive-poll
+  confirmation pattern but for the opposite transition (an agent appearing rather than
+  disappearing); requiring several matching polls in a row additionally guards against herdr
+  transiently misidentifying one of a multi-stage wrapper's own intermediate helper processes
+  (e.g. `hr`'s rtk-hook installer) as "the agent" before the real target takes over. Runs in
+  `implement_one` between the existing `pane_run` and `agent_wait(..., "idle", ...)` calls, under
+  its own `AGENT_START_WAIT_TIMEOUT_MS` (20s — roughly 3x the ~6-7s real-world worst case observed
+  against `hr`) budget, separate from `agent_wait`'s own 30s "idle" budget so a pane that never
+  starts an agent at all fails close to the former bound rather than compounding both. `AGENT_NOT_FOUND_POLL_INTERVAL`
+  (previously module-private) is now `pub`, reused as this new wait's poll interval rather than
+  duplicating the same tuning constant (TF-669)
 - Single-issue `<Enter>` implement now shows visible progress while `send_prompt_until_visible` is
   (re)confirming the prompt landed, instead of leaving the screen looking unchanged for the whole
   wait. Diagnosed live against a real `headroom wrap claude ...`-style multi-process
