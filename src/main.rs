@@ -398,6 +398,17 @@ const PROMPT_SEND_STABILITY_DURATION: std::time::Duration = std::time::Duration:
 /// for a target that's merely slow rather than actually stuck.
 const PROMPT_SEND_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
 
+/// TF-669: overall wall-clock budget for [`plugin::herdr_cli::agent_wait_for_start`] — how long
+/// `implement_one` waits for herdr to recognize a real, stable coding agent in the pane at all,
+/// *before* even asking `agent_wait` about "idle" status. Live-reproduced against this repo's own
+/// `hr` alias (`headroom wrap claude --memory --code-graph`): its memory-sync/proxy-check/rtk-setup
+/// preamble ran for ~6-7s of plain shell output before `claude` was exec'd (see TF-650's own
+/// diagnosis, and this ticket's live pane inspection). 20s gives roughly 3x that observed
+/// real-world worst case as margin for a slower machine or a colder cache, while still failing in
+/// bounded time — separate from `agent_wait`'s own 30s "idle" budget below, so a pane that
+/// genuinely never starts an agent at all fails close to this bound rather than compounding both.
+const AGENT_START_WAIT_TIMEOUT_MS: u64 = 20_000;
+
 /// Compile-time enforcement of the same two [`PromptSendPolicy`] invariants
 /// [`send_prompt_until_visible_with`]'s `debug_assert!`s check at the one real call site — but
 /// unconditionally, in every profile including `--release` (`debug_assert!` compiles out
@@ -762,6 +773,21 @@ async fn resolve_validated_agent_command(
     })
 }
 
+/// TF-669: the progress events [`implement_one`] can report mid-flight, via its `on_progress`
+/// parameter, for a caller that wants to redraw a terminal during either of its two waits.
+/// Deliberately one enum rather than two separate callbacks — see `implement_one`'s own doc for
+/// why two live `FnMut` closures over the same `&mut app`/`&mut terminal` captures can't coexist.
+#[derive(Debug, Clone, Copy)]
+enum ImplementProgress {
+    /// A single `herdr agent get` poll completed inside
+    /// [`plugin::herdr_cli::agent_wait_for_start`] without yet confirming a stable agent
+    /// identity; carries the 1-indexed poll count.
+    AgentStartPoll(u32),
+    /// A single prompt-send attempt completed inside [`send_prompt_until_visible`]; carries the
+    /// same `(attempt, attempts)` pair that function's own doc describes.
+    PromptAttempt { attempt: u32, attempts: u32 },
+}
+
 /// Runs the full "implement this issue" flow for one issue: create a fresh tab labeled after the
 /// issue and start `command` running inside it under a name unique to this issue (TF-590, see
 /// [`plugin::implement::build_agent_name`]), set the issue to its team's "In Progress" state,
@@ -792,11 +818,17 @@ async fn resolve_validated_agent_command(
 /// launch-context parse *and* its `current_dir()` fallback failing, which would otherwise pass
 /// an empty `--cwd` straight through to `tab_create`.
 ///
-/// `on_prompt_attempt` is forwarded verbatim to [`send_prompt_until_visible`] — see that
-/// function's doc for when it fires. `start_implementation` (single-issue) passes a closure that
-/// redraws the terminal; `implement_many` (concurrent multi-issue, TF-622) passes a no-op, since
-/// several of its futures can be mid-flight at once and none of them owns the one shared
-/// terminal safely.
+/// `on_progress` (TF-669) fires once per [`ImplementProgress`] event from either of
+/// `implement_one`'s two waits that can each run long enough to matter for a caller with a UI to
+/// redraw: [`plugin::herdr_cli::agent_wait_for_start`]'s per-poll signal and
+/// [`send_prompt_until_visible`]'s per-attempt signal — see each function's own doc for exactly
+/// when its half fires. A single callback rather than one per wait because `start_implementation`
+/// needs `&mut app`/`&mut terminal` in both, and two live `FnMut` closures can't share the same
+/// mutable captures; folding both signals into one enum sidesteps that without needing two
+/// separate mutable borrows of the same terminal state. `start_implementation` (single-issue)
+/// passes a closure that redraws the terminal for both variants; `implement_many` (concurrent
+/// multi-issue, TF-622) passes a no-op, since several of its futures can be mid-flight at once
+/// and none of them owns the one shared terminal safely.
 ///
 /// `notify` is forwarded to [`spawn_tab_close_when_agent_has_exited`] (TF-653) — the channel
 /// `event_loop` drains each tick to surface a `Status::Ok` once that background watcher actually
@@ -807,7 +839,7 @@ async fn implement_one(
     issue: &herdr_linear::Issue,
     command: &plugin::implement::ValidatedAgentCommand,
     notify: &StatusNotifier,
-    mut on_prompt_attempt: impl FnMut(u32, u32) + Send,
+    mut on_progress: impl FnMut(ImplementProgress) + Send,
 ) -> ImplementOutcome {
     let cwd = plugin::host::resolve_cwd();
     if cwd.as_os_str().is_empty() {
@@ -864,6 +896,37 @@ async fn implement_one(
 
     // From here on, every early return must still report `warnings` — a failure below doesn't
     // undo (or excuse hiding) a warning collected above it.
+
+    // TF-669: confirm herdr has recognized a real, *stable* coding agent in this pane before
+    // trusting `agent_wait`'s "idle" status below at all — see `agent_wait_for_start`'s doc for
+    // why that status alone can't be trusted for a multi-stage `agent_command` wrapper (e.g. an
+    // alias like `hr` that runs its own memory-sync/proxy-check/rtk-setup preamble for several
+    // seconds before actually exec'ing the real agent). Without this, the implement prompt can
+    // get typed into that wrapper's own plain bootstrap output instead of the agent's input box —
+    // confirmed live against a real stuck pane during this investigation.
+    if let Err(err) = plugin::herdr_cli::agent_wait_for_start(
+        herdr_bin,
+        &created_tab.root_pane_id,
+        AGENT_START_WAIT_TIMEOUT_MS,
+        plugin::herdr_cli::AGENT_NOT_FOUND_POLL_INTERVAL,
+        // A read-only poll, same as `agent_wait_for_exit`'s — killing an abandoned one mid-flight
+        // has no server-side consequence, and leaving it running would orphan the child process
+        // (see `OnAbandon`'s doc).
+        plugin::herdr_cli::OnAbandon::KillChild,
+        |poll| on_progress(ImplementProgress::AgentStartPoll(poll)),
+    )
+    .await
+    {
+        // Deliberately hedged, not "the agent never started" — `err` may equally be herdr
+        // becoming unresponsive (the poll error tolerance exhausted) as a pane that genuinely
+        // never got an agent running in it; `err` itself (see `agent_wait_for_start`'s doc)
+        // carries the specifics.
+        return ImplementOutcome::Failed(status_with_warnings(
+            format!("herdr never confirmed the agent started ({err}) — run manually: {prompt}"),
+            &warnings,
+        ));
+    }
+
     if let Err(err) = plugin::herdr_cli::agent_wait(
         herdr_bin,
         &created_tab.root_pane_id,
@@ -890,11 +953,13 @@ async fn implement_one(
         ));
     }
 
-    if let Err(err) =
-        send_prompt_until_visible(herdr_bin, &created_tab.root_pane_id, &prompt, |a, n| {
-            on_prompt_attempt(a, n)
-        })
-        .await
+    if let Err(err) = send_prompt_until_visible(
+        herdr_bin,
+        &created_tab.root_pane_id,
+        &prompt,
+        |attempt, attempts| on_progress(ImplementProgress::PromptAttempt { attempt, attempts }),
+    )
+    .await
     {
         return ImplementOutcome::Failed(status_with_warnings(
             format!("{err} — run manually: {prompt}"),
@@ -978,8 +1043,9 @@ fn tab_auto_closed_status(identifier: &str) -> plugin::app::Status {
 /// exited yet, or still open because closing it failed.
 ///
 /// Polls with [`plugin::herdr_cli::OnAbandon::KillChild`], not the
-/// [`plugin::herdr_cli::OnAbandon::LeaveRunning`] every other `agent_wait`/`agent_wait_for_exit`
-/// call in this codebase uses: since nothing else keeps this call's budget alive once its
+/// [`plugin::herdr_cli::OnAbandon::LeaveRunning`] every `agent_wait` call and most other
+/// `herdr` calls in this codebase use (TF-669's `agent_wait_for_start`, below, is the one other
+/// exception, for the same reason): since nothing else keeps this call's budget alive once its
 /// enclosing task is dropped (the plugin quit mid-wait, per this same ticket's acceptance
 /// criteria), leaving an in-flight `herdr agent get` child running would let it survive the
 /// plugin process itself, if only briefly — see [`plugin::herdr_cli::OnAbandon`]'s doc for the
@@ -1355,24 +1421,40 @@ fn prompt_attempt_status(
     )))
 }
 
+/// TF-669's counterpart to [`prompt_attempt_status`], for the *earlier*
+/// [`plugin::herdr_cli::agent_wait_for_start`] wait — closes the same "long silent wait" gap
+/// that fix closed for the prompt-send phase, but for "does herdr even see an agent in this
+/// pane yet" instead of "did the prompt land". Returns `None` for poll 1, for the same reason
+/// `prompt_attempt_status` does: a wait that resolves on its very first poll never needed a
+/// mid-flight status at all, so showing one only from poll 2 on avoids a one-poll flicker.
+/// Pure function, unit-tested directly, same rationale as `prompt_attempt_status`'s own doc.
+fn agent_start_poll_status(issue_identifier: &str, poll: u32) -> Option<plugin::app::Status> {
+    if poll <= 1 {
+        return None;
+    }
+    Some(plugin::app::Status::Ok(format!(
+        "{issue_identifier}: still waiting for herdr to recognize the agent — poll {poll}…"
+    )))
+}
+
 /// Single-issue `<Enter>` flow (unmarked selection — [`plugin::app::Action::Implement`]).
 /// Status wording is unchanged from before TF-590: `implement_one` does the work, this just
 /// prefixes its outcome with the issue identifier and picks `Ok`/`Error` the same way the
 /// inlined version used to.
 ///
-/// Takes `terminal` (new) so it can redraw mid-flight via [`prompt_attempt_status`] — safe here
-/// specifically because this is the *single*-issue path: exactly one `implement_one` call is
-/// ever in flight, so nothing else could be racing this function for the one shared terminal.
-/// The multi-issue path (`implement_many`, TF-622) runs several `implement_one` calls
-/// concurrently and deliberately does not attempt this — see that function's doc. A failed
-/// mid-flight redraw (a real terminal I/O error) is logged via `tracing::debug!` and otherwise
-/// swallowed rather than propagated — matching `send_prompt_until_visible_with`'s own
-/// "log a non-fatal failure, don't abort the flow over it" convention, and specifically *not*
-/// silently discarded the way a one-off diagnostic-only failure (`init_tracing`'s own
-/// precedent) would be: unlike that case, `terminal.draw` failing here is the same operation
-/// the caller treats as fatal one statement earlier (`terminal.draw(...)?` in `event_loop`,
-/// right before this function is called), so losing the error without a trace would leave a
-/// real terminal fault undiagnoseable after the fact.
+/// Takes `terminal` (new) so it can redraw mid-flight via [`agent_start_poll_status`]/
+/// [`prompt_attempt_status`] — safe here specifically because this is the *single*-issue path:
+/// exactly one `implement_one` call is ever in flight, so nothing else could be racing this
+/// function for the one shared terminal. The multi-issue path (`implement_many`, TF-622) runs
+/// several `implement_one` calls concurrently and deliberately does not attempt this — see that
+/// function's doc. A failed mid-flight redraw (a real terminal I/O error) is logged via
+/// `tracing::debug!` and otherwise swallowed rather than propagated — matching
+/// `send_prompt_until_visible_with`'s own "log a non-fatal failure, don't abort the flow over
+/// it" convention, and specifically *not* silently discarded the way a one-off diagnostic-only
+/// failure (`init_tracing`'s own precedent) would be: unlike that case, `terminal.draw` failing
+/// here is the same operation the caller treats as fatal one statement earlier
+/// (`terminal.draw(...)?` in `event_loop`, right before this function is called), so losing the
+/// error without a trace would leave a real terminal fault undiagnoseable after the fact.
 async fn start_implementation(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     app: &mut plugin::app::App,
@@ -1391,23 +1473,22 @@ async fn start_implementation(
             return;
         }
     };
-    let outcome = implement_one(
-        &herdr_bin,
-        client,
-        &issue,
-        &command,
-        notify,
-        |attempt, attempts| {
-            if let Some(status) = prompt_attempt_status(&issue.identifier, attempt, attempts) {
-                app.set_status(status);
-                if let Err(err) = terminal.draw(|frame| plugin::ui::draw(frame, app)) {
-                    tracing::debug!(
-                        "start_implementation: mid-flight progress redraw failed ({err})"
-                    );
-                }
+    let outcome = implement_one(&herdr_bin, client, &issue, &command, notify, |progress| {
+        let status = match progress {
+            ImplementProgress::AgentStartPoll(poll) => {
+                agent_start_poll_status(&issue.identifier, poll)
             }
-        },
-    )
+            ImplementProgress::PromptAttempt { attempt, attempts } => {
+                prompt_attempt_status(&issue.identifier, attempt, attempts)
+            }
+        };
+        if let Some(status) = status {
+            app.set_status(status);
+            if let Err(err) = terminal.draw(|frame| plugin::ui::draw(frame, app)) {
+                tracing::debug!("start_implementation: mid-flight progress redraw failed ({err})");
+            }
+        }
+    })
     .await;
     match outcome {
         ImplementOutcome::Started(message) => {
@@ -1580,7 +1661,7 @@ async fn implement_many(
         let identifier = issue.identifier.clone();
         // No progress redraw here — see `implement_one`'s doc on why the concurrent path passes
         // a no-op.
-        let outcome = implement_one(herdr_bin, client, &issue, command, notify, |_, _| {}).await;
+        let outcome = implement_one(herdr_bin, client, &issue, command, notify, |_| {}).await;
         Ok::<_, herdr_linear::Error>((identifier, outcome))
     });
     client
@@ -2865,6 +2946,34 @@ exit 1
     }
 
     #[test]
+    fn agent_start_poll_status_is_none_on_the_first_poll() {
+        // Same rationale as `prompt_attempt_status_is_none_on_the_first_attempt`: a wait that
+        // resolves on its very first poll never needed a mid-flight status, so poll 1 must stay
+        // silent to avoid a one-poll flicker.
+        assert_eq!(agent_start_poll_status("TF-579", 1), None);
+    }
+
+    #[test]
+    fn agent_start_poll_status_reports_progress_from_the_second_poll_on() {
+        assert_eq!(
+            agent_start_poll_status("TF-579", 2),
+            Some(plugin::app::Status::Ok(
+                "TF-579: still waiting for herdr to recognize the agent — poll 2…".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn agent_start_poll_status_reflects_the_actual_poll_count() {
+        assert_eq!(
+            agent_start_poll_status("ENG-42", 7),
+            Some(plugin::app::Status::Ok(
+                "ENG-42: still waiting for herdr to recognize the agent — poll 7…".to_string()
+            ))
+        );
+    }
+
+    #[test]
     fn tab_auto_closed_status_names_the_issue_and_says_what_happened() {
         // TF-653: this exact wording is the whole fix — it's the only thing standing between
         // "the tab is gone" reading as "finished" instead of "lost".
@@ -3782,10 +3891,37 @@ exit 1
             r#"
 case "$1 $2" in
   "tab create") {tab_create} ;;
+  "agent get") echo '{{"result":{{"agent":{{"agent":"claude"}}}}}}'; exit 0 ;;
   "pane run") {pane_run} ;;
   "agent wait") {agent_wait} ;;
   "agent rename") {agent_rename} ;;
   "agent prompt") echo '{{"result":{{}}}}'; exit 0 ;;
+  "agent read") echo 'Implement Linear Issue TF-579 using a new git worktree'; exit 0 ;;
+  *)
+    echo '{{"error":{{"message":"unexpected herdr call: $1 $2"}}}}'
+    exit 1
+    ;;
+esac
+"#
+        ))
+    }
+
+    /// A sibling of [`write_dispatching_herdr_script`] (TF-669) for scripting `agent get`'s
+    /// response explicitly — everything else behaves like a normal successful run (`pane run`,
+    /// `agent wait --until idle`, `agent rename`, `agent prompt` all succeed; `agent read` reports
+    /// the prompt landed), so tests using this only need to describe the one behavior under test.
+    fn write_dispatching_herdr_script_with_agent_get(
+        agent_get: &str,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        write_fake_herdr_script(&format!(
+            r#"
+case "$1 $2" in
+  "tab create")
+    echo '{{"result":{{"tab":{{"tab_id":"t1","label":"TF-579"}},"root_pane":{{"pane_id":"p1"}}}}}}'
+    exit 0
+    ;;
+  "agent get") {agent_get} ;;
+  "pane run"|"agent wait"|"agent rename"|"agent prompt") echo '{{"result":{{}}}}'; exit 0 ;;
   "agent read") echo 'Implement Linear Issue TF-579 using a new git worktree'; exit 0 ;;
   *)
     echo '{{"error":{{"message":"unexpected herdr call: $1 $2"}}}}'
@@ -3957,7 +4093,7 @@ esac
             &issue,
             &command,
             &notify_tx,
-            |_, _| {},
+            |_| {},
         )
         .await;
 
@@ -3994,7 +4130,7 @@ esac
             &issue,
             &command,
             &notify_tx,
-            |_, _| {},
+            |_| {},
         )
         .await;
 
@@ -4008,6 +4144,56 @@ esac
         assert!(
             !message.contains("an empty"),
             "must not assert the tab is definitely empty: {message}"
+        );
+    }
+
+    /// TF-669 regression test: `implement_one` must confirm herdr recognizes a real, stable agent
+    /// in the pane (`agent_wait_for_start`) *before* it goes on to `agent_wait(..., "idle", ...)`
+    /// and the prompt-send dance — otherwise a multi-stage `agent_command` wrapper (like the `hr`
+    /// alias this ticket was filed against) can get the prompt injected into its own pre-agent
+    /// bootstrap output. Exercises the error-tolerance-exhausted path at the `implement_one`
+    /// integration level (message content and that the outcome is `Failed` at all — a dropped or
+    /// bypassed guard would let this script's otherwise-all-succeeding `agent_wait`/`agent_rename`/
+    /// `agent_prompt` stubs run instead, producing a non-`Failed` outcome and panicking the `let
+    /// else` below). The *exact* poll-count boundary for this same path is pinned directly and
+    /// fast by
+    /// `agent_wait_for_start_propagates_a_non_agent_not_found_error_after_the_tolerance_is_exhausted`
+    /// in `herdr_cli.rs`, and the full timeout path (a persistent `agent_not_found` rather than a
+    /// persistent error) by `agent_wait_for_start_times_out_when_no_agent_is_ever_recognized`
+    /// there too — this test doesn't need to re-pin either, so it stays quick: three
+    /// non-`agent_not_found` errors in a row exhaust `AGENT_START_POLL_ERROR_TOLERANCE` well
+    /// before any timeout would.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn implement_one_fails_when_the_agent_never_gets_recognized() {
+        let (_dir, script) = write_dispatching_herdr_script_with_agent_get(
+            r#"echo '{"error":{"message":"boom"}}' >&2; exit 1"#,
+        );
+        let client = herdr_linear::LinearClient::new("lin_api_test_key").unwrap();
+        let issue = sample_issue("TF-579");
+        let command = plugin::implement::ValidatedAgentCommand::parse("hr".to_string()).unwrap();
+        let (notify_tx, _notify_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let outcome = implement_one(
+            script.to_str().unwrap(),
+            &client,
+            &issue,
+            &command,
+            &notify_tx,
+            |_| {},
+        )
+        .await;
+
+        let ImplementOutcome::Failed(message) = outcome else {
+            panic!("expected Failed, got {outcome:?}");
+        };
+        assert!(
+            message.contains("herdr never confirmed the agent started") && message.contains("boom"),
+            "unexpected message: {message}"
+        );
+        assert!(
+            message.contains("Implement Linear Issue TF-579 using a new git worktree"),
+            "failure message should tell the user how to run the prompt manually: {message}"
         );
     }
 
@@ -4050,7 +4236,7 @@ esac
             &issue,
             &command,
             &notify_tx,
-            |_, _| {},
+            |_| {},
         )
         .await;
 
@@ -4111,6 +4297,10 @@ case "$1 $2" in
     echo '{{"result":{{"tab":{{"tab_id":"t2","label":"TF-579"}},"root_pane":{{"pane_id":"p9"}}}}}}'
     exit 0
     ;;
+  "agent get")
+    echo '{{"result":{{"agent":{{"agent":"claude"}}}}}}'
+    exit 0
+    ;;
   "agent read")
     echo 'Implement Linear Issue TF-579 using a new git worktree'
     exit 0
@@ -4137,7 +4327,7 @@ esac
             &issue,
             &command,
             &notify_tx,
-            |_, _| {},
+            |_| {},
         )
         .await;
 
@@ -4172,6 +4362,14 @@ esac
             rest,
             vec![
                 "CALL: pane run p9 hr",
+                // TF-669: `agent_wait_for_start` confirms the same agent identity on
+                // `AGENT_START_CONFIRM_POLLS` (3) consecutive polls before `implement_one` trusts
+                // `agent_wait`'s "idle" status enough to start the prompt-send dance — this
+                // script's `agent get` always answers "claude" immediately, so the count here is
+                // exactly that constant, not a timing-dependent range.
+                "CALL: agent get p9",
+                "CALL: agent get p9",
+                "CALL: agent get p9",
                 "CALL: agent wait p9 --until idle --timeout 30000",
                 "CALL: agent rename p9 hr--tf-579",
                 "CALL: agent prompt p9 Implement Linear Issue TF-579 using a new git worktree",
@@ -4187,13 +4385,14 @@ esac
     #[cfg(unix)]
     #[tokio::test]
     async fn implement_one_forwards_on_prompt_attempt_through_a_resend() {
-        // Review gap: every other `implement_one` test above passes a no-op `|_, _| {}`, and the
+        // Review gap: every other `implement_one` test above passes a no-op `|_| {}`, and the
         // one test that exercises `send_prompt_until_visible_with`'s `on_attempt` hook directly
         // (`send_prompt_until_visible_resends_after_an_attempt_times_out`) calls that function
         // directly, bypassing `implement_one` entirely — so nothing actually proved
-        // `implement_one`'s own forwarding closure (`|a, n| { on_prompt_attempt(a, n) }`) passes
-        // a caller's real callback through unmodified. A regression that dropped the forward, or
-        // swapped the argument order, would compile and pass every other test in this file.
+        // `implement_one`'s own forwarding closure (which wraps a caller's `on_progress` into
+        // `send_prompt_until_visible`'s `|attempt, attempts| on_progress(PromptAttempt { .. })`)
+        // passes a caller's real callback through unmodified. A regression that dropped the
+        // forward, or swapped the argument order, would compile and pass every other test here.
         //
         // This drives `implement_one` through a genuine resend (the fake script's `agent read`
         // only reports the prompt landed once `agent prompt` has been called twice) and asserts
@@ -4224,6 +4423,10 @@ esac
 case "$1 $2" in
   "tab create")
     echo '{"result":{"tab":{"tab_id":"t9","label":"TF-579"},"root_pane":{"pane_id":"p9"}}}'
+    exit 0
+    ;;
+  "agent get")
+    echo '{"result":{"agent":{"agent":"claude"}}}'
     exit 0
     ;;
   "pane run"|"agent wait"|"agent rename")
@@ -4270,11 +4473,13 @@ esac
             &issue,
             &command,
             &notify_tx,
-            move |attempt, attempts| {
-                seen_attempts_for_callback
-                    .lock()
-                    .unwrap()
-                    .push((attempt, attempts));
+            move |progress| {
+                if let ImplementProgress::PromptAttempt { attempt, attempts } = progress {
+                    seen_attempts_for_callback
+                        .lock()
+                        .unwrap()
+                        .push((attempt, attempts));
+                }
             },
         )
         .await;
