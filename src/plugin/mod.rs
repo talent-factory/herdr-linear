@@ -7,7 +7,7 @@
 //! `implement` (pure decision logic for "implement this issue" flow), `host` (resolves the
 //! herdr-injected launch context's working directory, since the plugin process's own cwd is
 //! always its install directory), `keybindings` (canonical keybindings registry for the help
-//! overlay).
+//! overlay), `query` (hand-rolled query DSL parser: filter terms + sort keys).
 
 pub mod app;
 pub mod config;
@@ -18,5 +18,6 @@ pub mod host;
 pub mod implement;
 pub mod keybindings;
 pub mod launch;
+pub mod query;
 pub mod repo;
 pub mod ui;

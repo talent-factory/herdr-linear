@@ -1,7 +1,19 @@
 # EDITOR handling for `c` (open config.toml) — design
 
 **Date:** 2026-08-11
-**Status:** Approved
+**Status:** Superseded (2026-08-13) — the herdr-pane launch mechanism this doc designs (tier
+1/2's `open_config_in_herdr_pane`: `tab_create` + typing the editor command into the fresh
+tab's shell via `pane_run`) turned out to be the direct cause of a real UX problem: quitting
+the editor left its herdr tab's shell running, requiring a manual close every time. Replaced
+with an in-place hand-off — herdr-linear's own TUI suspends (raw mode/alternate screen/mouse
+capture off), the editor runs as a direct child process in the *same* pane, and the TUI resumes
+once it exits — mirroring `herdr-file-viewer`'s own editor hand-off, which already solves the
+identical "no GUI over SSH" problem this doc's Problem section describes without a second pane
+at all. See `main.rs`'s `run_editor_in_terminal`/`run_editor_command`/`open_config_editor` for
+the current implementation, and `CHANGELOG.md`'s `[Unreleased]` entry for the full before/after.
+The **editor-resolution** logic this doc designs (`src/plugin/editor.rs`'s three-tier `config`
+override → `nvim` on `PATH` → `None`) is unchanged and still accurate — only "Architecture"
+onward (how the resolved command actually gets launched) is superseded below.
 
 ## Problem
 

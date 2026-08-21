@@ -369,13 +369,17 @@ was reversed: herdr's tab list can only report the underlying binary a pane runs
 one started bare. Under the old precedence, `agent_command = "hr"` could never actually take
 effect once any other Claude Code tab was open.)
 
-`c` tries to open `config.toml` in `nvim`, inside a herdr pane, so it's usable over SSH (e.g.
-herdr on an iPad) where there's no GUI to hand the file to. Set `editor` in the same
+`c` tries to open `config.toml` in `nvim`, right in herdr-linear's own pane — the plugin's TUI
+steps aside (leaving raw mode/the alternate screen) while the editor runs, then comes back once
+you quit it, so it's usable over SSH (e.g. herdr on an iPad) where there's no GUI to hand the
+file to, with no extra pane left behind to close afterward. Set `editor` in the same
 `config.toml` to use a different command instead (a bare binary name, no flags — e.g.
-`editor = "vim"`); it's launched the same way, inside a herdr pane. If neither `nvim` nor an
-`editor` override is available, or the herdr pane couldn't be opened, `c` falls back to your
-OS's default handler for `.toml` files — today's original behavior. Repeated `c` presses reuse
-the same editor pane rather than opening a new one each time.
+`editor = "vim"`); it's launched the same way. If neither `nvim` nor an `editor` override is
+available, or the editor couldn't be launched at all (e.g. removed from disk at the last
+moment), `c` falls back to your OS's default handler for `.toml` files — today's original
+behavior. Once the editor actually starts, though, `c` no longer falls back on its own — an
+editor that exits with an error is reported as-is rather than silently retried through a second
+opener, since it already had the terminal.
 
 "Team Issues" shows a Linear team's open issues. Unlike a project, a team has no
 repo-derived name to match, so it needs an explicit default: set `team_id` in the same
@@ -390,6 +394,139 @@ resolves automatically. If `team_id` is unset and the workspace has more than on
 entering "Team Issues" shows an error naming every team (so you can see which id to use)
 and pointing at `config.toml`; press `c` on that error screen to open it, same as for the
 project-matching errors above.
+
+Every view supports a small query DSL, both as a default applied on entry and as a live
+`/`-filter over whatever's currently loaded. Free text still does a plain
+case-insensitive substring match against title/identifier, exactly as before; alongside
+it, `priority:`/`state:`/`label:` narrow by those fields and `sort:` orders the result
+(prefix a field with `-` for descending — e.g. `sort:-priority,updated`):
+
+| Term | Matches |
+| --- | --- |
+| `priority:2`, `priority:high` | Exact priority (`0`=none, `1`=urgent, `2`=high, `3`=medium, `4`=low) |
+| `priority:>=2`, `priority:<=2` | Priority at least/at most the given level |
+| `state:"In Review"` | Workflow state, by name (case-insensitive; quote multi-word names) |
+| `label:bug` | Has a label with this name (case-insensitive) |
+| `sort:priority`, `sort:-updated` | Order by `priority`/`updated`/`created`/`identifier` |
+
+`priority:`/`state:`/`label:`/`sort:` — the *keys* themselves, the `>=`/`<=` operators,
+the priority level names (`urgent`/`high`/…), and the sort field names
+(`priority`/`updated`/…) all have to be typed exactly as shown, lowercase: `Priority:2`,
+`SORT:priority`, and `priority:HIGH` are every bit as unrecognized as a plain typo like
+`prioroty:2`. This matters more than it sounds like it should, because it fails
+*differently* from a bad value on an otherwise-correct key: `priority:2` with a garbage
+*value* (`priority:notanumber`) is a recognized key that still gets flagged — you'll see
+`(⚠ not recognized: ...)` in the filter title, or a status message for `default_query` —
+but a wrong-case *key* like `Priority:2` isn't recognized as a key at all, so it's
+silently treated as two ordinary words of free text instead, with no warning either way.
+Free text itself can also be quoted — `"fix login"` is one search term rather than two —
+which mostly only matters if the phrase has irregular internal whitespace you want
+preserved exactly.
+
+Every view's own base filter only ever fetches non-terminal issues, so `state:Done`/
+`state:Canceled`/`state:Cancelled` never match anything — there's no way to bring a
+completed or canceled issue back into view with a `state:` term.
+
+Set a default for every view with `default_query` in `config.toml`. A few worked
+examples, each a single line to paste in as-is:
+
+```toml
+# Only what actually needs attention, most urgent first — good for a daily-driver view
+# that skips low-priority backlog noise entirely.
+default_query = "priority:>=2 sort:-priority"
+
+# See everything, most recently touched first — no filtering, just a sort default so a
+# freshly-opened view doesn't start in whatever order the API happened to return.
+default_query = "sort:-updated"
+
+# Only issues someone's actively reviewing, oldest first (so the longest-waiting review
+# surfaces at the top).
+default_query = "state:\"In Review\" sort:created"
+```
+
+(`config.toml` only reads one `default_query` value — these are three alternatives to
+pick from, not something you'd set all at once.)
+
+Filter terms in `default_query` narrow the fetch itself, so an excluded issue is never
+loaded in the first place; `sort:` in `default_query` orders the view as soon as it's
+loaded. Pressing `/` on a loaded view opens a second filter, parsed through the same
+DSL, but it composes *with* `default_query` rather than replacing it: it can only narrow
+further within whatever `default_query` already fetched (it can't bring back an issue
+`default_query` excluded), and if the typed query has no `sort:` of its own, the view
+keeps whatever order `default_query` put it in rather than reverting to fetch order. A
+`/`-filter with its own `priority:`/`state:`/`label:`/`sort:` terms does fully take over
+*those* aspects for as long as it's active, on top of whatever `default_query` already
+narrowed the fetch to. `Enter` confirms the `/`-filter, `Esc` clears it and returns to
+`default_query`'s own filtered-and-sorted view.
+
+If a `priority:`/`state:`/`label:`/`sort:` term isn't recognized — a typo like
+`priority:hihg`, or an out-of-range value — it's dropped and folded back into the
+free-text search instead of being applied; the currently-active filter's title bar shows
+`(⚠ not recognized: ...)` when that happens, and a `default_query` with the same problem
+shows a status message under the loaded list.
+
+`config.toml` only reads one `default_query`, though — for switching between a handful of
+go-to queries throughout the day (e.g. "just what's urgent" vs. "what's in review right
+now") without editing `config.toml` and leaving/re-entering the view every time, set
+multiple named presets and press `p` to cycle through them:
+
+```toml
+[[filter_presets]]
+name = "Urgent"
+query = "priority:>=2 sort:-priority"
+
+[[filter_presets]]
+name = "In Review"
+query = "state:\"In Review\" sort:created"
+```
+
+Each preset's `query` uses the exact same DSL as `default_query` above, applied through
+the exact same mechanism (server-side filter terms, client-side `sort:`) — a preset is
+just a named, switchable alternative to it, not a different feature. Pressing `p` on a
+loaded view cycles: `default_query` (the plain view, no bracket shown) → `Urgent` → `In
+Review` → back to `default_query` → `Urgent` again, and so on — a full loop that always
+includes a stop back at the baseline. Whichever preset is active is shown in the list
+title next to the view name (`My Issues [Urgent]`), the same way an active `/`-filter's
+query text already is; the fetch itself refetches server-side on every switch, exactly
+like leaving and re-entering the view after editing `default_query` would. An unrecognized
+term in a preset's `query` behaves exactly like one in `default_query` — dropped, with a
+status message naming the preset. Presets are independent of the live `/`-filter, which
+still layers on top of whichever one (a preset, or plain `default_query`) is currently
+active — declare zero `[[filter_presets]]` entries (the default) and nothing about
+`default_query`'s own behavior changes; `p` simply does nothing.
+
+Every key above lives in the one `config.toml`, so a real one ends up with several set at
+once. A minimal setup — just enough to get going, letting everything else fall back to
+its default:
+
+```toml
+api_key = "lin_api_your_key_here"
+default_query = "priority:>=2 sort:-priority"
+```
+
+A more filled-in one — multiple repos overridden to their Linear projects, a specific
+team picked for "Team Issues", a custom editor and agent, a `default_query` that only
+shows what's actively being worked on, and two named presets to switch to with `p`:
+
+```toml
+api_key = "lin_api_your_key_here"
+team_id = "linear-team-id"
+editor = "vim"
+agent_command = "hr"
+default_query = "state:\"In Progress\" sort:-updated"
+
+[project_overrides]
+"herdr-linear" = "proj-abc123"
+"some-other-repo" = "proj-def456"
+
+[[filter_presets]]
+name = "Urgent"
+query = "priority:>=2 sort:-priority"
+
+[[filter_presets]]
+name = "In Review"
+query = "state:\"In Review\" sort:created"
+```
 
 ### Use
 
@@ -418,18 +555,27 @@ Reload the config, then press the bound key to open the plugin. The panel opens 
 menu with three options — "My Issues", "Project Issues", and "Team Issues" — all
 available. From the menu, use `↑`/`↓` to navigate options,
 `Enter` to open the highlighted view, and `q` or `Esc` to quit. Once inside a view,
-use `↑`/`↓` to navigate the issue list, `/` to filter it by title or identifier (type to
-narrow, `↑`/`↓` still navigate the narrowed list live, `<Enter>` confirms and keeps the
-filter applied, `Esc` cancels and restores the full list), `o` to open the selected issue
-in your browser, `<Space>` to mark/unmark the selected issue (shown with a `[x]`/`[ ]`
+use `↑`/`↓` to navigate the issue list, `j`/`k` to scroll the Detail pane once its
+description runs past the bottom of the panel, or the mouse wheel over either pane —
+whichever half of the terminal it's over, moving the highlight in the list or scrolling
+the text in Detail (mouse is additive to the keyboard, best-effort depending on your
+terminal and herdr's `mouse_capture` config), `/` to filter it — free text matches title/
+identifier, or use the same `priority:`/`state:`/`label:`/`sort:` query DSL described
+under "Configure" above (type to narrow, `↑`/`↓` still navigate the narrowed list live,
+`<Enter>` confirms and keeps the filter applied, `Esc` cancels and restores the full
+list), `o` to open the selected issue in your browser, `<Space>` to mark/unmark the
+selected issue (shown with a `[x]`/`[ ]`
 checkbox prefix — independent of the active filter, so a mark survives narrowing and
 clearing the filter), `<Enter>` to implement it — with no issues marked, implements just
 the selected one; with one or more marked, implements every marked issue in list order,
 one after another (each opens a herdr tab, starts the preferred coding agent, sets the
 issue to "In Progress", and injects an implement prompt once the agent is ready; the
 status banner then summarizes how many started, e.g. "3/4 started", plus a per-issue
-message for any that failed or finished with a warning) — `r` to retry after an error,
-and `Esc` to return to the menu (or, while filtering, to cancel the filter first). Press
+message for any that failed or finished with a warning) — `m` to compose a comment on
+the selected issue (type your comment, `<Enter>` sends it via the same client the
+library exposes, `Esc` cancels and discards the draft without sending; an empty draft
+is never sent), `r` to retry after an error, and `Esc` to return to the menu (or, while
+filtering, to cancel the filter first; while commenting, to cancel the comment first). Press
 `q` to quit the panel from anywhere (menu or view), and `c` to open `config.toml` from
 anywhere — menu, a loading or loaded view, or an error screen (see "Configure" above —
 creates the file if it doesn't exist yet). Press `?` from anywhere to open an in-app help

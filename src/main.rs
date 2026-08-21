@@ -23,6 +23,18 @@ fn dispatch_launch_decision(args: &[String], stdin_content: &str) -> Option<Stri
 /// before this function existed. Best-effort: any failure to open the file or install the
 /// subscriber is swallowed, since logging is a diagnostic aid, not something worth failing
 /// startup over.
+///
+/// Explicitly sets the max level to `DEBUG` (`tracing_subscriber::fmt()` with no filter
+/// defaults to `INFO`, unlike `examples/tracing_demo.rs`'s own `EnvFilter`-based setup, which
+/// this function doesn't share). Caught live: every `tracing::debug!` call this crate has ever
+/// shipped — `send_prompt_until_visible_with`'s attempt-failure logging, `flush_buffered_quit`'s
+/// discarded-key count, and `start_implementation`'s mid-flight redraw-failure log added
+/// alongside this fix — was silently dropped by the unfiltered default even with
+/// `HERDR_LINEAR_LOG_FILE` set and pointed at a real, writable file: the calls execute, the
+/// subscriber is installed, but `INFO`'s floor discards every one of them before they reach the
+/// writer. Opting into this diagnostic mode at all (setting the env var in the first place) is
+/// already the signal that debug-level detail is wanted, so there's no reason for that default
+/// to still apply once a destination has been configured.
 fn init_tracing() {
     let Ok(path) = std::env::var("HERDR_LINEAR_LOG_FILE") else {
         return;
@@ -37,6 +49,7 @@ fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::sync::Mutex::new(file))
         .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
         .try_init();
 }
 
@@ -66,6 +79,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn install_panic_hook() {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
+        // Mouse capture must come off before the other two — same ordering as the
+        // matching teardown in `run_tui` below, and for the same reason: crossterm/
+        // ratatui's own panic-safety doesn't know we ever enabled it, so a panic that
+        // skipped this would leave the host terminal stuck in mouse-reporting mode.
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
         let _ = crossterm::terminal::disable_raw_mode();
         let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
         original_hook(panic_info);
@@ -78,6 +96,12 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
+    // Mouse is additive to the keyboard-first design (mirrors `herdr-file-viewer`'s own
+    // rationale, which requests capture for the identical reason): herdr forwards mouse
+    // events to a pane that requests capture, while reserving Shift+mouse for the
+    // terminal's own selection/copy — see `plugin::app::handle_mouse` for what this
+    // plugin does with them. Best-effort so a terminal without mouse support still runs.
+    let _ = crossterm::execute!(stdout, crossterm::event::EnableMouseCapture);
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
 
@@ -87,7 +111,12 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
 
     // Always attempt full teardown, even if an earlier step in it failed, so a
     // panic-free error path never leaves the terminal in raw mode / alternate
-    // screen / hidden-cursor. The event loop's actual `Result` is still returned.
+    // screen / hidden-cursor / mouse-reporting mode. The event loop's actual `Result`
+    // is still returned.
+    let _ = crossterm::execute!(
+        terminal.backend_mut(),
+        crossterm::event::DisableMouseCapture
+    );
     let _ = crossterm::terminal::disable_raw_mode();
     let _ = crossterm::execute!(
         terminal.backend_mut(),
@@ -98,23 +127,199 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
     result
 }
 
+/// `config.toml`'s `default_query` (TF-617), parsed once per [`load_issues`] call:
+/// [`plugin::query::ParsedQuery::filters`] narrows the fetch below server-side (the same
+/// `IssueFilter` merge TF-616 wired up via `filter_terms`), while
+/// [`plugin::query::ParsedQuery::sort_keys`] orders the fetched issues before they're
+/// shown (see [`apply_fetched_issues`]). Unset (`Ok(None)`) collapses to
+/// `ParsedQuery::default()` — an empty query, i.e. no additional narrowing or ordering
+/// beyond a view's own base filter, same as before this feature existed.
+///
+/// A malformed `config.toml` (`Err`), or a `default_query` string containing
+/// recognized-but-unparseable terms (`ParsedQuery::rejected`), also falls back to
+/// `ParsedQuery::default()` for *this* fetch — review fix: an earlier version of this
+/// function swallowed both outright with no signal to the user at all. That's a real gap
+/// this function is specifically exposed to, not a hypothetical: `load_issues` is only
+/// ever called from `ensure_loaded`, which only re-resolves `client` — and so only
+/// re-validates `config.toml` — on the *first* call of a session (`client.is_none()`);
+/// every subsequent view entry or `r`-retry re-reads `config.toml` fresh right here,
+/// with no revalidation elsewhere. Editing `default_query` via the `c` keybinding and
+/// hitting `r` is the intended workflow for this feature, so a typo introduced there is
+/// an expected occurrence, not an edge case. Both failure modes are now surfaced via
+/// [`plugin::app::App::set_status`] rather than [`plugin::app::App::set_error`]: unlike
+/// `ensure_loaded`'s own config/client failure (which prevents any fetch at all, so
+/// replacing the view with an error is correct), a bad `default_query` doesn't stop the
+/// fetch — the view still loads, just without the filter/sort it couldn't apply — so a
+/// `Status` banner shown under the loaded list (see `ui.rs`) fits better, the same way
+/// the `Action::Implement` flow already reports non-fatal outcomes without discarding
+/// whatever's currently on screen. Deliberately never calls `clear_status()` on the
+/// success path: every caller of `load_issues` (`Action::Retry`/`Action::EnterView` in
+/// the event loop) already clears status before triggering a fetch, so a stale banner
+/// from a previous failed load never lingers past the next retry/view-entry.
+///
+/// Takes `config_dir` as a parameter instead of reading `$HERDR_PLUGIN_CONFIG_DIR`
+/// directly — the same pure-core/real-env-wrapper split
+/// `plugin::config::resolve_default_query`/`load_default_query` already use, and for the
+/// same reason `plugin::app::open_config_action` is split from its real-environment
+/// caller: it lets tests exercise this function's actual filters/sort/status-banner
+/// decisions against a real (tempdir) `config.toml` without mutating process-global
+/// environment state that every other test in this binary runs concurrently against.
+/// [`resolved_query`] is the real-env wrapper (TF-647's entry point, folding in the
+/// active-preset check ahead of this `default_query`-only fallback).
+fn resolved_default_query_for(
+    app: &mut plugin::app::App,
+    config_dir: Option<&std::path::Path>,
+) -> plugin::query::ParsedQuery {
+    match plugin::config::resolve_default_query(config_dir) {
+        Ok(Some(query)) => {
+            let parsed = plugin::query::parse_query(&query);
+            if !parsed.rejected.is_empty() {
+                app.set_status(plugin::app::Status::Error(format!(
+                    "default_query in config.toml: {} term(s) not recognized, ignored: {}",
+                    parsed.rejected.len(),
+                    parsed.rejected.join(", ")
+                )));
+            }
+            parsed
+        }
+        Ok(None) => plugin::query::ParsedQuery::default(),
+        Err(err) => {
+            app.set_status(plugin::app::Status::Error(format!(
+                "default_query in config.toml could not be applied: {err}"
+            )));
+            plugin::query::ParsedQuery::default()
+        }
+    }
+}
+
+/// Resolves the query to fetch issues with — the real-environment wrapper around
+/// [`resolved_query_for`], reading `$HERDR_PLUGIN_CONFIG_DIR` the same way
+/// [`resolved_default_query_for`]'s own (removed by TF-647, folded in here) real-env
+/// wrapper used to.
+fn resolved_query(app: &mut plugin::app::App) -> plugin::query::ParsedQuery {
+    let config_dir = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR").map(std::path::PathBuf::from);
+    resolved_query_for(app, config_dir.as_deref())
+}
+
+/// Formats the "filter presets could not be resolved at all" status message (TF-647
+/// review fix): shared by [`resolved_query_for`]'s `Err` arm and `event_loop`'s
+/// `Action::CyclePreset` handling — the same underlying failure
+/// ([`plugin::config::resolve_filter_presets`] erroring, e.g. malformed TOML) can surface
+/// from either call site depending on whether it's hit while cycling or while fetching,
+/// so both should say the same thing rather than risk drifting apart.
+fn filter_presets_error_message(err: herdr_linear::Error) -> String {
+    format!("filter presets in config.toml could not be applied: {err}")
+}
+
+/// The pure core of [`resolved_query`] (TF-647): the active named filter preset
+/// (`app.active_preset()`) if one is set, otherwise the plain `default_query` —
+/// delegating to the unchanged [`resolved_default_query_for`] for that fallback, so
+/// TF-647's "no preset active → unchanged behavior" acceptance criterion holds by
+/// construction rather than by parallel-but-separate logic.
+///
+/// Always re-reads `config.toml` fresh (never trusts a query string cached at cycle
+/// time), so edits made via `c` are picked up on the very next fetch — exactly like
+/// `default_query` already does. A malformed `config.toml`, a preset whose query has
+/// unrecognized terms, or a preset removed from the config since it was activated all
+/// degrade to a status banner (mirroring [`resolved_default_query_for`]'s own error
+/// handling) rather than ever crashing or fetching with an undefined query.
+fn resolved_query_for(
+    app: &mut plugin::app::App,
+    config_dir: Option<&std::path::Path>,
+) -> plugin::query::ParsedQuery {
+    let Some(active) = app.active_preset().cloned() else {
+        return resolved_default_query_for(app, config_dir);
+    };
+
+    match plugin::config::resolve_filter_presets(config_dir) {
+        Ok(resolved) => match resolved.presets.get(active.index) {
+            Some(preset) => {
+                // TF-647 review fix: `config.toml` can be reordered/renamed (not just
+                // shrunk) between activation and this fetch, e.g. via `c` mid-session —
+                // `index` alone can no longer prove this is still the same preset the
+                // user activated. Re-derive the display name from this fresh read so the
+                // list title (`ui.rs`) never shows a name that doesn't match the query
+                // actually being applied; a mismatch here is not itself an error (the
+                // preset at this position is still a real, user-configured preset), just
+                // stale display state to correct.
+                if preset.name != active.name {
+                    app.set_active_preset(Some(plugin::app::ActivePreset {
+                        index: active.index,
+                        name: preset.name.clone(),
+                    }));
+                }
+                let parsed = plugin::query::parse_query(&preset.query);
+                if !parsed.rejected.is_empty() {
+                    app.set_status(plugin::app::Status::Error(format!(
+                        "preset \"{}\" in config.toml: {} term(s) not recognized, ignored: {}",
+                        preset.name,
+                        parsed.rejected.len(),
+                        parsed.rejected.join(", ")
+                    )));
+                }
+                parsed
+            }
+            None => {
+                // The preset list shrank since this preset was activated (config.toml
+                // edited mid-session, e.g. via `c`) — fall back to `default_query` rather
+                // than fetching with an undefined query, same "adapt, don't crash" spirit
+                // every other config resolver here follows. Status is set *before*
+                // delegating: if `default_query` itself also has a problem,
+                // `resolved_default_query_for`'s own `set_status` call runs after this one
+                // and wins (status is last-write, not appended) — an intentional, rare
+                // double-fault tradeoff rather than an oversight.
+                app.set_status(plugin::app::Status::Error(format!(
+                    "preset \"{}\" no longer exists in config.toml (list changed since it \
+                     was activated) — reverted to default_query",
+                    active.name
+                )));
+                app.set_active_preset(None);
+                resolved_default_query_for(app, config_dir)
+            }
+        },
+        Err(err) => {
+            app.set_status(plugin::app::Status::Error(filter_presets_error_message(
+                err,
+            )));
+            plugin::query::ParsedQuery::default()
+        }
+    }
+}
+
+/// Sorts `issues` by `sort_keys` (a no-op for an empty slice) and hands them to
+/// [`plugin::app::App::set_issues`] — the shared tail of every `load_issues` fetch arm,
+/// so the resolved query's `sort:` terms — `default_query`'s (TF-617), or an active named
+/// preset's (TF-647) — apply identically regardless of which view was entered or which of
+/// the two supplied them.
+fn apply_fetched_issues(
+    app: &mut plugin::app::App,
+    mut issues: Vec<herdr_linear::Issue>,
+    sort_keys: &[plugin::query::SortKey],
+) {
+    plugin::query::sort_issues(&mut issues, sort_keys);
+    app.set_issues(issues);
+}
+
 async fn load_issues(app: &mut plugin::app::App, client: &herdr_linear::LinearClient) {
+    let query = resolved_query(app);
+    let filter_terms = &query.filters;
+
     match app.current_view() {
         Some(plugin::app::ViewKind::MyIssues) => {
-            match plugin::data::fetch_my_issues(client).await {
-                Ok(issues) => app.set_issues(issues),
+            match plugin::data::fetch_my_issues(client, filter_terms).await {
+                Ok(issues) => apply_fetched_issues(app, issues, &query.sort_keys),
                 Err(err) => app.set_error(err.to_string()),
             }
         }
         Some(plugin::app::ViewKind::ProjectIssues) => {
-            match plugin::data::fetch_current_project_issues(client).await {
-                Ok(issues) => app.set_issues(issues),
+            match plugin::data::fetch_current_project_issues(client, filter_terms).await {
+                Ok(issues) => apply_fetched_issues(app, issues, &query.sort_keys),
                 Err(err) => app.set_error(err.to_string()),
             }
         }
         Some(plugin::app::ViewKind::TeamIssues) => {
-            match plugin::data::fetch_current_team_issues(client).await {
-                Ok(issues) => app.set_issues(issues),
+            match plugin::data::fetch_current_team_issues(client, filter_terms).await {
+                Ok(issues) => apply_fetched_issues(app, issues, &query.sort_keys),
                 Err(err) => app.set_error(err.to_string()),
             }
         }
@@ -192,6 +397,34 @@ const PROMPT_SEND_STABILITY_DURATION: std::time::Duration = std::time::Duration:
 /// stability window within one attempt, without the timeout itself becoming the limiting factor
 /// for a target that's merely slow rather than actually stuck.
 const PROMPT_SEND_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// TF-669: overall wall-clock budget for [`plugin::herdr_cli::agent_wait_for_start`] — how long
+/// `implement_one` waits for herdr to recognize a real, stable coding agent in the pane at all,
+/// *before* even asking `agent_wait` about "idle" status. Live-reproduced against this repo's own
+/// `hr` alias (`headroom wrap claude --memory --code-graph`): its memory-sync/proxy-check/rtk-setup
+/// preamble ran for ~6-7s of plain shell output before `claude` was exec'd (see TF-650's own
+/// diagnosis, and this ticket's live pane inspection). 20s gives roughly 3x that observed
+/// real-world worst case as margin for a slower machine or a colder cache, while still failing in
+/// bounded time — separate from `agent_wait`'s own 30s "idle" budget below, so a pane that
+/// genuinely never starts an agent at all fails close to this bound rather than compounding both.
+const AGENT_START_WAIT_TIMEOUT_MS: u64 = 20_000;
+
+/// Compile-time enforcement of the same two [`PromptSendPolicy`] invariants
+/// [`send_prompt_until_visible_with`]'s `debug_assert!`s check at the one real call site — but
+/// unconditionally, in every profile including `--release` (`debug_assert!` compiles out
+/// entirely there; this crate's `[profile.release]` doesn't override `debug-assertions`, and
+/// `cargo build --release`/`plugin-reinstall` — see `justfile` — is the only build the actual
+/// shipped plugin binary ever comes from, so a debug-only check alone would never protect it).
+/// This only covers these four production constants, not the two test-constructed
+/// `PromptSendPolicy` values in `send_prompt_until_visible_with`'s own tests — those stay
+/// hand-verified, same as before.
+const _: () = assert!(
+    PROMPT_SEND_ATTEMPTS >= 1
+        && PROMPT_SEND_ATTEMPT_TIMEOUT.as_nanos() > PROMPT_SEND_STABILITY_DURATION.as_nanos(),
+    "PROMPT_SEND_ATTEMPTS must be >= 1 and PROMPT_SEND_ATTEMPT_TIMEOUT must exceed \
+     PROMPT_SEND_STABILITY_DURATION, or every implement attempt would silently degrade into \
+     always timing out without ever reaching PromptPollStep::Stable"
+);
 
 /// Starter content written to `config.toml` by the `c` keybinding when the file doesn't
 /// exist yet, so pressing `c` never fails with "file not found" and always opens something
@@ -328,6 +561,30 @@ async fn wait_for_prompt_stable(
     }
 }
 
+/// Tuning knobs for [`send_prompt_until_visible_with`]'s resend/confirm loop, bundled into one
+/// struct rather than four positional parameters — split out when adding the `on_attempt`
+/// progress hook (see [`send_prompt_until_visible`]'s doc) pushed the parameter count past
+/// clippy's `too_many_arguments` threshold. Fields mirror the `PROMPT_SEND_*` constants exactly;
+/// [`send_prompt_until_visible`] is the only real (non-test) caller and always passes those.
+///
+/// `attempts` must be at least 1 and `attempt_timeout` must exceed `stability_duration`, or
+/// [`send_prompt_until_visible_with`]'s retry loop can never reach [`PromptPollStep::Stable`] —
+/// this struct itself has no constructor to enforce that (see its own fields being plain and
+/// public-within-module below), so two things check it instead, at different strengths: a
+/// `const _: () = assert!(...)` right after the `PROMPT_SEND_*` constants covers the one real
+/// (non-test) construction unconditionally, in every build profile including `--release`; a
+/// pair of `debug_assert!`s at the top of `send_prompt_until_visible_with` additionally cover
+/// every construction, including the two test ones, but only in debug/test builds — the
+/// `--release` binary `justfile`'s `build`/`plugin-reinstall` actually produce gets no
+/// protection from those.
+#[derive(Debug, Clone, Copy)]
+struct PromptSendPolicy {
+    attempts: u32,
+    poll_interval: std::time::Duration,
+    stability_duration: std::time::Duration,
+    attempt_timeout: std::time::Duration,
+}
+
 /// Sends `prompt` to `pane_id` and confirms it actually landed — and *stayed* landed — before
 /// returning success.
 ///
@@ -345,45 +602,89 @@ async fn wait_for_prompt_stable(
 ///
 /// Thin wrapper around [`send_prompt_until_visible_with`] that supplies the real
 /// [`PROMPT_SEND_ATTEMPTS`]/[`PROMPT_SEND_POLL_INTERVAL`]/[`PROMPT_SEND_STABILITY_DURATION`]/
-/// [`PROMPT_SEND_ATTEMPT_TIMEOUT`] constants — split out purely so tests can drive the retry loop
-/// itself (resend-after-timeout, exhaustion-after-N-attempts) with millisecond-scale values
-/// instead of the real multi-second ones, the same reason [`wait_for_prompt_stable`] takes its
-/// durations as parameters rather than reading the constants directly.
+/// [`PROMPT_SEND_ATTEMPT_TIMEOUT`] constants (via [`PromptSendPolicy`]) — split out purely so
+/// tests can drive the retry loop itself (resend-after-timeout, exhaustion-after-N-attempts)
+/// with millisecond-scale values instead of the real multi-second ones, the same reason
+/// [`wait_for_prompt_stable`] takes its durations as parameters rather than reading the
+/// constants directly.
+///
+/// `on_attempt` is forwarded to [`send_prompt_until_visible_with`] verbatim — see its doc for
+/// when it's called and why.
 async fn send_prompt_until_visible(
     herdr_bin: &str,
     pane_id: &plugin::herdr_cli::PaneId,
     prompt: &str,
+    on_attempt: impl FnMut(u32, u32) + Send,
 ) -> std::result::Result<(), String> {
     send_prompt_until_visible_with(
         herdr_bin,
         pane_id,
         prompt,
-        PROMPT_SEND_ATTEMPTS,
-        PROMPT_SEND_POLL_INTERVAL,
-        PROMPT_SEND_STABILITY_DURATION,
-        PROMPT_SEND_ATTEMPT_TIMEOUT,
+        PromptSendPolicy {
+            attempts: PROMPT_SEND_ATTEMPTS,
+            poll_interval: PROMPT_SEND_POLL_INTERVAL,
+            stability_duration: PROMPT_SEND_STABILITY_DURATION,
+            attempt_timeout: PROMPT_SEND_ATTEMPT_TIMEOUT,
+        },
+        on_attempt,
     )
     .await
 }
 
-/// See [`send_prompt_until_visible`]. This resends up to `attempts` times, delegating each
-/// attempt's confirmation to [`wait_for_prompt_stable`]; a `TimedOut`/error result falls through
-/// to the next (re)send rather than trusting an early sighting. Every attempt's failure is logged
-/// via `tracing::debug!` before moving on (see `main.rs::init_tracing`, and `agent_wait`'s
-/// missing-`result` retry loop in `herdr_cli.rs` for the established convention this follows)
-/// — only the *last* attempt's error is returned to the caller, so a log-enabled session is the
-/// only way to see what the earlier, discarded attempts actually failed with.
+/// See [`send_prompt_until_visible`]. This resends up to `policy.attempts` times, delegating
+/// each attempt's confirmation to [`wait_for_prompt_stable`]; a `TimedOut`/error result falls
+/// through to the next (re)send rather than trusting an early sighting. Every attempt's failure
+/// is logged via `tracing::debug!` before moving on (see `main.rs::init_tracing`, and
+/// `agent_wait`'s missing-`result` retry loop in `herdr_cli.rs` for the established convention
+/// this follows) — only the *last* attempt's error is returned to the caller, so a log-enabled
+/// session is the only way to see what the earlier, discarded attempts actually failed with.
+///
+/// `on_attempt(attempt, attempts)` fires once per (re)send, immediately before that attempt's
+/// `agent_prompt` call — including the first. Diagnosed live: against a freshly-launched
+/// `headroom wrap claude ...`-style multi-process `agent_command`, `agent_wait`'s "idle" status
+/// (checked by the caller before any of this runs) resolves in single-digit milliseconds, long
+/// before the target's own input loop has attached — so attempt 1 is a *near-certain* miss, not
+/// an occasional one, and the caller is blocked for a full `attempt_timeout` before attempt 2
+/// (typically the one that lands) even starts. `Action::Implement`'s caller uses this hook to
+/// redraw a "still starting…" status once that happens, so the mandatory wait has some visible
+/// sign of life instead of looking indistinguishable from a hang for its whole duration — see
+/// `start_implementation`'s doc. Every caller that doesn't need this (tests, the concurrent
+/// multi-issue path in `implement_many`, which has no single terminal it can safely redraw from
+/// mid-flight) passes a no-op closure.
 async fn send_prompt_until_visible_with(
     herdr_bin: &str,
     pane_id: &plugin::herdr_cli::PaneId,
     prompt: &str,
-    attempts: u32,
-    poll_interval: std::time::Duration,
-    stability_duration: std::time::Duration,
-    attempt_timeout: std::time::Duration,
+    policy: PromptSendPolicy,
+    mut on_attempt: impl FnMut(u32, u32) + Send,
 ) -> std::result::Result<(), String> {
+    let PromptSendPolicy {
+        attempts,
+        poll_interval,
+        stability_duration,
+        attempt_timeout,
+    } = policy;
+    // `PromptSendPolicy` is a plain data bag with no constructor to enforce this at
+    // construction time (see its own doc) — catch a nonsensical policy here instead, in debug
+    // builds only (the top-level `const _: () = assert!(...)` right after the `PROMPT_SEND_*`
+    // constants is what actually protects the `--release` binary). `attempts == 0` doesn't
+    // "silently degrade into always timing out" the way a too-short `attempt_timeout` does — the
+    // `for attempt in 1..=attempts` loop below just never runs, and this returns its generic
+    // "failed to send implement command" fallback immediately — but it's just as nonsensical a
+    // policy and just as worth catching here rather than downstream as a confusing one-line
+    // failure with no indication why every attempt was skipped.
+    debug_assert!(
+        attempts >= 1,
+        "PromptSendPolicy::attempts must be at least 1"
+    );
+    debug_assert!(
+        attempt_timeout > stability_duration,
+        "PromptSendPolicy::attempt_timeout must exceed stability_duration, or a landed prompt \
+         can never hold stable long enough to be confirmed within one attempt"
+    );
     let mut last_err = None;
     for attempt in 1..=attempts {
+        on_attempt(attempt, attempts);
         if let Err(err) = plugin::herdr_cli::agent_prompt(herdr_bin, pane_id, prompt).await {
             tracing::debug!(
                 "send_prompt_until_visible: attempt {attempt} failed to send ({err}), retrying"
@@ -472,6 +773,21 @@ async fn resolve_validated_agent_command(
     })
 }
 
+/// TF-669: the progress events [`implement_one`] can report mid-flight, via its `on_progress`
+/// parameter, for a caller that wants to redraw a terminal during either of its two waits.
+/// Deliberately one enum rather than two separate callbacks — see `implement_one`'s own doc for
+/// why two live `FnMut` closures over the same `&mut app`/`&mut terminal` captures can't coexist.
+#[derive(Debug, Clone, Copy)]
+enum ImplementProgress {
+    /// A single `herdr agent get` poll completed inside
+    /// [`plugin::herdr_cli::agent_wait_for_start`] without yet confirming a stable agent
+    /// identity; carries the 1-indexed poll count.
+    AgentStartPoll(u32),
+    /// A single prompt-send attempt completed inside [`send_prompt_until_visible`]; carries the
+    /// same `(attempt, attempts)` pair that function's own doc describes.
+    PromptAttempt { attempt: u32, attempts: u32 },
+}
+
 /// Runs the full "implement this issue" flow for one issue: create a fresh tab labeled after the
 /// issue and start `command` running inside it under a name unique to this issue (TF-590, see
 /// [`plugin::implement::build_agent_name`]), set the issue to its team's "In Progress" state,
@@ -501,11 +817,29 @@ async fn resolve_validated_agent_command(
 /// doc), so this function separately guards against the one case that matters here: both its
 /// launch-context parse *and* its `current_dir()` fallback failing, which would otherwise pass
 /// an empty `--cwd` straight through to `tab_create`.
+///
+/// `on_progress` (TF-669) fires once per [`ImplementProgress`] event from either of
+/// `implement_one`'s two waits that can each run long enough to matter for a caller with a UI to
+/// redraw: [`plugin::herdr_cli::agent_wait_for_start`]'s per-poll signal and
+/// [`send_prompt_until_visible`]'s per-attempt signal — see each function's own doc for exactly
+/// when its half fires. A single callback rather than one per wait because `start_implementation`
+/// needs `&mut app`/`&mut terminal` in both, and two live `FnMut` closures can't share the same
+/// mutable captures; folding both signals into one enum sidesteps that without needing two
+/// separate mutable borrows of the same terminal state. `start_implementation` (single-issue)
+/// passes a closure that redraws the terminal for both variants; `implement_many` (concurrent
+/// multi-issue, TF-622) passes a no-op, since several of its futures can be mid-flight at once
+/// and none of them owns the one shared terminal safely.
+///
+/// `notify` is forwarded to [`spawn_tab_close_when_agent_has_exited`] (TF-653) — the channel
+/// `event_loop` drains each tick to surface a `Status::Ok` once that background watcher actually
+/// closes this issue's tab, so "the tab is gone" never has to be read as "something broke".
 async fn implement_one(
     herdr_bin: &str,
     client: &herdr_linear::LinearClient,
     issue: &herdr_linear::Issue,
     command: &plugin::implement::ValidatedAgentCommand,
+    notify: &StatusNotifier,
+    mut on_progress: impl FnMut(ImplementProgress) + Send,
 ) -> ImplementOutcome {
     let cwd = plugin::host::resolve_cwd();
     if cwd.as_os_str().is_empty() {
@@ -562,8 +896,45 @@ async fn implement_one(
 
     // From here on, every early return must still report `warnings` — a failure below doesn't
     // undo (or excuse hiding) a warning collected above it.
-    if let Err(err) =
-        plugin::herdr_cli::agent_wait(herdr_bin, &created_tab.root_pane_id, "idle", 30_000).await
+
+    // TF-669: confirm herdr has recognized a real, *stable* coding agent in this pane before
+    // trusting `agent_wait`'s "idle" status below at all — see `agent_wait_for_start`'s doc for
+    // why that status alone can't be trusted for a multi-stage `agent_command` wrapper (e.g. an
+    // alias like `hr` that runs its own memory-sync/proxy-check/rtk-setup preamble for several
+    // seconds before actually exec'ing the real agent). Without this, the implement prompt can
+    // get typed into that wrapper's own plain bootstrap output instead of the agent's input box —
+    // confirmed live against a real stuck pane during this investigation.
+    if let Err(err) = plugin::herdr_cli::agent_wait_for_start(
+        herdr_bin,
+        &created_tab.root_pane_id,
+        AGENT_START_WAIT_TIMEOUT_MS,
+        plugin::herdr_cli::AGENT_NOT_FOUND_POLL_INTERVAL,
+        // A read-only poll, same as `agent_wait_for_exit`'s — killing an abandoned one mid-flight
+        // has no server-side consequence, and leaving it running would orphan the child process
+        // (see `OnAbandon`'s doc).
+        plugin::herdr_cli::OnAbandon::KillChild,
+        |poll| on_progress(ImplementProgress::AgentStartPoll(poll)),
+    )
+    .await
+    {
+        // Deliberately hedged, not "the agent never started" — `err` may equally be herdr
+        // becoming unresponsive (the poll error tolerance exhausted) as a pane that genuinely
+        // never got an agent running in it; `err` itself (see `agent_wait_for_start`'s doc)
+        // carries the specifics.
+        return ImplementOutcome::Failed(status_with_warnings(
+            format!("herdr never confirmed the agent started ({err}) — run manually: {prompt}"),
+            &warnings,
+        ));
+    }
+
+    if let Err(err) = plugin::herdr_cli::agent_wait(
+        herdr_bin,
+        &created_tab.root_pane_id,
+        "idle",
+        30_000,
+        plugin::herdr_cli::OnAbandon::LeaveRunning,
+    )
+    .await
     {
         return ImplementOutcome::Failed(status_with_warnings(
             format!("agent didn't become ready ({err}) — run manually: {prompt}"),
@@ -582,13 +953,26 @@ async fn implement_one(
         ));
     }
 
-    if let Err(err) = send_prompt_until_visible(herdr_bin, &created_tab.root_pane_id, &prompt).await
+    if let Err(err) = send_prompt_until_visible(
+        herdr_bin,
+        &created_tab.root_pane_id,
+        &prompt,
+        |attempt, attempts| on_progress(ImplementProgress::PromptAttempt { attempt, attempts }),
+    )
+    .await
     {
         return ImplementOutcome::Failed(status_with_warnings(
             format!("{err} — run manually: {prompt}"),
             &warnings,
         ));
     }
+
+    spawn_tab_close_when_agent_has_exited(
+        herdr_bin.to_string(),
+        issue.identifier.clone(),
+        created_tab,
+        notify.clone(),
+    );
 
     if warnings.is_empty() {
         ImplementOutcome::Started("tab opened, agent started, set to In Progress.".to_string())
@@ -597,163 +981,309 @@ async fn implement_one(
     }
 }
 
-/// Failure modes for [`open_config_in_herdr_pane`]. The two variants matter to
-/// [`open_config_editor`]: an `Unavailable` failure means nothing was created and the OS-opener
-/// fallback is safe; an `Ambiguous` failure means a tab may already exist with the editor
-/// running in it, so falling back would risk opening `config.toml` a second time — see
-/// `pane_run`'s handling above and [`implement_one`]'s identical `run_with_timeout` caveat
-/// for why a herdr-call `Err` doesn't mean the call didn't actually take effect.
-#[derive(Debug, PartialEq, Eq)]
-enum HerdrPaneError {
-    /// No tab was created — either an existing tab was found but `tab_focus` failed, or no
-    /// existing tab was found and `tab_create` failed; either way the caller's OS-opener
-    /// fallback is safe.
-    Unavailable(String),
-    /// A tab was created but `pane_run`'s outcome is unknown (the editor may have started
-    /// despite the error). The caller must not fall back to the OS opener here.
-    Ambiguous(String),
+/// Wall-clock ceiling for [`close_tab_once_agent_has_exited`]'s exit-poll — deliberately generous
+/// compared to [`implement_one`]'s own `agent_wait(..., "idle", ...)` 30s wait for the agent
+/// process to *start*: this one instead covers however long the whole issue takes in that pane —
+/// implementation, opening a PR, getting it reviewed, and fixing findings are all manual steps
+/// that happen there before anyone types `/exit`, and for a real issue that can run for hours.
+/// TF-649 requires fail-open on timeout (see [`close_tab_once_agent_has_exited`]), so erring
+/// generous here only costs a leftover tab in the rare case that takes unusually long — never a
+/// prematurely closed one out from under a still-open session.
+const AGENT_EXIT_WAIT_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000; // 24h
+
+/// Poll interval for [`close_tab_once_agent_has_exited`]'s exit-poll while the agent is still
+/// present. Coarse on purpose: unlike a "just launched, not yet detected" wait (seconds at most),
+/// this one can run for [`AGENT_EXIT_WAIT_TIMEOUT_MS`]'s full 24h, so a tight interval would mean
+/// tens of thousands of `herdr agent get` calls per watched issue for no benefit — nothing is
+/// listening for the close to happen any sooner than the next tick of a plugin the user isn't
+/// currently looking at.
+const AGENT_EXIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// TF-653: the channel `event_loop` drains (via [`drain_notifications`]) each tick to surface a
+/// `Status` once a background watcher — currently only
+/// [`close_tab_once_agent_has_exited`]/[`spawn_tab_close_when_agent_has_exited`] — has something
+/// to report. Named for readability at the six call sites that thread it through the
+/// implement-flow call chain; not a semantic wrapper, just
+/// `tokio::sync::mpsc::UnboundedSender<plugin::app::Status>`.
+type StatusNotifier = tokio::sync::mpsc::UnboundedSender<plugin::app::Status>;
+
+/// Status banner shown once [`close_tab_once_agent_has_exited`] (TF-649) actually closes a tab —
+/// the only user-visible sign that "the tab is gone" means "the agent finished", not "lost" or
+/// "crashed" (TF-653: two tabs vanished mid-session with no such signal, which led to re-running
+/// an already-finished implementation). Split out as a pure function, mirroring
+/// [`prompt_attempt_status`] below, purely so the wording is unit-testable without a channel or
+/// background task in the loop.
+fn tab_auto_closed_status(identifier: &str) -> plugin::app::Status {
+    plugin::app::Status::Ok(format!("{identifier}: agent finished, tab closed."))
 }
 
-impl std::fmt::Display for HerdrPaneError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            HerdrPaneError::Unavailable(message) | HerdrPaneError::Ambiguous(message) => {
-                write!(f, "{message}")
-            }
-        }
-    }
-}
-
-/// True if the herdr tab `tab_id` (an existing config-editor tab) currently has a non-shell
-/// foreground process running in its root pane. Used by [`open_config_in_herdr_pane`] to avoid
-/// reusing a dead editor tab. Falls back to `false` on any I/O or parsing error — a tab whose
-/// liveness can't be verified is treated as dead, and a fresh tab is created instead.
-async fn editor_tab_is_alive(herdr_bin: &str, tab_id: &plugin::herdr_cli::TabId) -> bool {
-    let panes_json = match plugin::herdr_cli::pane_list(herdr_bin).await {
-        Ok(json) => json,
-        Err(err) => {
-            tracing::debug!(
-                "couldn't list panes to check liveness of existing '{}' tab ({err}) — assuming \
-                 dead",
-                plugin::editor::EDITOR_AGENT_NAME
-            );
-            return false;
-        }
-    };
-
-    let pane_id = match plugin::herdr_cli::find_root_pane_for_tab(&panes_json, tab_id) {
-        Some(pane_id) => pane_id,
-        None => {
-            tracing::debug!(
-                "couldn't find root pane for existing '{}' tab — assuming dead",
-                plugin::editor::EDITOR_AGENT_NAME
-            );
-            return false;
-        }
-    };
-
-    match plugin::herdr_cli::pane_process_info(herdr_bin, &pane_id).await {
-        Ok(info) => plugin::herdr_cli::is_pane_alive(&info),
-        Err(err) => {
-            tracing::debug!(
-                "couldn't read process info for existing '{}' tab ({err}) — assuming dead",
-                plugin::editor::EDITOR_AGENT_NAME
-            );
-            false
-        }
-    }
-}
-
-/// Runs `editor_cmd` on `config_path` inside a herdr pane, for the `c` keybinding: reuses an
-/// already-open editor tab from a previous `c` press if a `herdr tab list` label lookup
-/// ([`plugin::herdr_cli::find_existing_editor_tab`]) finds one *and* [`editor_tab_is_alive`]
-/// confirms the editor process is still running, switching to it via
-/// [`plugin::herdr_cli::tab_focus`]; otherwise opens a fresh tab and types the editor command
-/// into its root pane via [`plugin::herdr_cli::tab_create`] + [`plugin::herdr_cli::pane_run`].
-/// The tab label is always [`plugin::editor::EDITOR_AGENT_NAME`] — deliberately global, not
-/// derived from repo or issue; see that constant's own doc for why a single shared tab across
-/// every herdr-linear instance is correct here, unlike `implement_one`'s per-issue names.
+/// TF-668: once [`implement_one`]'s prompt has landed, waits for that issue's agent pane to
+/// genuinely go away — the agent process exits (typically the user typing `/exit` once they're
+/// truly done with the issue), is released, or is replaced — then closes its tab. Always called
+/// through [`spawn_tab_close_when_agent_has_exited`], the fire-and-forget wrapper that keeps this
+/// off `implement_one`'s critical path; split out on its own so it can be driven directly (awaited
+/// to completion) in tests instead of racing a background task's scheduling.
 ///
-/// `nvim` can never become a herdr-recognized "agent" — it isn't in herdr's fixed `--kind` enum,
-/// and herdr only auto-detects/tracks recognized coding-agent binaries (verified live against
-/// herdr 0.8.0, TF-624) — so the old `agent focus`/`agent start` reuse-and-launch model is
-/// unusable for it; a tab-label lookup plus a plain `pane run` is the only mechanism that still
-/// works for an arbitrary editor command. The editor therefore runs directly in the tab's own
-/// root pane — exactly like `implement_one`'s agent does — so, unlike the pre-TF-624
-/// implementation, there is no separate agent pane split in alongside it and no redundant root
-/// pane to close afterward.
+/// TF-649 originally closed the tab once herdr's `agent_status` reported `"done"` instead. That
+/// turned out to be the wrong signal (TF-668): per herdr's own skill doc, `"done"` is just "the
+/// same underlying idle state [as `idle`] after unseen background work finishes" — a tab-focus
+/// heuristic, not a completion signal. It fired the moment the initial implement prompt finished,
+/// long before the issue's actual manual steps (opening a PR, getting it reviewed, fixing
+/// findings) had even started, closing the tab those steps needed. Waiting for the agent to
+/// really exit via [`plugin::herdr_cli::agent_wait_for_exit`] ties the close to something real
+/// instead.
 ///
-/// `pane_run`'s `Err` is treated as [`HerdrPaneError::Ambiguous`], not a plain failure: per
-/// `implement_one`'s doc on the same `herdr_cli` call pattern, a timed-out `run_with_timeout` (no
-/// `kill_on_drop` on the underlying subprocess) doesn't mean the editor never started — it may
-/// well be up in the tab that was just created. Reporting this as `Unavailable` would make
-/// [`open_config_editor`] fall back to the OS opener, opening `config.toml` a second time
-/// whenever the herdr call actually succeeded despite the client-side timeout. See
-/// docs/superpowers/specs/2026-08-11-editor-handling-design.md.
-async fn open_config_in_herdr_pane(
+/// Fails open on both steps, matching TF-649's original acceptance criteria: a real timeout,
+/// herdr losing track of the pane some other way, or the agent simply never exiting all leave the
+/// tab exactly as it is, on the theory that a possibly still-useful (or failed) agent's output
+/// must never silently vanish. A `tab_close` failure afterwards (already closed, herdr restarted
+/// mid-wait, ...) is swallowed too — there is nothing left for this task to usefully do at that
+/// point. Neither fail-open branch sends anything through `notify` (TF-653): a notice on either
+/// would falsely claim "finished" for a tab that's either still open because the agent hasn't
+/// exited yet, or still open because closing it failed.
+///
+/// Polls with [`plugin::herdr_cli::OnAbandon::KillChild`], not the
+/// [`plugin::herdr_cli::OnAbandon::LeaveRunning`] every `agent_wait` call and most other
+/// `herdr` calls in this codebase use (TF-669's `agent_wait_for_start`, below, is the one other
+/// exception, for the same reason): since nothing else keeps this call's budget alive once its
+/// enclosing task is dropped (the plugin quit mid-wait, per this same ticket's acceptance
+/// criteria), leaving an in-flight `herdr agent get` child running would let it survive the
+/// plugin process itself, if only briefly — see [`plugin::herdr_cli::OnAbandon`]'s doc for the
+/// underlying mechanism.
+///
+/// `identifier` and `notify` are TF-653 additions: once `tab_close` actually succeeds, this
+/// sends [`tab_auto_closed_status`] through `notify` so `event_loop` can surface it. A `send` on
+/// an already-dropped receiver (the plugin quit) is silently ignored — consistent with this
+/// function's fail-open stance throughout.
+async fn close_tab_once_agent_has_exited(
     herdr_bin: &str,
+    identifier: &str,
+    tab: &plugin::herdr_cli::TabCreated,
+    timeout_ms: u64,
+    poll_interval: std::time::Duration,
+    notify: &StatusNotifier,
+) {
+    if let Err(err) = plugin::herdr_cli::agent_wait_for_exit(
+        herdr_bin,
+        &tab.root_pane_id,
+        timeout_ms,
+        poll_interval,
+        plugin::herdr_cli::OnAbandon::KillChild,
+    )
+    .await
+    {
+        tracing::debug!(
+            "close_tab_once_agent_has_exited: agent in {:?} never exited ({err}), leaving its \
+             tab open",
+            tab.root_pane_id
+        );
+        return;
+    }
+
+    if let Err(err) = plugin::herdr_cli::tab_close(herdr_bin, &tab.tab_id).await {
+        tracing::debug!(
+            "close_tab_once_agent_has_exited: agent in {:?} exited but closing its tab failed \
+             ({err})",
+            tab.root_pane_id
+        );
+        return;
+    }
+
+    let _ = notify.send(tab_auto_closed_status(identifier));
+}
+
+/// Fire-and-forget wrapper around [`close_tab_once_agent_has_exited`] (TF-649): detaches it onto
+/// the runtime via `tokio::spawn` and returns immediately, so `implement_one` — and in turn
+/// `start_implementation`/[`implement_many`] — return to their caller as soon as the prompt
+/// lands, regardless of how long the issue actually takes. This is not optional for correctness:
+/// `implement_many`'s parallel multi-issue flow (TF-622) must not have one issue's close-watcher
+/// block starting, or waiting on, any of the others.
+///
+/// Deliberately detached rather than tracked/joined anywhere — if the user quits the plugin
+/// before the agent exits, tokio drops this task along with the rest of the runtime on exit: no
+/// cleanup hook, no panic, just a task that silently stops existing (see TF-649's "out of scope"
+/// on guaranteed cleanup across plugin/herdr-server restarts).
+///
+/// `identifier` and `notify` (TF-653) are forwarded verbatim to
+/// [`close_tab_once_agent_has_exited`]; `notify` is an owned clone rather than a borrow because
+/// this closure must be `'static` to satisfy `tokio::spawn`.
+fn spawn_tab_close_when_agent_has_exited(
+    herdr_bin: String,
+    identifier: String,
+    tab: plugin::herdr_cli::TabCreated,
+    notify: StatusNotifier,
+) {
+    tokio::spawn(async move {
+        close_tab_once_agent_has_exited(
+            &herdr_bin,
+            &identifier,
+            &tab,
+            AGENT_EXIT_WAIT_TIMEOUT_MS,
+            AGENT_EXIT_POLL_INTERVAL,
+            &notify,
+        )
+        .await;
+    });
+}
+
+/// Outcome of [`run_editor_command`]/[`run_editor_in_terminal_with`] — the actual "launch the
+/// editor and wait for it" attempt. Distinguishes "never ran" (safe for [`open_config_editor`]
+/// to fall back to the OS opener) from "ran, and already had the terminal" (a fallback next
+/// would risk a second, confusing "open" for a file the user just closed) — loosely mirrors
+/// `herdr-file-viewer`'s own `NotLaunched`/`NonZeroExit` distinction for the identical
+/// spawn-and-wait hand-off (that project splits the concern across two types, `SpawnError` at
+/// its `Spawner` layer and a 4-variant `EditorOutcome` at its `EditorHandoff` layer, including a
+/// `TookOver`/`NoTakeover` split this one has no equivalent of — the two aren't a 1:1 match).
+#[derive(Debug, PartialEq, Eq)]
+enum EditorOutcome {
+    /// The editor ran, exited successfully, and the terminal was restored afterward.
+    Ok,
+    /// The editor could not be launched at all — e.g. removed from disk in the gap between
+    /// [`resolve_editor_command_from_env`] resolving it and this call. Nothing happened, so
+    /// the OS-opener fallback is safe.
+    NotLaunched(String),
+    /// The editor launched and ran, but exited with a non-zero status (`:cq` in nvim, or a
+    /// real crash). It already took over the terminal, so the caller must not also try the OS
+    /// opener.
+    NonZeroExit(String),
+    /// The editor itself ran fine (or already failed to launch/exited non-zero — see
+    /// [`run_editor_in_terminal_with`]), but restoring herdr-linear's own TUI afterward failed.
+    /// Treated like `NonZeroExit` by [`open_config_editor`] (the terminal was already handed
+    /// over, so no OS-opener fallback) but kept as its own variant so the message can point at
+    /// the *terminal*, not the editor, as what needs attention — and, critically, so this
+    /// failure is never silently dropped the way it used to be: previously a `resume_tui`
+    /// failure after a successful edit left `run_editor_in_terminal` returning a bare `Ok`,
+    /// which `open_config_editor`/`open_config_result_status` turn into *clearing* the status
+    /// bar — zero on-screen indication that the terminal might now be broken (PR #46 review).
+    TerminalNotRestored(String),
+}
+
+/// Runs `editor_cmd` on `config_path` as a blocking child process and waits for it to exit, via
+/// the injected `spawn` (`std::process::Command::new(editor_cmd).arg(config_path).status()` in
+/// production — see [`run_editor_in_terminal_with`]) — kept as a parameter so this stays
+/// unit-testable without really launching anything, the same reason [`open_config_editor`]
+/// takes its own `opener` as a parameter rather than calling `open::that` directly. Never
+/// returns [`EditorOutcome::TerminalNotRestored`] — that variant only exists to report a
+/// terminal-resume failure, which is [`run_editor_in_terminal_with`]'s concern, layered on top
+/// of whatever this function already decided.
+fn run_editor_command(
     editor_cmd: &str,
     config_path: &std::path::Path,
-) -> std::result::Result<(), HerdrPaneError> {
-    // Reuse an already-open editor tab from a previous `c` press, if any — see this function's
-    // own doc for why a tab-label lookup is the only reuse mechanism that still works for `nvim`.
-    // Guard against reusing a dead tab: a tab with the right label but no running editor process
-    // (e.g. the user quit nvim inside it) would otherwise strand the user on an empty shell pane.
-    match plugin::herdr_cli::tab_list(herdr_bin).await {
-        Ok(json) => {
-            if let Some(tab_id) = plugin::herdr_cli::find_existing_editor_tab(&json) {
-                if editor_tab_is_alive(herdr_bin, &tab_id).await {
-                    return plugin::herdr_cli::tab_focus(herdr_bin, &tab_id)
-                        .await
-                        .map_err(|err| {
-                            HerdrPaneError::Unavailable(format!(
-                                "found an existing '{}' tab but failed to focus it: {err}",
-                                plugin::editor::EDITOR_AGENT_NAME
-                            ))
-                        });
-                }
-                tracing::debug!(
-                    "existing '{}' tab has no running editor process — creating a new tab",
-                    plugin::editor::EDITOR_AGENT_NAME
-                );
-            }
+    spawn: impl FnOnce(&str, &std::path::Path) -> std::io::Result<std::process::ExitStatus>,
+) -> EditorOutcome {
+    match spawn(editor_cmd, config_path) {
+        Ok(status) if status.success() => EditorOutcome::Ok,
+        Ok(status) => EditorOutcome::NonZeroExit(format!("{editor_cmd} exited with {status}")),
+        Err(err) => EditorOutcome::NotLaunched(format!("couldn't launch {editor_cmd}: {err}")),
+    }
+}
+
+/// Leaves raw mode and the alternate screen — and drops mouse capture, which would otherwise
+/// leak raw escape sequences into the editor's own input — so `editor_cmd` gets a clean
+/// terminal to draw into. Real terminal I/O, so — like `run_tui`'s own raw-mode setup —
+/// deliberately untested.
+///
+/// Every step is attempted regardless of whether an earlier one failed — mirrors `run_tui`'s
+/// own teardown discipline (its doc: "Always attempt full teardown, even if an earlier step in
+/// it failed"), which the first cut of this function *didn't* follow (PR #46 review): it used
+/// `?` after the mouse-capture step, so a `disable_raw_mode` failure skipped `LeaveAlternateScreen`
+/// entirely, leaving a worse, more inconsistent partial state than attempting it too would have.
+/// Mouse-capture failure is still swallowed outright (`let _ = ...`), matching `run_tui`'s own
+/// identical treatment of it elsewhere — not every terminal supports mouse reporting, and that's
+/// an accepted, best-effort-only case, unlike raw mode / the alternate screen.
+fn suspend_tui() -> std::io::Result<()> {
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+    let raw_mode_result = crossterm::terminal::disable_raw_mode();
+    let alt_screen_result =
+        crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+    raw_mode_result.and(alt_screen_result)
+}
+
+/// Re-enters raw mode and the alternate screen, and re-arms mouse capture, after the editor
+/// exits. Every step is attempted regardless of an earlier one's outcome, for the same reason
+/// [`suspend_tui`]'s doc gives.
+fn resume_tui() -> std::io::Result<()> {
+    let raw_mode_result = crossterm::terminal::enable_raw_mode();
+    let alt_screen_result =
+        crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen);
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+    raw_mode_result.and(alt_screen_result)
+}
+
+/// Pure core of [`run_editor_in_terminal`]: `suspend`/`spawn`/`resume` as injected closures, so
+/// the *composition* around them — the suspend-failure branch, and the "resume is always
+/// attempted, and its failure is never silently dropped" invariant — is unit-testable without
+/// touching a real terminal or process. Mirrors [`run_editor_command`]'s/[`open_config_editor`]'s
+/// own pure-core/real-wrapper split; this function was the one place in the original PR #46 that
+/// skipped it, which is exactly where the review found its two real bugs (PR #46 review).
+///
+/// `resume` runs unconditionally — even when `suspend` itself failed (best-effort: whatever
+/// `suspend` may have partially changed before failing still deserves an attempt at restoring)
+/// and even when the editor never ran or exited non-zero — mirroring `run_tui`'s "always attempt
+/// full teardown" discipline extended to this suspend/resume pair. A `resume` failure folds into
+/// the returned [`EditorOutcome`] rather than being dropped: paired with an editor that already
+/// took over the terminal (`Ok`/`NonZeroExit`), it becomes `TerminalNotRestored`, which
+/// `open_config_editor` treats like `NonZeroExit` — no OS-opener fallback, since the terminal
+/// was already handed over. Paired with `NotLaunched` (the editor never ran at all — nothing
+/// touched the display), the resume failure is folded into that same `NotLaunched` message
+/// instead: the OS-opener fallback is still safe there regardless of whether this specific
+/// recovery attempt succeeded, so reclassifying it as `TerminalNotRestored` would incorrectly
+/// block a fallback that's still fine to try.
+fn run_editor_in_terminal_with(
+    editor_cmd: &str,
+    config_path: &std::path::Path,
+    suspend: impl FnOnce() -> std::io::Result<()>,
+    spawn: impl FnOnce(&str, &std::path::Path) -> std::io::Result<std::process::ExitStatus>,
+    resume: impl FnOnce() -> std::io::Result<()>,
+) -> EditorOutcome {
+    if let Err(suspend_err) = suspend() {
+        if let Err(resume_err) = resume() {
+            return EditorOutcome::NotLaunched(format!(
+                "couldn't suspend the terminal ({suspend_err}); it also failed to restore \
+                 afterward: {resume_err}"
+            ));
         }
-        Err(err) => {
-            tracing::debug!(
-                "couldn't list tabs to check for an existing '{}' pane ({err}) — creating a new \
-                 tab",
-                plugin::editor::EDITOR_AGENT_NAME
-            );
-        }
+        return EditorOutcome::NotLaunched(format!("couldn't suspend the terminal: {suspend_err}"));
     }
 
-    let cwd = config_path
-        .parent()
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(plugin::host::resolve_cwd);
-    let command = plugin::editor::build_editor_command(editor_cmd, config_path);
+    let outcome = run_editor_command(editor_cmd, config_path, spawn);
 
-    let created_tab =
-        plugin::herdr_cli::tab_create(herdr_bin, &cwd, plugin::editor::EDITOR_AGENT_NAME)
-            .await
-            .map_err(|err| HerdrPaneError::Unavailable(format!("failed to create a tab: {err}")))?;
+    if let Err(resume_err) = resume() {
+        return match outcome {
+            EditorOutcome::NotLaunched(editor_err) => EditorOutcome::NotLaunched(format!(
+                "{editor_err}; the terminal also failed to restore afterward: {resume_err}"
+            )),
+            EditorOutcome::Ok => EditorOutcome::TerminalNotRestored(resume_err.to_string()),
+            EditorOutcome::NonZeroExit(editor_err) => EditorOutcome::TerminalNotRestored(format!(
+                "{editor_err}; the terminal also failed to restore afterward: {resume_err}"
+            )),
+            EditorOutcome::TerminalNotRestored(_) => unreachable!(
+                "run_editor_command (the only source of `outcome` here) never returns \
+                 TerminalNotRestored — see its own doc"
+            ),
+        };
+    }
 
-    // A `pane_run` `Err` doesn't necessarily mean the editor never launched — the same
-    // `run_with_timeout`-without-`kill_on_drop` caveat `implement_one`'s own `pane_run` call
-    // documents applies here too (a client-side timeout on a `herdr` call that's still running
-    // in the background).
-    // Report `Ambiguous`, not `Unavailable`, so the caller doesn't fall back to the OS opener and
-    // risk opening the file a second time.
-    plugin::herdr_cli::pane_run(herdr_bin, &created_tab.root_pane_id, &command)
-        .await
-        .map_err(|err| {
-            HerdrPaneError::Ambiguous(format!(
-                "tab created but launching the editor failed ({err}) — check the '{}' tab: it \
-                 may be empty (safe to close) or the editor may have started anyway despite the \
-                 error, so verify before closing it",
-                plugin::editor::EDITOR_AGENT_NAME
-            ))
-        })
+    outcome
+}
+
+/// The real, real-environment editor hand-off for the `c` keybinding: suspends herdr-linear's
+/// own TUI, runs `editor_cmd` on `config_path` as a blocking child process that takes over the
+/// terminal directly — no separate herdr pane, mirroring `herdr-file-viewer`'s own hand-off —
+/// and restores the TUI afterward regardless of outcome. Unlike the old
+/// `open_config_in_herdr_pane` (which typed the launch command into a fresh herdr tab's shell
+/// via `tab_create`/`pane_run`), there's no separate pane at all here, so nothing is left
+/// behind to close manually once the editor exits — quitting the editor returns straight to
+/// herdr-linear's own screen. Real terminal I/O plus a real subprocess, so deliberately
+/// untested itself; [`run_editor_in_terminal_with`] is its tested, injectable core.
+fn run_editor_in_terminal(editor_cmd: &str, config_path: &std::path::Path) -> EditorOutcome {
+    run_editor_in_terminal_with(
+        editor_cmd,
+        config_path,
+        suspend_tui,
+        |cmd, path| std::process::Command::new(cmd).arg(path).status(),
+        resume_tui,
+    )
 }
 
 /// Resolves which editor `c` should use from the real environment: `config.toml`'s `editor`
@@ -774,31 +1304,33 @@ fn resolve_editor_command_from_env() -> Option<String> {
 }
 
 /// Opens `config.toml` for the `c` keybinding: if `editor_cmd` resolved to something (see
-/// [`resolve_editor_command_from_env`]), tries [`open_config_in_herdr_pane`] first; on success,
-/// `opener` is never called — the file must never be opened twice. Otherwise (`editor_cmd` is
-/// `None`, or the herdr-pane attempt failed) calls `opener(path)` — `open::that` in production,
-/// today's unchanged OS-default-opener fallback. `herdr_bin` and `opener` are both explicit
-/// parameters (rather than resolved internally via `plugin::herdr_cli::herdr_bin()`/`open::that`
-/// directly) so this whole function stays testable against a fake `herdr` script and a fake
-/// opener — mirrors how `implement_one` takes `herdr_bin: &str` while only its real-environment
-/// caller (`start_implementation`) is left untested. See
-/// docs/superpowers/specs/2026-08-11-editor-handling-design.md.
-async fn open_config_editor(
+/// [`resolve_editor_command_from_env`]), runs it via `run_editor` (`run_editor_in_terminal` in
+/// production — suspends the TUI, runs the editor in-place, resumes the TUI). On
+/// [`EditorOutcome::Ok`], `opener` is never called — the file must never be opened twice. Both
+/// [`EditorOutcome::NonZeroExit`] and [`EditorOutcome::TerminalNotRestored`] are reported
+/// straight to the caller instead of falling back — the editor already had the terminal (one
+/// way or another), so trying the OS opener next would risk a second, confusing "open" for a
+/// file the user just closed. Only [`EditorOutcome::NotLaunched`] (or no `editor_cmd` at all)
+/// falls through to `opener(path)` — `open::that` in production, today's unchanged
+/// OS-default-opener fallback. `run_editor` and `opener` are both explicit parameters so this
+/// whole function stays testable against fakes for both, mirroring how `implement_one` takes
+/// `herdr_bin: &str` while only its real-environment caller (`start_implementation`) is left
+/// untested.
+fn open_config_editor(
     path: &std::path::Path,
     editor_cmd: Option<String>,
-    herdr_bin: &str,
+    run_editor: impl FnOnce(&str, &std::path::Path) -> EditorOutcome,
     opener: impl Fn(&std::path::Path) -> std::io::Result<()>,
 ) -> std::result::Result<(), String> {
     if let Some(cmd) = &editor_cmd {
-        match open_config_in_herdr_pane(herdr_bin, cmd, path).await {
-            Ok(()) => return Ok(()),
-            // The tab may already exist with the editor running in it — falling back to the
-            // OS opener here would risk opening the file a second time, so this is reported
-            // straight to the caller instead of being retried. See `HerdrPaneError`'s doc.
-            Err(HerdrPaneError::Ambiguous(message)) => return Err(message),
-            Err(HerdrPaneError::Unavailable(err)) => {
+        match run_editor(cmd, path) {
+            EditorOutcome::Ok => return Ok(()),
+            EditorOutcome::NonZeroExit(message) | EditorOutcome::TerminalNotRestored(message) => {
+                return Err(message);
+            }
+            EditorOutcome::NotLaunched(message) => {
                 tracing::warn!(
-                    "herdr editor pane unavailable, falling back to the OS opener: {err}"
+                    "editor could not be launched, falling back to the OS opener: {message}"
                 );
             }
         }
@@ -807,14 +1339,128 @@ async fn open_config_editor(
     opener(path).map_err(|e| format!("Couldn't open {}: {e}", path.display()))
 }
 
+/// Whether the process is attached to a remote session (SSH, and by extension Mosh — which
+/// still sets `SSH_TTY` on the far end even though the transport itself is UDP — or Moshi, which
+/// tunnels over one of those). Checked once at startup and threaded through to the `o` key's
+/// browser-open handling: `open::that(url)` shells out to the *local* OS opener, so over a
+/// remote session it opens a browser on the host, not the device the user is actually looking
+/// at. Presence, not content, is what matters — both vars are always non-empty when a real SSH
+/// daemon sets them, so `.is_some()` is sufficient without inspecting the value.
+fn is_remote_session(ssh_connection: Option<&str>, ssh_tty: Option<&str>) -> bool {
+    ssh_connection.is_some() || ssh_tty.is_some()
+}
+
+/// Wraps `text` in an OSC 52 "set clipboard" escape sequence. Terminal multiplexers/clients that
+/// pass OSC 52 through (Moshi does, per its docs — host → iOS clipboard) apply it to the
+/// *client's* clipboard even over SSH/Mosh, unlike `open::that()` which always acts on whatever
+/// machine the process itself is running on.
+fn osc52_copy_sequence(text: &str) -> String {
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    format!("\x1b]52;c;{encoded}\x07")
+}
+
+/// Handles the `o` key's `Action::OpenInBrowser(url)`. Minimal-diff by design (TF-652):
+/// the local branch is untouched — `open::that(url)`'s result is still discarded exactly as
+/// before, preserving pre-TF-652 behaviour (silent no-op on failure; there's no useful recovery
+/// action to offer for "the OS couldn't open a browser"). Only the remote branch is new, since
+/// that's the one that's actually broken (see module docs on `is_remote_session`): it can't call
+/// the local OS opener at all, so it copies the URL via OSC 52 instead. Unlike the local branch,
+/// a failed clipboard write here has no other fallback the user could fall back on, so — unlike
+/// `open::that`'s discarded result above — it's surfaced as `Status::Error` rather than assumed
+/// to have succeeded.
+fn open_issue_url(
+    url: &str,
+    is_remote: bool,
+    opener: impl FnOnce(&str) -> std::io::Result<()>,
+    write_clipboard_sequence: impl FnOnce(&str) -> std::io::Result<()>,
+) -> Option<plugin::app::Status> {
+    if is_remote {
+        Some(match write_clipboard_sequence(&osc52_copy_sequence(url)) {
+            Ok(()) => plugin::app::Status::Ok("Issue-URL kopiert – in Safari einfügen".to_string()),
+            Err(e) => {
+                plugin::app::Status::Error(format!("Issue-URL konnte nicht kopiert werden: {e}"))
+            }
+        })
+    } else {
+        let _ = opener(url);
+        None
+    }
+}
+
+/// Status shown while [`start_implementation`] is blocked confirming a (re)sent prompt, once
+/// `send_prompt_until_visible`'s progress hook reaches a (re)send beyond the first — diagnosed
+/// live (TF-650): against a freshly-launched `headroom wrap claude ...`-style multi-process
+/// `agent_command`, `agent_wait`'s "idle" status resolves in single-digit milliseconds, long
+/// before the target's own input loop has attached, so attempt 1 is a near-certain miss rather
+/// than an occasional one — every single-issue implement pays a mandatory multi-second wait for
+/// attempt 2 (typically the one that lands) with, until now, no visible sign anything was still
+/// happening, which is exactly the shape of a "not injected, but the second manual try usually
+/// works" report: the user is very plausibly looking at this same unindicated wait and
+/// concluding it failed before `send_prompt_until_visible`'s own retry (already reliable — see
+/// the constants' own docs) had a chance to land.
+///
+/// Returns `None` for attempt 1. It does *not* fire the instant `Action::Implement`'s own
+/// "Starting implementation for X…" status is drawn — `implement_one` still has to create the
+/// tab, launch the agent, make two Linear API calls, and wait for `agent_wait`'s "idle" first —
+/// but it does fire before any *other* status update would otherwise appear, so redrawing
+/// identical information at that point would be a no-op flicker rather than new signal. Split
+/// out as a pure function (rather than inlined in the closure `start_implementation` builds)
+/// purely so the wording is unit-testable without a real `App`/`Terminal`.
+fn prompt_attempt_status(
+    issue_identifier: &str,
+    attempt: u32,
+    attempts: u32,
+) -> Option<plugin::app::Status> {
+    if attempt <= 1 {
+        return None;
+    }
+    Some(plugin::app::Status::Ok(format!(
+        "{issue_identifier}: still waiting for the agent to finish starting up — confirming \
+         attempt {attempt} of {attempts}…"
+    )))
+}
+
+/// TF-669's counterpart to [`prompt_attempt_status`], for the *earlier*
+/// [`plugin::herdr_cli::agent_wait_for_start`] wait — closes the same "long silent wait" gap
+/// that fix closed for the prompt-send phase, but for "does herdr even see an agent in this
+/// pane yet" instead of "did the prompt land". Returns `None` for poll 1, for the same reason
+/// `prompt_attempt_status` does: a wait that resolves on its very first poll never needed a
+/// mid-flight status at all, so showing one only from poll 2 on avoids a one-poll flicker.
+/// Pure function, unit-tested directly, same rationale as `prompt_attempt_status`'s own doc.
+fn agent_start_poll_status(issue_identifier: &str, poll: u32) -> Option<plugin::app::Status> {
+    if poll <= 1 {
+        return None;
+    }
+    Some(plugin::app::Status::Ok(format!(
+        "{issue_identifier}: still waiting for herdr to recognize the agent — poll {poll}…"
+    )))
+}
+
 /// Single-issue `<Enter>` flow (unmarked selection — [`plugin::app::Action::Implement`]).
 /// Status wording is unchanged from before TF-590: `implement_one` does the work, this just
 /// prefixes its outcome with the issue identifier and picks `Ok`/`Error` the same way the
 /// inlined version used to.
+///
+/// Takes `terminal` (new) so it can redraw mid-flight via [`agent_start_poll_status`]/
+/// [`prompt_attempt_status`] — safe here specifically because this is the *single*-issue path:
+/// exactly one `implement_one` call is ever in flight, so nothing else could be racing this
+/// function for the one shared terminal. The multi-issue path (`implement_many`, TF-622) runs
+/// several `implement_one` calls concurrently and deliberately does not attempt this — see that
+/// function's doc. A failed mid-flight redraw (a real terminal I/O error) is logged via
+/// `tracing::debug!` and otherwise swallowed rather than propagated — matching
+/// `send_prompt_until_visible_with`'s own "log a non-fatal failure, don't abort the flow over
+/// it" convention, and specifically *not* silently discarded the way a one-off diagnostic-only
+/// failure (`init_tracing`'s own precedent) would be: unlike that case, `terminal.draw` failing
+/// here is the same operation the caller treats as fatal one statement earlier
+/// (`terminal.draw(...)?` in `event_loop`, right before this function is called), so losing the
+/// error without a trace would leave a real terminal fault undiagnoseable after the fact.
 async fn start_implementation(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     app: &mut plugin::app::App,
     client: &herdr_linear::LinearClient,
     issue: herdr_linear::Issue,
+    notify: &StatusNotifier,
 ) {
     let herdr_bin = plugin::herdr_cli::herdr_bin();
     let command = match resolve_validated_agent_command(&herdr_bin).await {
@@ -827,7 +1473,24 @@ async fn start_implementation(
             return;
         }
     };
-    match implement_one(&herdr_bin, client, &issue, &command).await {
+    let outcome = implement_one(&herdr_bin, client, &issue, &command, notify, |progress| {
+        let status = match progress {
+            ImplementProgress::AgentStartPoll(poll) => {
+                agent_start_poll_status(&issue.identifier, poll)
+            }
+            ImplementProgress::PromptAttempt { attempt, attempts } => {
+                prompt_attempt_status(&issue.identifier, attempt, attempts)
+            }
+        };
+        if let Some(status) = status {
+            app.set_status(status);
+            if let Err(err) = terminal.draw(|frame| plugin::ui::draw(frame, app)) {
+                tracing::debug!("start_implementation: mid-flight progress redraw failed ({err})");
+            }
+        }
+    })
+    .await;
+    match outcome {
         ImplementOutcome::Started(message) => {
             app.set_status(plugin::app::Status::Ok(format!(
                 "{}: {message}",
@@ -841,6 +1504,63 @@ async fn start_implementation(
             )));
         }
     }
+}
+
+/// `Enter`-while-commenting flow ([`plugin::app::Action::AddComment`], TF-648): submit
+/// `body` on `issue` via `client.add_comment()` and report the outcome as a status
+/// banner, the same `"<identifier>: <detail>"` wording and `Ok`/`Error` split
+/// `start_implementation` uses. `client.add_comment`'s `Err` is interpolated via
+/// `Display` (`{err}`), the same convention `load_issues`'/`ensure_loaded`'s
+/// `err.to_string()` calls surface `herdr_linear::Error` with — both just invoke the same
+/// `Display` impl, so no detail differs between the two spellings.
+///
+/// On failure, the draft is *not* discarded (PR #53 review): `app.restore_failed_comment_
+/// draft` reopens it as a resumable [`plugin::app::CommentState::Failed`], and the
+/// failure is additionally logged via `tracing::warn!` so it's recoverable from a log
+/// file (see `main.rs::init_tracing`) even after the status banner is next overwritten.
+async fn start_add_comment(
+    app: &mut plugin::app::App,
+    client: &herdr_linear::LinearClient,
+    issue: herdr_linear::Issue,
+    body: String,
+) {
+    match client.add_comment(&issue.id, &body).await {
+        Ok(_) => {
+            app.set_status(plugin::app::Status::Ok(format!(
+                "{}: comment added.",
+                issue.identifier
+            )));
+        }
+        Err(err) => {
+            tracing::warn!(
+                "start_add_comment: failed to add comment to {} ({err})",
+                issue.identifier
+            );
+            app.set_status(plugin::app::Status::Error(format!(
+                "{}: failed to add comment — {err} (draft kept, press m to resume it)",
+                issue.identifier
+            )));
+            app.restore_failed_comment_draft(issue, body);
+        }
+    }
+}
+
+/// The status shown when [`plugin::app::Action::AddComment`] reaches `event_loop` before
+/// a client has ever connected (`client.as_ref() == None`) — pulled into a pure function
+/// so it's directly unit-testable despite `event_loop` itself not being drivable by
+/// `TestBackend` (same rationale `apply_cycle_preset` was extracted for). In practice
+/// unreachable today: `client` only ever transitions `None` → `Some` (`ensure_loaded`'s
+/// success path, never reset back), and reaching `Action::AddComment` at all requires an
+/// already-`Loaded` view, which itself requires `load_issues` — and therefore a connected
+/// client — to have already succeeded (verified by reading every `client` assignment in
+/// this file). Kept as a real, honest branch rather than `unreachable!()` anyway: trusting
+/// that cross-module invariant here would turn a future change to the client lifecycle
+/// into a panic instead of a message.
+fn add_comment_unavailable_status(issue: &herdr_linear::Issue) -> plugin::app::Status {
+    plugin::app::Status::Error(format!(
+        "{}: not connected to Linear yet — draft kept, press m to resume it.",
+        issue.identifier
+    ))
 }
 
 /// Max per-issue detail segments [`summarize_many`] includes verbatim in the status banner
@@ -935,10 +1655,13 @@ async fn implement_many(
     client: &herdr_linear::LinearClient,
     issues: Vec<herdr_linear::Issue>,
     command: &plugin::implement::ValidatedAgentCommand,
+    notify: &StatusNotifier,
 ) -> Vec<(String, ImplementOutcome)> {
     let requests = issues.into_iter().map(|issue| async move {
         let identifier = issue.identifier.clone();
-        let outcome = implement_one(herdr_bin, client, &issue, command).await;
+        // No progress redraw here — see `implement_one`'s doc on why the concurrent path passes
+        // a no-op.
+        let outcome = implement_one(herdr_bin, client, &issue, command, notify, |_| {}).await;
         Ok::<_, herdr_linear::Error>((identifier, outcome))
     });
     client
@@ -965,6 +1688,7 @@ async fn start_implementation_many(
     app: &mut plugin::app::App,
     client: &herdr_linear::LinearClient,
     issues: Vec<herdr_linear::Issue>,
+    notify: &StatusNotifier,
 ) -> bool {
     let herdr_bin = plugin::herdr_cli::herdr_bin();
     let total = issues.len();
@@ -986,7 +1710,7 @@ async fn start_implementation_many(
         }
     };
 
-    let results = implement_many(&herdr_bin, client, issues, &command).await;
+    let results = implement_many(&herdr_bin, client, issues, &command, notify).await;
 
     let (status, all_started) = summarize_many(total, results);
     app.set_status(status);
@@ -1077,8 +1801,9 @@ fn is_buffered_quit_key(
 /// screen state they'd act on has already moved on — but the count is still noted via
 /// `tracing::debug!` (see `main.rs::init_tracing`) so a log-enabled session has a trail instead
 /// of those keypresses vanishing with zero trace anywhere.
-/// Minimum time [`ensure_loaded`] must have actually taken, in the `Action::Retry` /
-/// `Action::EnterView` arm, before a buffered key is discarded via [`flush_buffered_quit`].
+/// Minimum time [`ensure_loaded`] must have actually taken, in [`draw_and_load`] (used by
+/// the `Action::Retry` / `Action::EnterView` arm and, since TF-647, `Action::CyclePreset`),
+/// before a buffered key is discarded via [`flush_buffered_quit`].
 /// The common case is a plain network round-trip well under a second; a key buffered during
 /// that window is exactly the kind of fast, legitimate follow-up keypress (a quick second
 /// `Enter`/`r`) that — before the TF-610-driven flush was added — simply sat in the terminal's
@@ -1087,8 +1812,7 @@ fn is_buffered_quit_key(
 /// this was added for: TF-610's rate-limit retry, which can leave `ensure_loaded` blocking for
 /// up to ~2 minutes (3 attempts × up to 60s `Retry-After` each) with the screen looking hung.
 /// 1s is comfortably above any ordinary round-trip and comfortably below the first retry wait.
-const RETRY_OR_ENTER_VIEW_STALE_LOAD_THRESHOLD: std::time::Duration =
-    std::time::Duration::from_secs(1);
+const STALE_LOAD_FLUSH_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(1);
 
 fn flush_buffered_quit() -> std::io::Result<bool> {
     let mut quit_requested = false;
@@ -1111,157 +1835,396 @@ fn flush_buffered_quit() -> std::io::Result<bool> {
     Ok(quit_requested)
 }
 
+/// Draws the just-triggered `Loading` transition, then awaits [`ensure_loaded`] — shared
+/// by the `Action::Retry`/`Action::EnterView` arm and, since TF-647, `Action::CyclePreset`
+/// (both are, at this point, just "the screen moved to `Loading`, now actually go fetch").
+///
+/// `ensure_loaded` can block for up to ~2 minutes riding out TF-610's rate-limit retry (up
+/// to 3 attempts, each waiting up to 60s on the server's Retry-After) with no visible
+/// progress — during that window keys the user presses, including quit, just buffer up in
+/// the terminal instead of being handled. This drains them the same way the
+/// Implement/ImplementMany arms do, so a quit pressed while this was stuck actually takes
+/// effect instead of leaving the app looking hung. But only once the load actually took
+/// long enough to justify it (see `STALE_LOAD_FLUSH_THRESHOLD`) — on the
+/// common fast round-trip, draining unconditionally would silently eat a legitimate
+/// follow-up keypress that the loop's normal poll would otherwise have picked up next
+/// iteration.
+///
+/// Returns `true` if the caller should `break` out of `event_loop` (a quit was buffered
+/// during a slow load).
+async fn draw_and_load(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    app: &mut plugin::app::App,
+    client: &mut Option<herdr_linear::LinearClient>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    terminal.draw(|frame| plugin::ui::draw(frame, app))?;
+
+    let load_started = std::time::Instant::now();
+    ensure_loaded(app, client).await;
+
+    Ok(load_started.elapsed() >= STALE_LOAD_FLUSH_THRESHOLD && flush_buffered_quit()?)
+}
+
+/// The pure core of `Action::CyclePreset`'s handling in [`event_loop`] (TF-647 review
+/// fix): given the freshly-read `[[filter_presets]]` resolution, cycles `app`'s active
+/// preset and decides whether a refetch is warranted. Extracted from `event_loop` (which
+/// is hardcoded to a real terminal backend, so it can't itself be driven by
+/// `ratatui::backend::TestBackend` the way `ui.rs`'s render tests are) so this decision —
+/// and its "no valid preset to cycle to, but some configured entries were malformed"
+/// status message — is directly testable.
+///
+/// Always calls [`plugin::app::App::cycle_active_preset`], even against an empty
+/// `resolved.presets` — that's the only way a currently-active preset gets cleared once
+/// its last remaining `config.toml` entry is deleted (previously this was gated on the
+/// list being non-empty, which left a stale `active_preset`, and its bracketed name in
+/// the title, stuck forever once the list it pointed into became empty).
+///
+/// Returns `true` if the active preset actually changed and the caller should transition
+/// to `Loading` and refetch. If cycling was a genuine no-op — no valid preset to switch
+/// to, or already back at `None` — and at least one `[[filter_presets]]` entry existed but
+/// was dropped for having a blank `name`/`query`, sets a status message: this is
+/// distinguished from "no `[[filter_presets]]` configured at all" (TF-647's AC, which
+/// stays silent) precisely so a config typo doesn't look identical to the feature not
+/// being used.
+fn apply_cycle_preset(
+    app: &mut plugin::app::App,
+    resolved: &plugin::config::ResolvedFilterPresets,
+) -> bool {
+    let before = app.active_preset().cloned();
+    app.cycle_active_preset(&resolved.presets);
+    if app.active_preset().cloned() != before {
+        return true;
+    }
+    if resolved.presets.is_empty() && resolved.dropped > 0 {
+        let noun = if resolved.dropped == 1 {
+            "entry"
+        } else {
+            "entries"
+        };
+        app.set_status(plugin::app::Status::Error(format!(
+            "{} [[filter_presets]] {noun} in config.toml ignored: each needs both a \
+             non-blank `name` and `query`",
+            resolved.dropped
+        )));
+    }
+    false
+}
+
+/// Drains any [`plugin::app::Status`] notices queued by `event_loop`'s background tab-close
+/// watchers (TF-653, via [`spawn_tab_close_when_agent_has_exited`]) into `app`'s status.
+///
+/// `try_recv` never blocks, so this never stalls the render/input loop whether or not anything
+/// is queued. If more than one notice is queued, only the last one survives — `App::set_status`
+/// overwrites rather than accumulates, the same class as every other `set_status` overwrite
+/// already in this codebase; an accepted tradeoff for a transient banner. Any notice replaced
+/// this way (unlike one merely superseded by a later, unrelated action) is logged via
+/// `tracing::debug!` (PR #57 review) — silently dropping *this specific* kind of status is what
+/// TF-653 exists to prevent in the first place, so even though the last-wins behavior itself is
+/// staying, it shouldn't also be unrecoverable from a log file if it ever matters (e.g. several
+/// of `implement_many`'s concurrently-running tabs closing within the same poll window).
+///
+/// Callers matter for correctness here, not just as an implementation detail: this only avoids
+/// TF-653's original clobber bug (a notice overwriting a just-set, never-yet-drawn outcome
+/// status before the user ever saw it) because `event_loop` no longer calls this unconditionally
+/// every tick — see its `skip_drain_this_tick` mechanism, which this function relies on but
+/// cannot enforce or verify itself. Extracted into its own function anyway (not a "pure"
+/// function — it mutates both `rx` and `app` — mirroring [`tab_auto_closed_status`]'s *reason*
+/// for being split out, not its purity) purely so its own drain/overwrite semantics are
+/// unit-testable without a running `event_loop` or a real terminal; the loop-level ordering
+/// itself is not covered by an automated test (`event_loop` is hardcoded to a real
+/// `CrosstermBackend` terminal, so it can't be driven by `TestBackend` — same limitation
+/// `apply_cycle_preset` was extracted to work around, which doesn't help here since the property
+/// under test is the *ordering* of two loop-level statements, not a pure computation) — reasoned
+/// about via this doc comment and the one on `skip_drain_this_tick` instead.
+fn drain_notifications(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<plugin::app::Status>,
+    app: &mut plugin::app::App,
+) {
+    let mut pending: Option<plugin::app::Status> = None;
+    while let Ok(status) = rx.try_recv() {
+        if let Some(replaced) = pending.replace(status) {
+            tracing::debug!(
+                "drain_notifications: replaced a queued status before it was ever drawn: {}",
+                replaced.text()
+            );
+        }
+    }
+    if let Some(status) = pending {
+        app.set_status(status);
+    }
+}
+
 async fn event_loop(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     app: &mut plugin::app::App,
     client: &mut Option<herdr_linear::LinearClient>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Doesn't change over the process lifetime, so resolved once here rather than re-reading
+    // the environment on every `o` keypress.
+    let is_remote = is_remote_session(
+        std::env::var("SSH_CONNECTION").ok().as_deref(),
+        std::env::var("SSH_TTY").ok().as_deref(),
+    );
+
+    // TF-653: fed by `spawn_tab_close_when_agent_has_exited`'s background watchers (TF-649), one
+    // clone per implement call — `event_loop` is the only place `App::set_status` can be called
+    // from, so this is how a detached `tokio::spawn`ed task gets a status banner onto the
+    // screen at all.
+    let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel::<plugin::app::Status>();
+
+    // TF-653 review (PR #57): whether the *previous* iteration's `poll` returned because an
+    // event arrived (`true`) rather than timing out (`false`) — read at the top of this
+    // iteration to decide whether `drain_notifications` is safe to run yet, then overwritten
+    // with this iteration's own `poll` result at the bottom. Starts `false`: nothing has been
+    // set by an event handler before the first iteration, so there's nothing to protect yet.
+    //
+    // A first version of this fix (PR #56) drew once, inline, right after `Action::Implement`/
+    // `Action::ImplementMany`'s blocking calls returned — closing the race for those two arms
+    // only, and only in the narrow sense of "drawn at all": a `terminal.draw()` immediately
+    // followed by *another* `terminal.draw()` (the next iteration's, once `drain_notifications`
+    // had overwritten the status) can both reach the terminal within the same tick, with no
+    // guarantee an emulator ever painted the first one before the second arrived. Deferring
+    // `drain_notifications` until a `poll` genuinely times out — meaning the terminal has been
+    // sitting on the current draw, undisturbed, for up to the full `poll` duration — reuses the
+    // exact mechanism that already gives every other status banner its real, human-observable
+    // dwell time, rather than inventing a separate minimum-display-duration timer. It also
+    // protects *every* action arm uniformly (`OpenInBrowser`, `OpenConfig`, `CyclePreset`, ...),
+    // not just the two that happened to `.await` a background result — those two are no
+    // longer special-cased at all; see `drain_notifications`'s own doc for the property this
+    // guarantees, and its "not unit-tested" note for what this ordering still relies on being
+    // gotten right by inspection rather than a driven `event_loop` test.
+    let mut skip_drain_this_tick = false;
+
     loop {
+        // See `skip_drain_this_tick`'s declaration above for why this is conditional now
+        // (TF-653 review, PR #57) rather than unconditional.
+        if !skip_drain_this_tick {
+            drain_notifications(&mut notify_rx, app);
+        }
+
         terminal.draw(|frame| plugin::ui::draw(frame, app))?;
 
-        if crossterm::event::poll(std::time::Duration::from_millis(200))? {
-            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
-                if let Some(action) = plugin::app::handle_key(app, key.code, key.modifiers) {
-                    match action {
-                        plugin::app::Action::Quit => break,
-                        plugin::app::Action::OpenInBrowser(url) => {
-                            let _ = open::that(url);
-                        }
-                        plugin::app::Action::OpenConfig(path) => {
-                            // Unlike `OpenInBrowser` above, this chains filesystem writes and
-                            // (possibly) a herdr round-trip in front of the final "open it"
-                            // step — each with real, user-hittable failure modes (permission
-                            // denied, disk full, herdr unreachable) — and it's one of the
-                            // recovery actions offered on the error screen. Silently doing
-                            // nothing here would leave the user stuck with no indication that
-                            // pressing `c` didn't work, so unlike `OpenInBrowser` this surfaces a
-                            // failure via `set_status` rather than discarding it. See
-                            // docs/superpowers/specs/2026-08-11-editor-handling-design.md.
-                            let ensure_result: Result<(), String> = (|| {
-                                if let Some(parent) = path.parent() {
-                                    std::fs::create_dir_all(parent).map_err(|e| {
-                                        format!("Couldn't create {}: {e}", parent.display())
-                                    })?;
+        skip_drain_this_tick = crossterm::event::poll(std::time::Duration::from_millis(200))?;
+        if skip_drain_this_tick {
+            match crossterm::event::read()? {
+                crossterm::event::Event::Mouse(mouse) => {
+                    // Real-time, not cached from the last `terminal.draw` — cheap (a single
+                    // terminal-size query, an ioctl on Unix) and always current, unlike a
+                    // size captured at draw time, which could be stale by the time a mouse
+                    // event arrives after a resize.
+                    let (width, _height) = crossterm::terminal::size()?;
+                    plugin::app::handle_mouse(app, mouse.kind, mouse.column, width);
+                }
+                crossterm::event::Event::Key(key) => {
+                    if let Some(action) = plugin::app::handle_key(app, key.code, key.modifiers) {
+                        match action {
+                            plugin::app::Action::Quit => break,
+                            plugin::app::Action::OpenInBrowser(url) => {
+                                // Local branch is untouched — see `open_issue_url`'s doc comment
+                                // for why the remote (SSH/Mosh/Moshi) branch needs different
+                                // handling than just calling the OS opener.
+                                if let Some(status) = open_issue_url(
+                                    &url,
+                                    is_remote,
+                                    |u| open::that(u),
+                                    |seq| {
+                                        use std::io::Write as _;
+                                        let mut stdout = std::io::stdout();
+                                        stdout.write_all(seq.as_bytes())?;
+                                        stdout.flush()
+                                    },
+                                ) {
+                                    app.set_status(status);
                                 }
-                                if !path.exists() {
-                                    std::fs::write(&path, CONFIG_TEMPLATE).map_err(|e| {
-                                        format!("Couldn't write {}: {e}", path.display())
-                                    })?;
+                            }
+                            plugin::app::Action::OpenConfig(path) => {
+                                // Unlike `OpenInBrowser`'s local branch above, this chains
+                                // filesystem writes and a blocking editor hand-off
+                                // (`run_editor_in_terminal`) in front of the final "open it" step
+                                // — each with real, user-hittable failure modes (permission
+                                // denied, disk full, editor not found) — and it's one of the
+                                // recovery actions offered on the error screen. Silently doing
+                                // nothing here would leave the user stuck with no indication that
+                                // pressing `c` didn't work, so unlike that branch this surfaces a
+                                // failure via `set_status` rather than discarding it.
+                                let ensure_result: Result<(), String> = (|| {
+                                    if let Some(parent) = path.parent() {
+                                        std::fs::create_dir_all(parent).map_err(|e| {
+                                            format!("Couldn't create {}: {e}", parent.display())
+                                        })?;
+                                    }
+                                    if !path.exists() {
+                                        std::fs::write(&path, CONFIG_TEMPLATE).map_err(|e| {
+                                            format!("Couldn't write {}: {e}", path.display())
+                                        })?;
+                                    }
+                                    Ok(())
+                                })(
+                                );
+
+                                match ensure_result {
+                                    Err(message) => {
+                                        app.set_status(plugin::app::Status::Error(format!(
+                                            "{message}. Edit it manually."
+                                        )));
+                                    }
+                                    Ok(()) => {
+                                        let editor_cmd = resolve_editor_command_from_env();
+                                        // Shown unconditionally, not gated on `editor_cmd.is_some()`
+                                        // — see `open_config_result_status`'s doc for why: it keeps
+                                        // this set symmetric with the unconditional `clear`/`set`
+                                        // below on every tier, including the OS-opener-only one.
+                                        app.set_status(plugin::app::Status::Ok(
+                                            "Opening config.toml…".to_string(),
+                                        ));
+                                        terminal.draw(|frame| plugin::ui::draw(frame, app))?;
+
+                                        let result = open_config_editor(
+                                            &path,
+                                            editor_cmd,
+                                            run_editor_in_terminal,
+                                            |p| open::that(p),
+                                        );
+
+                                        // `run_editor_in_terminal` may have suspended and resumed
+                                        // the real terminal (raw mode / alternate screen) around
+                                        // the editor — ratatui's own back buffer has no idea that
+                                        // happened, so the next `draw` would otherwise only diff
+                                        // against stale, pre-editor content. `clear` resets that
+                                        // buffer, forcing a full repaint. Harmless (just a slightly
+                                        // less efficient repaint) on the OS-opener-only path, where
+                                        // nothing actually touched the terminal.
+                                        terminal.clear()?;
+
+                                        match open_config_result_status(&result) {
+                                            Some(status) => app.set_status(status),
+                                            None => app.clear_status(),
+                                        }
+                                    }
                                 }
-                                Ok(())
-                            })(
-                            );
 
-                            match ensure_result {
-                                Err(message) => {
-                                    app.set_status(plugin::app::Status::Error(format!(
-                                        "{message}. Edit it manually."
-                                    )));
+                                if flush_buffered_quit()? {
+                                    break;
                                 }
-                                Ok(()) => {
-                                    let editor_cmd = resolve_editor_command_from_env();
-                                    // Shown unconditionally, not gated on `editor_cmd.is_some()`
-                                    // — see `open_config_result_status`'s doc for why: it keeps
-                                    // this set symmetric with the unconditional `clear`/`set`
-                                    // below on every tier, including the OS-opener-only one.
-                                    app.set_status(plugin::app::Status::Ok(
-                                        "Opening config.toml…".to_string(),
-                                    ));
-                                    terminal.draw(|frame| plugin::ui::draw(frame, app))?;
-
-                                    let herdr_bin = plugin::herdr_cli::herdr_bin();
-                                    let result =
-                                        open_config_editor(&path, editor_cmd, &herdr_bin, |p| {
-                                            open::that(p)
-                                        })
-                                        .await;
-
-                                    match open_config_result_status(&result) {
-                                        Some(status) => app.set_status(status),
-                                        None => app.clear_status(),
+                            }
+                            plugin::app::Action::Retry | plugin::app::Action::EnterView => {
+                                // `handle_key` already moved `app` into `Loading` — either
+                                // retrying the current view or entering a newly selected
+                                // one. `draw_and_load` draws that before the fetch's own
+                                // round-trip (so it's visible instead of leaving the stale
+                                // previous frame) and drains a buffered quit if the load
+                                // ran long — see its own doc comment for why.
+                                if draw_and_load(terminal, app, client).await? {
+                                    break;
+                                }
+                            }
+                            plugin::app::Action::CyclePreset => {
+                                // TF-647: unlike `Retry`/`EnterView` above, `handle_key`
+                                // deliberately did *not* move `app` into `Loading` — it
+                                // can't know the configured preset count without reading
+                                // `config.toml`, and must stay pure/I/O-free (see
+                                // `Action::CyclePreset`'s own doc comment). Do that read
+                                // here, then hand off to `apply_cycle_preset` (pure core,
+                                // directly tested below) to decide whether a refetch is
+                                // warranted, then mirror `Retry`: transition to `Loading`
+                                // and reuse `draw_and_load`.
+                                let config_dir = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR")
+                                    .map(std::path::PathBuf::from);
+                                match plugin::config::resolve_filter_presets(config_dir.as_deref())
+                                {
+                                    Ok(resolved) => {
+                                        if apply_cycle_preset(app, &resolved) {
+                                            app.retry();
+                                            if draw_and_load(terminal, app, client).await? {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    Err(err) => {
+                                        app.set_status(plugin::app::Status::Error(
+                                            filter_presets_error_message(err),
+                                        ));
                                     }
                                 }
                             }
-
-                            if flush_buffered_quit()? {
-                                break;
-                            }
-                        }
-                        plugin::app::Action::Retry | plugin::app::Action::EnterView => {
-                            // `handle_key` already moved `app` into `Loading` — either
-                            // retrying the current view or entering a newly selected
-                            // one; draw that before the fetch's own round-trip so
-                            // it's visible instead of leaving the stale previous frame.
-                            terminal.draw(|frame| plugin::ui::draw(frame, app))?;
-                            // `ensure_loaded` can block for up to ~2 minutes riding out
-                            // TF-610's rate-limit retry (up to 3 attempts, each waiting up
-                            // to 60s on the server's Retry-After) with no visible progress —
-                            // during that window keys the user presses, including quit, just
-                            // buffer up in the terminal instead of being handled. Drain them
-                            // the same way the Implement/ImplementMany arms below do, so a
-                            // quit pressed while this was stuck actually takes effect instead
-                            // of leaving the app looking hung. But only once the load actually
-                            // took long enough to justify it (see
-                            // `RETRY_OR_ENTER_VIEW_STALE_LOAD_THRESHOLD`) — on the common fast
-                            // round-trip, draining unconditionally would silently eat a
-                            // legitimate follow-up keypress that the loop's normal poll would
-                            // otherwise have picked up next iteration.
-                            let load_started = std::time::Instant::now();
-                            ensure_loaded(app, client).await;
-
-                            if load_started.elapsed() >= RETRY_OR_ENTER_VIEW_STALE_LOAD_THRESHOLD
-                                && flush_buffered_quit()?
-                            {
-                                break;
-                            }
-                        }
-                        plugin::app::Action::Implement(issue) => {
-                            app.set_status(plugin::app::Status::Ok(format!(
-                                "Starting implementation for {}…",
-                                issue.identifier
-                            )));
-                            terminal.draw(|frame| plugin::ui::draw(frame, app))?;
-                            match client.as_ref() {
-                                Some(c) => start_implementation(app, c, issue).await,
-                                None => app.set_status(plugin::app::Status::Error(format!(
-                                    "{}: not connected to Linear yet — try again.",
+                            plugin::app::Action::Implement(issue) => {
+                                app.set_status(plugin::app::Status::Ok(format!(
+                                    "Starting implementation for {}…",
                                     issue.identifier
-                                ))),
-                            }
+                                )));
+                                terminal.draw(|frame| plugin::ui::draw(frame, app))?;
+                                match client.as_ref() {
+                                    Some(c) => {
+                                        start_implementation(terminal, app, c, issue, &notify_tx)
+                                            .await
+                                    }
+                                    None => app.set_status(plugin::app::Status::Error(format!(
+                                        "{}: not connected to Linear yet — try again.",
+                                        issue.identifier
+                                    ))),
+                                }
+                                // TF-653 (PR #57 review): no explicit draw here anymore — the
+                                // loop-top `skip_drain_this_tick` mechanism now guarantees the
+                                // status just set above renders, protected from
+                                // `drain_notifications`, on the very next iteration regardless
+                                // of which action arm set it. See that mechanism's doc.
 
-                            if flush_buffered_quit()? {
-                                break;
+                                if flush_buffered_quit()? {
+                                    break;
+                                }
                             }
-                        }
-                        plugin::app::Action::ImplementMany(issues) => {
-                            app.set_status(plugin::app::Status::Ok(format!(
-                                "Starting implementation for {} issues…",
-                                issues.len()
-                            )));
-                            terminal.draw(|frame| plugin::ui::draw(frame, app))?;
-                            // Only clear the marked-issue selection once every issue actually
-                            // started — not connected (nothing attempted) and a partial/total
-                            // failure both leave the marks in place, so the user can retry
-                            // without re-marking everything (TF-590).
-                            match client.as_ref() {
-                                Some(c) => {
-                                    let all_started =
-                                        start_implementation_many(app, c, issues).await;
-                                    if should_clear_marks_after_implementing_many(all_started) {
-                                        app.clear_marks();
+                            plugin::app::Action::ImplementMany(issues) => {
+                                app.set_status(plugin::app::Status::Ok(format!(
+                                    "Starting implementation for {} issues…",
+                                    issues.len()
+                                )));
+                                terminal.draw(|frame| plugin::ui::draw(frame, app))?;
+                                // Only clear the marked-issue selection once every issue actually
+                                // started — not connected (nothing attempted) and a partial/total
+                                // failure both leave the marks in place, so the user can retry
+                                // without re-marking everything (TF-590).
+                                match client.as_ref() {
+                                    Some(c) => {
+                                        let all_started =
+                                            start_implementation_many(app, c, issues, &notify_tx)
+                                                .await;
+                                        if should_clear_marks_after_implementing_many(all_started) {
+                                            app.clear_marks();
+                                        }
+                                    }
+                                    None => app.set_status(plugin::app::Status::Error(
+                                        "not connected to Linear yet — try again.".to_string(),
+                                    )),
+                                }
+                                // TF-653 (PR #57 review): see the single-issue `Action::Implement`
+                                // arm above — same reasoning, no explicit draw needed here either.
+
+                                if flush_buffered_quit()? {
+                                    break;
+                                }
+                            }
+                            plugin::app::Action::AddComment { issue, body } => {
+                                app.set_status(plugin::app::Status::Ok(format!(
+                                    "{}: posting comment…",
+                                    issue.identifier
+                                )));
+                                terminal.draw(|frame| plugin::ui::draw(frame, app))?;
+                                match client.as_ref() {
+                                    Some(c) => start_add_comment(app, c, issue, body).await,
+                                    None => {
+                                        app.set_status(add_comment_unavailable_status(&issue));
+                                        app.restore_failed_comment_draft(issue, body);
                                     }
                                 }
-                                None => app.set_status(plugin::app::Status::Error(
-                                    "not connected to Linear yet — try again.".to_string(),
-                                )),
-                            }
 
-                            if flush_buffered_quit()? {
-                                break;
+                                if flush_buffered_quit()? {
+                                    break;
+                                }
                             }
                         }
                     }
                 }
+                _ => {}
             }
         }
     }
@@ -1299,260 +2262,236 @@ mod tests {
         (dir, script)
     }
 
-    /// Fake `herdr` script dispatching `tab list`, `tab create`, and `pane run` calls to canned
-    /// bodies — the three subcommands `open_config_in_herdr_pane` can issue after TF-624's
-    /// redesign. `tab focus` is not parameterized: it always succeeds (`{"result":{}}`), since
-    /// none of this fixture's callers need to simulate a `tab focus` failure — the one test that
-    /// reaches it (`..._focuses_an_existing_tab_without_creating_a_new_one`) only needs to prove
-    /// reuse short-circuits `tab create`/`pane run`, not exercise `tab focus`'s own error path.
-    /// `pane list`/`pane process-info` default to "no pane / dead pane" so callers that don't
-    /// expect to reach reuse don't need to supply them.
-    fn write_editor_herdr_script(
-        tab_list: &str,
-        tab_create: &str,
-        pane_run: &str,
-        pane_list: Option<&str>,
-        pane_process_info: Option<&str>,
-    ) -> (tempfile::TempDir, std::path::PathBuf) {
-        let pane_list = pane_list.unwrap_or(r#"echo '{"result":{"panes":[]}}'; exit 0"#);
-        let pane_process_info = pane_process_info.unwrap_or(
-            r#"echo '{"result":{"process_info":{"shell_pid":1,"foreground_processes":[]}}}'; exit 0"#,
+    #[cfg(unix)]
+    #[test]
+    fn run_editor_command_is_ok_when_the_spawned_process_exits_successfully() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let outcome = run_editor_command(
+            "nvim",
+            std::path::Path::new("/fake/config.toml"),
+            |_cmd, _path| Ok(std::process::ExitStatus::from_raw(0)),
         );
-        write_fake_herdr_script(&format!(
-            r#"
-case "$1 $2" in
-  "tab list") {tab_list} ;;
-  "tab create") {tab_create} ;;
-  "pane run") {pane_run} ;;
-  "tab focus") echo '{{"result":{{}}}}'; exit 0 ;;
-  "pane list") {pane_list} ;;
-  "pane process-info") {pane_process_info} ;;
-  *)
-    echo '{{"error":{{"message":"unexpected herdr call: $1 $2"}}}}'
-    exit 1
-    ;;
-esac
-"#
-        ))
+
+        assert_eq!(outcome, EditorOutcome::Ok);
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn open_config_in_herdr_pane_focuses_an_existing_tab_without_creating_a_new_one() {
-        let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"result":{"tabs":[{"tab_id":"w1:t2","label":"herdr-linear-config"}]}}'; exit 0"#,
-            r#"echo 'tab create should not run'; exit 1"#,
-            r#"echo 'pane run should not run'; exit 1"#,
-            Some(r#"echo '{"result":{"panes":[{"pane_id":"w1:p2","tab_id":"w1:t2"}]}}'; exit 0"#),
-            Some(
-                r#"echo '{"result":{"process_info":{"shell_pid":1000,"foreground_processes":[{"pid":2000,"name":"nvim"}]}}}'; exit 0"#,
-            ),
+    #[test]
+    fn run_editor_command_reports_a_non_zero_exit_without_falling_back() {
+        use std::os::unix::process::ExitStatusExt;
+
+        // `1 << 8` is the raw wait-status encoding for a normal exit with code 1 (see
+        // `ExitStatusExt::from_raw`'s doc) — a real, if artificial, non-zero exit.
+        let outcome = run_editor_command(
+            "nvim",
+            std::path::Path::new("/fake/config.toml"),
+            |_cmd, _path| Ok(std::process::ExitStatus::from_raw(1 << 8)),
         );
 
-        let result = open_config_in_herdr_pane(
-            script.to_str().unwrap(),
-            "nvim",
-            std::path::Path::new("/fake/config/dir/config.toml"),
-        )
-        .await;
-
-        assert_eq!(result, Ok(()));
+        let EditorOutcome::NonZeroExit(message) = outcome else {
+            panic!("expected NonZeroExit, got {outcome:?}");
+        };
+        assert!(message.contains("nvim"), "unexpected message: {message}");
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn open_config_in_herdr_pane_creates_a_tab_when_no_existing_one_is_found() {
-        let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"result":{"tabs":[]}}'; exit 0"#,
-            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"herdr-linear-config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
-            r#"echo '{"result":{}}'; exit 0"#,
-            None,
-            None,
+    #[test]
+    fn run_editor_command_reports_not_launched_when_spawn_fails() {
+        let outcome = run_editor_command(
+            "nvim",
+            std::path::Path::new("/fake/config.toml"),
+            |_cmd, _path| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no such file",
+                ))
+            },
         );
 
-        let result = open_config_in_herdr_pane(
-            script.to_str().unwrap(),
-            "nvim",
-            std::path::Path::new("/fake/config/dir/config.toml"),
-        )
-        .await;
-
-        assert_eq!(result, Ok(()));
+        let EditorOutcome::NotLaunched(message) = outcome else {
+            panic!("expected NotLaunched, got {outcome:?}");
+        };
+        assert!(
+            message.contains("nvim") && message.contains("no such file"),
+            "unexpected message: {message}"
+        );
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn open_config_in_herdr_pane_creates_a_new_tab_when_the_existing_editor_tab_is_dead() {
-        // The tab exists with the right label, but the editor process has exited and the pane
-        // is back at the shell prompt. Reusing it via `tab focus` would strand the user on a
-        // dead pane, so we must create a fresh tab instead.
-        let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"result":{"tabs":[{"tab_id":"w1:t2","label":"herdr-linear-config"}]}}'; exit 0"#,
-            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"herdr-linear-config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
-            r#"echo '{"result":{}}'; exit 0"#,
-            Some(r#"echo '{"result":{"panes":[{"pane_id":"w1:p2","tab_id":"w1:t2"}]}}'; exit 0"#),
-            Some(
-                r#"echo '{"result":{"process_info":{"shell_pid":1000,"foreground_processes":[{"pid":1000,"name":"zsh"}]}}}'; exit 0"#,
-            ),
+    #[test]
+    fn run_editor_command_passes_the_editor_command_and_config_path_to_spawn() {
+        let mut captured = None;
+        let _ = run_editor_command(
+            "nvim",
+            std::path::Path::new("/fake/config/dir/config.toml"),
+            |cmd, path| {
+                captured = Some((cmd.to_string(), path.to_path_buf()));
+                Err(std::io::Error::new(std::io::ErrorKind::NotFound, "boom"))
+            },
         );
 
-        let result = open_config_in_herdr_pane(
-            script.to_str().unwrap(),
-            "nvim",
-            std::path::Path::new("/fake/config/dir/config.toml"),
-        )
-        .await;
-
-        assert_eq!(result, Ok(()));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn open_config_in_herdr_pane_threads_the_editor_cmd_and_cwd_into_the_cli_calls() {
-        // `write_editor_herdr_script`'s tests above only prove the right subcommand runs in the
-        // right order — none of them inspect the argv beyond `$1 $2`. A regression that hardcoded
-        // the wrong editor, dropped/swapped `cwd`/`config_path`, or built the wrong shell-quoted
-        // command would pass every one of them. This captures every call's full argv instead.
-        let capture_dir = tempfile::tempdir().unwrap();
-        let args_file = capture_dir.path().join("args.txt");
-        let (_dir, script) = write_fake_herdr_script(&format!(
-            r#"
-printf 'CALL: %s\n' "$*" >> "{args_file}"
-case "$1 $2" in
-  "tab list")
-    echo '{{"result":{{"tabs":[]}}}}'
-    exit 0
-    ;;
-  "tab create")
-    echo '{{"result":{{"tab":{{"tab_id":"t2","label":"herdr-linear-config"}},"root_pane":{{"pane_id":"p9"}}}}}}'
-    exit 0
-    ;;
-  "pane run")
-    echo '{{"result":{{}}}}'
-    exit 0
-    ;;
-esac
-"#,
-            args_file = args_file.display()
-        ));
-
-        let result = open_config_in_herdr_pane(
-            script.to_str().unwrap(),
-            "nvim",
-            std::path::Path::new("/fake/config/dir/config.toml"),
-        )
-        .await;
-
-        assert_eq!(result, Ok(()));
-
-        let captured = std::fs::read_to_string(&args_file).unwrap();
         assert_eq!(
             captured,
-            "CALL: tab list\n\
-             CALL: tab create --cwd /fake/config/dir --label herdr-linear-config --focus\n\
-             CALL: pane run p9 'nvim' '/fake/config/dir/config.toml'\n",
-            "unexpected sequence of herdr CLI calls: {captured}"
+            Some((
+                "nvim".to_string(),
+                std::path::PathBuf::from("/fake/config/dir/config.toml")
+            ))
         );
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn open_config_in_herdr_pane_treats_an_unlistable_tabs_call_as_no_existing_tab() {
-        // `tab list` failing outright (rather than succeeding with an empty/non-matching list)
-        // must fall through to creating a fresh tab, not bubble up as a hard failure.
-        let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"error":{"message":"no such workspace"}}'; exit 1"#,
-            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"herdr-linear-config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
-            r#"echo '{"result":{}}'; exit 0"#,
-            None,
-            None,
+    #[test]
+    fn run_editor_in_terminal_with_reports_not_launched_when_suspend_fails_and_never_spawns() {
+        let outcome = run_editor_in_terminal_with(
+            "nvim",
+            std::path::Path::new("/fake/config.toml"),
+            || Err(std::io::Error::other("suspend boom")),
+            |_cmd, _path| panic!("spawn must not run when suspend fails"),
+            || Ok(()),
         );
 
-        let result = open_config_in_herdr_pane(
-            script.to_str().unwrap(),
-            "nvim",
-            std::path::Path::new("/fake/config/dir/config.toml"),
-        )
-        .await;
-
-        assert_eq!(result, Ok(()));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn open_config_in_herdr_pane_fails_when_tab_create_fails_after_no_existing_tab_is_found()
-    {
-        let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"result":{"tabs":[]}}'; exit 0"#,
-            r#"echo '{"error":{"message":"no such workspace"}}'; exit 1"#,
-            r#"echo 'pane run should not run'; exit 1"#,
-            None,
-            None,
-        );
-
-        let result = open_config_in_herdr_pane(
-            script.to_str().unwrap(),
-            "nvim",
-            std::path::Path::new("/fake/config/dir/config.toml"),
-        )
-        .await;
-
-        let Err(HerdrPaneError::Unavailable(message)) = result else {
-            panic!("expected Err(Unavailable), got {result:?}");
+        let EditorOutcome::NotLaunched(message) = outcome else {
+            panic!("expected NotLaunched, got {outcome:?}");
         };
         assert!(
-            message.contains("failed to create a tab") && message.contains("no such workspace"),
+            message.contains("suspend boom"),
+            "unexpected message: {message}"
+        );
+    }
+
+    #[test]
+    fn run_editor_in_terminal_with_folds_a_resume_failure_into_a_failed_suspends_message() {
+        // A `suspend` failure that ALSO can't recover via `resume` must stay classified as
+        // `NotLaunched` (nothing ever touched the terminal from the editor's side, so the
+        // OS-opener fallback is still safe), just with both errors folded into one message —
+        // not silently dropped, and not reclassified into a fallback-blocking variant.
+        let outcome = run_editor_in_terminal_with(
+            "nvim",
+            std::path::Path::new("/fake/config.toml"),
+            || Err(std::io::Error::other("suspend boom")),
+            |_cmd, _path| panic!("spawn must not run when suspend fails"),
+            || Err(std::io::Error::other("resume boom")),
+        );
+
+        let EditorOutcome::NotLaunched(message) = outcome else {
+            panic!("expected NotLaunched, got {outcome:?}");
+        };
+        assert!(
+            message.contains("suspend boom") && message.contains("resume boom"),
             "unexpected message: {message}"
         );
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn open_config_in_herdr_pane_returns_ambiguous_when_pane_run_fails_after_tab_create() {
-        // `pane_run`'s `Err` doesn't mean the editor never launched (see this function's own doc
-        // on `run_with_timeout`'s lack of `kill_on_drop`) — so this must be reported as
-        // `Ambiguous`, not `Unavailable`, or the caller would fall back to the OS opener and risk
-        // opening the file a second time.
-        let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"result":{"tabs":[]}}'; exit 0"#,
-            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"herdr-linear-config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
-            r#"echo '{"error":{"message":"no such pane"}}'; exit 1"#,
-            None,
-            None,
+    #[test]
+    fn run_editor_in_terminal_with_reports_terminal_not_restored_when_resume_fails_after_success() {
+        use std::os::unix::process::ExitStatusExt;
+
+        // Regression test (PR #46 review): previously a `resume` failure after a
+        // successful edit was silently dropped — `run_editor_in_terminal` returned a bare
+        // `Ok`, which `open_config_editor`/`open_config_result_status` turn into *clearing*
+        // the status bar, leaving zero on-screen indication anything went wrong.
+        let outcome = run_editor_in_terminal_with(
+            "nvim",
+            std::path::Path::new("/fake/config.toml"),
+            || Ok(()),
+            |_cmd, _path| Ok(std::process::ExitStatus::from_raw(0)),
+            || Err(std::io::Error::other("resume boom")),
         );
 
-        let result = open_config_in_herdr_pane(
-            script.to_str().unwrap(),
-            "nvim",
-            std::path::Path::new("/fake/config/dir/config.toml"),
-        )
-        .await;
-
-        let Err(HerdrPaneError::Ambiguous(message)) = result else {
-            panic!("expected Err(Ambiguous), got {result:?}");
+        let EditorOutcome::TerminalNotRestored(message) = outcome else {
+            panic!("expected TerminalNotRestored, got {outcome:?}");
         };
         assert!(
-            message.contains("no such pane")
-                && message.contains("check the")
-                && message.contains(plugin::editor::EDITOR_AGENT_NAME),
+            message.contains("resume boom"),
             "unexpected message: {message}"
         );
     }
 
-    #[tokio::test]
-    async fn open_config_editor_calls_the_opener_when_no_editor_resolved() {
+    #[cfg(unix)]
+    #[test]
+    fn run_editor_in_terminal_with_folds_a_resume_failure_into_a_non_zero_exits_message() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let outcome = run_editor_in_terminal_with(
+            "nvim",
+            std::path::Path::new("/fake/config.toml"),
+            || Ok(()),
+            |_cmd, _path| Ok(std::process::ExitStatus::from_raw(1 << 8)),
+            || Err(std::io::Error::other("resume boom")),
+        );
+
+        let EditorOutcome::TerminalNotRestored(message) = outcome else {
+            panic!("expected TerminalNotRestored, got {outcome:?}");
+        };
+        assert!(
+            message.contains("nvim") && message.contains("resume boom"),
+            "unexpected message: {message}"
+        );
+    }
+
+    #[test]
+    fn run_editor_in_terminal_with_folds_a_resume_failure_into_a_not_launched_message() {
+        // Mirrors the non-zero-exit case above, but for the "editor never even launched"
+        // outcome — must stay `NotLaunched` (still safe to fall back to the OS opener),
+        // not get reclassified into a fallback-blocking `TerminalNotRestored`.
+        let outcome = run_editor_in_terminal_with(
+            "nvim",
+            std::path::Path::new("/fake/config.toml"),
+            || Ok(()),
+            |_cmd, _path| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no such file",
+                ))
+            },
+            || Err(std::io::Error::other("resume boom")),
+        );
+
+        let EditorOutcome::NotLaunched(message) = outcome else {
+            panic!("expected NotLaunched, got {outcome:?}");
+        };
+        assert!(
+            message.contains("no such file") && message.contains("resume boom"),
+            "unexpected message: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_editor_in_terminal_with_resumes_and_returns_ok_when_everything_succeeds() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let resume_called = std::cell::Cell::new(false);
+        let outcome = run_editor_in_terminal_with(
+            "nvim",
+            std::path::Path::new("/fake/config.toml"),
+            || Ok(()),
+            |_cmd, _path| Ok(std::process::ExitStatus::from_raw(0)),
+            || {
+                resume_called.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(
+            resume_called.get(),
+            "resume must always run after a successful spawn"
+        );
+        assert_eq!(outcome, EditorOutcome::Ok);
+    }
+
+    #[test]
+    fn open_config_editor_calls_the_opener_when_no_editor_resolved() {
         let opener_calls = std::cell::RefCell::new(Vec::new());
 
         let result = open_config_editor(
             std::path::Path::new("/fake/config/dir/config.toml"),
             None,
-            "/nonexistent/herdr-should-not-run",
+            |_cmd, _path| panic!("run_editor must not be called when no editor resolved"),
             |p| {
                 opener_calls.borrow_mut().push(p.to_path_buf());
                 Ok(())
             },
-        )
-        .await;
+        );
 
         assert_eq!(result, Ok(()));
         assert_eq!(
@@ -1561,130 +2500,23 @@ esac
         );
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn open_config_editor_does_not_call_the_opener_when_the_herdr_pane_succeeds() {
-        let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"result":{"tabs":[{"tab_id":"w1:t2","label":"herdr-linear-config"}]}}'; exit 0"#,
-            r#"echo 'tab create should not run'; exit 1"#,
-            r#"echo 'pane run should not run'; exit 1"#,
-            Some(r#"echo '{"result":{"panes":[{"pane_id":"w1:p2","tab_id":"w1:t2"}]}}'; exit 0"#),
-            Some(
-                r#"echo '{"result":{"process_info":{"shell_pid":1000,"foreground_processes":[{"pid":2000,"name":"nvim"}]}}}'; exit 0"#,
-            ),
-        );
-        let opener_calls = std::cell::RefCell::new(Vec::new());
-
+    #[test]
+    fn open_config_editor_fails_when_no_editor_resolved_and_the_opener_fails() {
+        // The `None`-`editor_cmd` precondition, paired with a failing opener — the sibling
+        // `..._fails_when_both_the_editor_and_the_opener_fail` test above covers the same
+        // final `opener(path).map_err(...)` line, but only reaches it via `NotLaunched`, not
+        // via `editor_cmd: None`.
         let result = open_config_editor(
             std::path::Path::new("/fake/config/dir/config.toml"),
-            Some("nvim".to_string()),
-            script.to_str().unwrap(),
-            |p| {
-                opener_calls.borrow_mut().push(p.to_path_buf());
-                Ok(())
-            },
-        )
-        .await;
-
-        assert_eq!(result, Ok(()));
-        assert!(
-            opener_calls.into_inner().is_empty(),
-            "opener must not run when the herdr-pane path already succeeded"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn open_config_editor_falls_back_to_the_opener_when_the_herdr_pane_path_fails() {
-        let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"result":{"tabs":[]}}'; exit 0"#,
-            r#"echo '{"error":{"message":"no such workspace"}}'; exit 1"#,
-            r#"echo 'pane run should not run'; exit 1"#,
             None,
-            None,
-        );
-        let opener_calls = std::cell::RefCell::new(Vec::new());
-
-        let result = open_config_editor(
-            std::path::Path::new("/fake/config/dir/config.toml"),
-            Some("nvim".to_string()),
-            script.to_str().unwrap(),
-            |p| {
-                opener_calls.borrow_mut().push(p.to_path_buf());
-                Ok(())
-            },
-        )
-        .await;
-
-        assert_eq!(result, Ok(()));
-        assert_eq!(
-            opener_calls.into_inner(),
-            vec![std::path::PathBuf::from("/fake/config/dir/config.toml")]
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn open_config_editor_does_not_fall_back_when_pane_run_ambiguously_fails() {
-        // Unlike the `tab_create`-fails case above (nothing was created, safe to fall back),
-        // a `pane_run` failure after a tab was already created is ambiguous — falling back
-        // to the opener here would risk opening the file a second time. The opener must not run.
-        let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"result":{"tabs":[]}}'; exit 0"#,
-            r#"echo '{"result":{"tab":{"tab_id":"t2","label":"herdr-linear-config"},"root_pane":{"pane_id":"p9"}}}'; exit 0"#,
-            r#"echo '{"error":{"message":"no such pane"}}'; exit 1"#,
-            None,
-            None,
-        );
-        let opener_calls = std::cell::RefCell::new(Vec::new());
-
-        let result = open_config_editor(
-            std::path::Path::new("/fake/config/dir/config.toml"),
-            Some("nvim".to_string()),
-            script.to_str().unwrap(),
-            |p| {
-                opener_calls.borrow_mut().push(p.to_path_buf());
-                Ok(())
-            },
-        )
-        .await;
-
-        let Err(message) = result else {
-            panic!("expected Err, got {result:?}");
-        };
-        assert!(
-            message.contains("check the") && message.contains(plugin::editor::EDITOR_AGENT_NAME),
-            "unexpected message: {message}"
-        );
-        assert!(
-            opener_calls.into_inner().is_empty(),
-            "opener must not run on an ambiguous pane_run failure — it could open the file twice"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn open_config_editor_fails_when_both_the_herdr_pane_and_the_opener_fail() {
-        let (_dir, script) = write_editor_herdr_script(
-            r#"echo '{"result":{"tabs":[]}}'; exit 0"#,
-            r#"echo '{"error":{"message":"no such workspace"}}'; exit 1"#,
-            r#"echo 'pane run should not run'; exit 1"#,
-            None,
-            None,
-        );
-
-        let result = open_config_editor(
-            std::path::Path::new("/fake/config/dir/config.toml"),
-            Some("nvim".to_string()),
-            script.to_str().unwrap(),
+            |_cmd, _path| panic!("run_editor must not be called when no editor resolved"),
             |_p| {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     "no handler registered",
                 ))
             },
-        )
-        .await;
+        );
 
         let Err(message) = result else {
             panic!("expected Err, got {result:?}");
@@ -1693,6 +2525,247 @@ esac
             message.contains("Couldn't open") && message.contains("no handler registered"),
             "unexpected message: {message}"
         );
+    }
+
+    #[test]
+    fn open_config_editor_does_not_call_the_opener_when_the_editor_succeeds() {
+        let opener_calls = std::cell::RefCell::new(Vec::new());
+
+        let result = open_config_editor(
+            std::path::Path::new("/fake/config/dir/config.toml"),
+            Some("nvim".to_string()),
+            |_cmd, _path| EditorOutcome::Ok,
+            |p| {
+                opener_calls.borrow_mut().push(p.to_path_buf());
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Ok(()));
+        assert!(
+            opener_calls.into_inner().is_empty(),
+            "opener must not run when the editor already succeeded"
+        );
+    }
+
+    #[test]
+    fn open_config_editor_falls_back_to_the_opener_when_the_editor_could_not_be_launched() {
+        let opener_calls = std::cell::RefCell::new(Vec::new());
+
+        let result = open_config_editor(
+            std::path::Path::new("/fake/config/dir/config.toml"),
+            Some("nvim".to_string()),
+            |_cmd, _path| EditorOutcome::NotLaunched("nvim not found".to_string()),
+            |p| {
+                opener_calls.borrow_mut().push(p.to_path_buf());
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            opener_calls.into_inner(),
+            vec![std::path::PathBuf::from("/fake/config/dir/config.toml")]
+        );
+    }
+
+    #[test]
+    fn open_config_editor_does_not_fall_back_when_the_editor_exits_non_zero() {
+        // Unlike the "could not launch" case above (nothing happened, safe to fall back), a
+        // non-zero exit means the editor already took over the terminal — falling back to the
+        // opener here would risk opening the file a second time. The opener must not run.
+        let opener_calls = std::cell::RefCell::new(Vec::new());
+
+        let result = open_config_editor(
+            std::path::Path::new("/fake/config/dir/config.toml"),
+            Some("nvim".to_string()),
+            |_cmd, _path| EditorOutcome::NonZeroExit("nvim exited with exit status: 1".to_string()),
+            |p| {
+                opener_calls.borrow_mut().push(p.to_path_buf());
+                Ok(())
+            },
+        );
+
+        let Err(message) = result else {
+            panic!("expected Err, got {result:?}");
+        };
+        assert!(
+            message.contains("exited with"),
+            "unexpected message: {message}"
+        );
+        assert!(
+            opener_calls.into_inner().is_empty(),
+            "opener must not run when the editor already exited — it could open the file twice"
+        );
+    }
+
+    #[test]
+    fn open_config_editor_does_not_fall_back_when_the_terminal_fails_to_restore() {
+        // Mirrors the non-zero-exit case above: `TerminalNotRestored` means the terminal was
+        // already handed over to the editor, so the opener must not run either.
+        let opener_calls = std::cell::RefCell::new(Vec::new());
+
+        let result = open_config_editor(
+            std::path::Path::new("/fake/config/dir/config.toml"),
+            Some("nvim".to_string()),
+            |_cmd, _path| {
+                EditorOutcome::TerminalNotRestored("couldn't re-enter raw mode".to_string())
+            },
+            |p| {
+                opener_calls.borrow_mut().push(p.to_path_buf());
+                Ok(())
+            },
+        );
+
+        let Err(message) = result else {
+            panic!("expected Err, got {result:?}");
+        };
+        assert!(
+            message.contains("raw mode"),
+            "unexpected message: {message}"
+        );
+        assert!(
+            opener_calls.into_inner().is_empty(),
+            "opener must not run when the terminal was already handed over to the editor"
+        );
+    }
+
+    #[test]
+    fn open_config_editor_fails_when_both_the_editor_and_the_opener_fail() {
+        let result = open_config_editor(
+            std::path::Path::new("/fake/config/dir/config.toml"),
+            Some("nvim".to_string()),
+            |_cmd, _path| EditorOutcome::NotLaunched("nvim not found".to_string()),
+            |_p| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no handler registered",
+                ))
+            },
+        );
+
+        let Err(message) = result else {
+            panic!("expected Err, got {result:?}");
+        };
+        assert!(
+            message.contains("Couldn't open") && message.contains("no handler registered"),
+            "unexpected message: {message}"
+        );
+    }
+
+    #[test]
+    fn is_remote_session_is_false_when_neither_ssh_env_var_is_set() {
+        assert!(!is_remote_session(None, None));
+    }
+
+    #[test]
+    fn is_remote_session_is_true_when_only_ssh_connection_is_set() {
+        assert!(is_remote_session(Some("10.0.0.1 1234 10.0.0.2 22"), None));
+    }
+
+    #[test]
+    fn is_remote_session_is_true_when_only_ssh_tty_is_set() {
+        assert!(is_remote_session(None, Some("/dev/pts/0")));
+    }
+
+    #[test]
+    fn is_remote_session_is_true_when_both_ssh_vars_are_set() {
+        // The realistic case for a Mosh-over-SSH session: mosh-server inherits both from the
+        // bootstrap SSH connection and never unsets them (see module docs on `is_remote_session`).
+        assert!(is_remote_session(
+            Some("10.0.0.1 1234 10.0.0.2 22"),
+            Some("/dev/pts/0")
+        ));
+    }
+
+    #[test]
+    fn is_remote_session_is_true_when_a_var_is_set_but_empty() {
+        // Pins down the doc comment's claim that presence, not content, is what matters: even an
+        // empty (but present) value counts as "set".
+        assert!(is_remote_session(Some(""), None));
+        assert!(is_remote_session(None, Some("")));
+    }
+
+    #[test]
+    fn osc52_copy_sequence_wraps_base64_of_the_input_in_the_osc52_escape_codes() {
+        assert_eq!(osc52_copy_sequence("hello"), "\x1b]52;c;aGVsbG8=\x07");
+    }
+
+    #[test]
+    fn osc52_copy_sequence_handles_empty_and_unicode_input() {
+        assert_eq!(osc52_copy_sequence(""), "\x1b]52;c;\x07");
+        // Multi-byte UTF-8 (ü) must be base64-encoded byte-for-byte, not per-`char`.
+        assert_eq!(osc52_copy_sequence("für"), "\x1b]52;c;ZsO8cg==\x07");
+    }
+
+    #[test]
+    fn open_issue_url_copies_via_osc52_and_returns_a_status_when_remote() {
+        let clipboard_calls = std::cell::RefCell::new(Vec::new());
+
+        let status = open_issue_url(
+            "https://linear.app/team/issue/TF-1",
+            true,
+            |_url| panic!("opener must not be called for a remote session"),
+            |seq| {
+                clipboard_calls.borrow_mut().push(seq.to_string());
+                Ok(())
+            },
+        );
+
+        assert_eq!(
+            status,
+            Some(plugin::app::Status::Ok(
+                "Issue-URL kopiert – in Safari einfügen".to_string()
+            ))
+        );
+        assert_eq!(
+            clipboard_calls.into_inner(),
+            vec![osc52_copy_sequence("https://linear.app/team/issue/TF-1")]
+        );
+    }
+
+    #[test]
+    fn open_issue_url_calls_the_opener_and_returns_no_status_when_local() {
+        let opener_calls = std::cell::RefCell::new(Vec::new());
+
+        let status = open_issue_url(
+            "https://linear.app/team/issue/TF-1",
+            false,
+            |url| {
+                opener_calls.borrow_mut().push(url.to_string());
+                Ok(())
+            },
+            |_seq| panic!("clipboard writer must not be called for a local session"),
+        );
+
+        assert_eq!(status, None);
+        assert_eq!(
+            opener_calls.into_inner(),
+            vec!["https://linear.app/team/issue/TF-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn open_issue_url_returns_an_error_status_when_the_clipboard_write_fails_remotely() {
+        // Unlike the local branch (which has no working fallback to fall back on if
+        // `open::that` fails either), a failed OSC 52 write must not be reported as success —
+        // there's no other signal the user could use to notice the copy didn't happen.
+        let status = open_issue_url(
+            "https://linear.app/team/issue/TF-1",
+            true,
+            |_url| panic!("opener must not be called for a remote session"),
+            |_seq| Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+        );
+
+        match status {
+            Some(plugin::app::Status::Error(message)) => {
+                assert!(
+                    message.contains("Issue-URL"),
+                    "expected the error message to mention the issue URL, got: {message}"
+                );
+            }
+            other => panic!("expected Some(Status::Error(_)) on a failed write, got: {other:?}"),
+        }
     }
 
     #[cfg(unix)]
@@ -1831,10 +2904,125 @@ exit 1
     #[test]
     fn open_config_result_status_sets_an_error_on_failure() {
         assert_eq!(
-            open_config_result_status(&Err("herdr unreachable".to_string())),
+            open_config_result_status(&Err("nvim exited with exit status: 1".to_string())),
             Some(plugin::app::Status::Error(
-                "herdr unreachable. Edit it manually.".to_string()
+                "nvim exited with exit status: 1. Edit it manually.".to_string()
             ))
+        );
+    }
+
+    #[test]
+    fn prompt_attempt_status_is_none_on_the_first_attempt() {
+        // Attempt 1 fires before any status other than `Action::Implement`'s own "Starting
+        // implementation…" has been drawn — redrawing identical information at that point would
+        // be a no-op flicker, not new signal, so this must stay silent. See
+        // `prompt_attempt_status`'s own doc for why "before any other status" isn't the same as
+        // "the instant that status is drawn" (`implement_one` still does real work first).
+        assert_eq!(prompt_attempt_status("TF-579", 1, 5), None);
+    }
+
+    #[test]
+    fn prompt_attempt_status_reports_progress_from_the_second_attempt_on() {
+        assert_eq!(
+            prompt_attempt_status("TF-579", 2, 5),
+            Some(plugin::app::Status::Ok(
+                "TF-579: still waiting for the agent to finish starting up — confirming \
+                 attempt 2 of 5…"
+                    .to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn prompt_attempt_status_reflects_the_actual_attempt_and_total() {
+        assert_eq!(
+            prompt_attempt_status("ENG-42", 3, 3),
+            Some(plugin::app::Status::Ok(
+                "ENG-42: still waiting for the agent to finish starting up — confirming \
+                 attempt 3 of 3…"
+                    .to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn agent_start_poll_status_is_none_on_the_first_poll() {
+        // Same rationale as `prompt_attempt_status_is_none_on_the_first_attempt`: a wait that
+        // resolves on its very first poll never needed a mid-flight status, so poll 1 must stay
+        // silent to avoid a one-poll flicker.
+        assert_eq!(agent_start_poll_status("TF-579", 1), None);
+    }
+
+    #[test]
+    fn agent_start_poll_status_reports_progress_from_the_second_poll_on() {
+        assert_eq!(
+            agent_start_poll_status("TF-579", 2),
+            Some(plugin::app::Status::Ok(
+                "TF-579: still waiting for herdr to recognize the agent — poll 2…".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn agent_start_poll_status_reflects_the_actual_poll_count() {
+        assert_eq!(
+            agent_start_poll_status("ENG-42", 7),
+            Some(plugin::app::Status::Ok(
+                "ENG-42: still waiting for herdr to recognize the agent — poll 7…".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn tab_auto_closed_status_names_the_issue_and_says_what_happened() {
+        // TF-653: this exact wording is the whole fix — it's the only thing standing between
+        // "the tab is gone" reading as "finished" instead of "lost".
+        assert_eq!(
+            tab_auto_closed_status("TF-641"),
+            plugin::app::Status::Ok("TF-641: agent finished, tab closed.".to_string())
+        );
+    }
+
+    #[test]
+    fn drain_notifications_applies_a_single_queued_status() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = plugin::app::App::new();
+        tx.send(tab_auto_closed_status("TF-649")).unwrap();
+
+        drain_notifications(&mut rx, &mut app);
+
+        assert_eq!(app.status(), Some(&tab_auto_closed_status("TF-649")));
+    }
+
+    #[test]
+    fn drain_notifications_on_an_empty_channel_leaves_status_untouched() {
+        let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = plugin::app::App::new();
+        app.set_status(plugin::app::Status::Ok("still here".to_string()));
+
+        drain_notifications(&mut rx, &mut app);
+
+        assert_eq!(
+            app.status(),
+            Some(&plugin::app::Status::Ok("still here".to_string()))
+        );
+    }
+
+    #[test]
+    fn drain_notifications_keeps_only_the_last_of_several_queued_statuses() {
+        // TF-653: `drain_notifications`'s own doc comment claims this — if two notices land in
+        // the same poll window, only the last survives. Prove it rather than just asserting it.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = plugin::app::App::new();
+        tx.send(tab_auto_closed_status("TF-641")).unwrap();
+        tx.send(tab_auto_closed_status("TF-642")).unwrap();
+
+        drain_notifications(&mut rx, &mut app);
+
+        assert_eq!(
+            app.status(),
+            Some(&tab_auto_closed_status("TF-642")),
+            "only the most recently queued notice should survive the drain"
         );
     }
 
@@ -2082,6 +3270,607 @@ exit 1
         }
     }
 
+    /// TF-648: `Action::AddComment`'s handler — success path. Verifies the exact status
+    /// text `event_loop` ends up showing, not just "some Ok status got set" (a
+    /// swapped-in-a-different-issue or dropped-identifier regression would still leave
+    /// `status().is_some()` true).
+    #[tokio::test]
+    async fn start_add_comment_reports_success_status() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "data": {
+                        "commentCreate": {
+                            "comment": {
+                                "id": "comment-1",
+                                "body": "Looks good",
+                                "user": {
+                                    "id": "user-1",
+                                    "email": "alice@example.com",
+                                    "name": "Alice",
+                                    "avatarUrl": null,
+                                    "createdAt": "2026-01-01T00:00:00Z",
+                                    "updatedAt": "2026-01-01T00:00:00Z"
+                                },
+                                "createdAt": "2026-01-01T00:00:00Z",
+                                "updatedAt": "2026-01-01T00:00:00Z"
+                            }
+                        }
+                    },
+                    "errors": null
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let client = herdr_linear::LinearClient::with_endpoint(
+            "lin_api_test",
+            format!("{}/graphql", server.url()),
+        )
+        .unwrap();
+        let mut app = plugin::app::App::new();
+        let issue = sample_issue("TF-648");
+
+        start_add_comment(&mut app, &client, issue, "Looks good".to_string()).await;
+
+        let status = app.status().unwrap();
+        assert!(!status.is_error());
+        assert_eq!(status.text(), "TF-648: comment added.");
+        mock.assert_async().await;
+    }
+
+    /// TF-648: `Action::AddComment`'s handler — a GraphQL-level failure (bad auth,
+    /// validation, ...) must surface as an `Error` status naming the issue, mirroring
+    /// `load_issues`'/`ensure_loaded`'s existing `err.to_string()` convention rather than
+    /// swallowing the underlying `herdr_linear::Error`.
+    #[tokio::test]
+    async fn start_add_comment_reports_error_status_on_failure() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(json!({"data": null, "errors": [{"message": "not authorized"}]}).to_string())
+            .create_async()
+            .await;
+        let client = herdr_linear::LinearClient::with_endpoint(
+            "lin_api_test",
+            format!("{}/graphql", server.url()),
+        )
+        .unwrap();
+        let mut app = plugin::app::App::new();
+        let issue = sample_issue("TF-648");
+
+        start_add_comment(&mut app, &client, issue, "Looks good".to_string()).await;
+
+        let status = app.status().unwrap();
+        assert!(status.is_error());
+        assert!(status.text().contains("TF-648"));
+        assert!(status.text().contains("failed to add comment"));
+        assert!(status.text().contains("not authorized"));
+    }
+
+    /// PR #53 review: a comment that fails to send must not simply vanish — it should be
+    /// resumable via `m` rather than requiring the user to retype it from memory.
+    /// `start_add_comment`'s `Err` branch restores it as `CommentState::Failed`, which
+    /// `App::start_commenting` (see its own doc) resumes for the same issue. Proven
+    /// end-to-end here through the same public API `handle_key`/`event_loop` themselves
+    /// use, not by reaching into `App`'s private fields.
+    #[tokio::test]
+    async fn start_add_comment_restores_a_resumable_draft_on_failure() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(json!({"data": null, "errors": [{"message": "not authorized"}]}).to_string())
+            .create_async()
+            .await;
+        let client = herdr_linear::LinearClient::with_endpoint(
+            "lin_api_test",
+            format!("{}/graphql", server.url()),
+        )
+        .unwrap();
+        let mut app = plugin::app::App::new();
+        app.enter_selected_menu_option();
+        app.set_issues(vec![sample_issue("TF-648")]);
+        let issue = sample_issue("TF-648");
+
+        start_add_comment(&mut app, &client, issue, "half-typed".to_string()).await;
+
+        // Resuming with `m` should pick the failed text back up rather than starting
+        // blank — proven by appending one more character and confirming, then checking
+        // the *whole* resulting body rather than just "editing became true".
+        app.start_commenting();
+        app.push_comment_char('!');
+        let action = app.confirm_comment();
+
+        assert_eq!(
+            action,
+            Some(plugin::app::Action::AddComment {
+                issue: sample_issue("TF-648"),
+                body: "half-typed!".to_string()
+            })
+        );
+    }
+
+    /// PR #53 review: `add_comment_unavailable_status` names the issue and, unlike the
+    /// pre-fix wording ("try again"), doesn't imply a free/cheap retry — the caller
+    /// (`event_loop`) separately calls `App::restore_failed_comment_draft` so the draft
+    /// really is kept, and this message should say so honestly rather than by accident.
+    #[test]
+    fn add_comment_unavailable_status_names_the_issue_and_is_an_error() {
+        let issue = sample_issue("TF-648");
+
+        let status = add_comment_unavailable_status(&issue);
+
+        assert!(status.is_error());
+        assert!(status.text().contains("TF-648"));
+        assert!(status.text().contains("draft kept"));
+    }
+
+    /// TF-617: `apply_fetched_issues` is `load_issues`'s shared post-fetch step —
+    /// confirms `default_query`'s `sort:` terms actually reorder what lands in `app`,
+    /// not just that `sort_issues`/`parse_query` are individually correct in isolation
+    /// (covered by their own unit tests in `plugin::query`).
+    #[test]
+    fn apply_fetched_issues_sorts_before_setting_them_on_app() {
+        let mut app = plugin::app::App::new();
+        app.enter_selected_menu_option();
+        let mut low = sample_issue("ENG-1");
+        low.priority = 1;
+        let mut high = sample_issue("ENG-2");
+        high.priority = 3;
+        let sort_keys = [plugin::query::SortKey {
+            field: plugin::query::SortField::Priority,
+            ascending: false,
+        }];
+
+        apply_fetched_issues(&mut app, vec![low, high], &sort_keys);
+
+        assert_eq!(app.selected_issue().unwrap().identifier, "ENG-2");
+    }
+
+    #[test]
+    fn apply_fetched_issues_with_no_sort_keys_preserves_fetch_order() {
+        let mut app = plugin::app::App::new();
+        app.enter_selected_menu_option();
+
+        apply_fetched_issues(
+            &mut app,
+            vec![sample_issue("ENG-2"), sample_issue("ENG-1")],
+            &[],
+        );
+
+        assert_eq!(app.selected_issue().unwrap().identifier, "ENG-2");
+    }
+
+    #[test]
+    fn resolved_query_is_empty_without_a_readable_default_query_or_active_preset() {
+        // TF-617/TF-647: deliberately doesn't set HERDR_PLUGIN_CONFIG_DIR itself — true
+        // whether it's unset, or (as plugin::app's own tests transiently do, concurrently,
+        // in this same test binary) pointed at the nonexistent literal path
+        // "/fake/config/dir" — since either way `resolve_default_query`/
+        // `resolve_filter_presets` hit a `NotFound` reading the file and resolve to
+        // `None`/`vec![]`, exactly like a real missing config.toml would. With no active
+        // preset (the default for a freshly-created `App`), `resolved_query` delegates
+        // straight to `resolved_default_query_for`. See plugin::config's test suite for
+        // `resolve_default_query`/`load_default_query`/`resolve_filter_presets`/
+        // `load_filter_presets` coverage against a real config.toml, via the pure,
+        // env-free variant `resolved_default_query_for` (tested directly below) also uses.
+        let mut app = plugin::app::App::new();
+        app.enter_selected_menu_option();
+
+        let parsed = resolved_query(&mut app);
+
+        assert!(parsed.filters.is_empty());
+        assert!(parsed.sort_keys.is_empty());
+        assert!(app.status().is_none());
+    }
+
+    // TF-617 review fixes: `resolved_default_query_for` (the pure core `resolved_query`
+    // falls back to when there's no active preset, taking `config_dir` directly so these
+    // tests never touch the process-global `HERDR_PLUGIN_CONFIG_DIR` every other test in
+    // this binary runs concurrently against) — covering the composition this function exists for (one
+    // `default_query` string populating both filters *and* sort_keys) and the two
+    // previously-silent failure modes it now surfaces via `app.set_status`.
+
+    #[test]
+    fn resolved_default_query_for_populates_both_filters_and_sort_from_one_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "default_query = \"priority:>=2 sort:-priority\"\n",
+        )
+        .unwrap();
+        let mut app = plugin::app::App::new();
+        app.enter_selected_menu_option();
+
+        let parsed = resolved_default_query_for(&mut app, Some(dir.path()));
+
+        assert_eq!(
+            parsed.filters,
+            vec![plugin::query::FilterTerm::Priority {
+                op: plugin::query::PriorityOp::Ge,
+                value: plugin::query::Priority::new(2).unwrap(),
+            }]
+        );
+        assert_eq!(
+            parsed.sort_keys,
+            vec![plugin::query::SortKey {
+                field: plugin::query::SortField::Priority,
+                ascending: false,
+            }]
+        );
+        assert!(app.status().is_none());
+    }
+
+    #[test]
+    fn resolved_default_query_for_treats_plain_non_dsl_text_as_an_inert_no_op() {
+        // A `default_query` that's syntactically valid TOML but not DSL syntax (no
+        // recognized `key:value` tokens — just prose) is a different failure mode than
+        // malformed TOML: `parse_query` never errors, so this degrades silently and
+        // correctly to "no filter/sort, just free text nothing will use" rather than
+        // surfacing as a status banner — confirms that degradation actually happens
+        // through the full chain, not just at the `parse_query` unit level.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "default_query = \"please filter my tickets\"\n",
+        )
+        .unwrap();
+        let mut app = plugin::app::App::new();
+        app.enter_selected_menu_option();
+
+        let parsed = resolved_default_query_for(&mut app, Some(dir.path()));
+
+        assert!(parsed.filters.is_empty());
+        assert!(parsed.sort_keys.is_empty());
+        assert_eq!(parsed.free_text, "please filter my tickets");
+        assert!(app.status().is_none());
+    }
+
+    #[test]
+    fn resolved_default_query_for_surfaces_unrecognized_terms_as_a_status_banner() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "default_query = \"priority:notanumber\"\n",
+        )
+        .unwrap();
+        let mut app = plugin::app::App::new();
+        app.enter_selected_menu_option();
+
+        let parsed = resolved_default_query_for(&mut app, Some(dir.path()));
+
+        assert!(parsed.filters.is_empty());
+        let status = app.status().expect("a rejected term should set a status");
+        assert!(status.is_error());
+        assert!(status.text().contains("priority:notanumber"));
+    }
+
+    #[test]
+    fn resolved_default_query_for_surfaces_malformed_toml_as_a_status_banner() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), "this is [invalid toml\n").unwrap();
+        let mut app = plugin::app::App::new();
+        app.enter_selected_menu_option();
+
+        let parsed = resolved_default_query_for(&mut app, Some(dir.path()));
+
+        assert!(parsed.filters.is_empty());
+        assert!(parsed.sort_keys.is_empty());
+        let status = app
+            .status()
+            .expect("malformed config.toml should set a status");
+        assert!(status.is_error());
+        assert!(status.text().contains("default_query"));
+    }
+
+    // TF-647: `resolved_query_for` — the active-preset layer in front of
+    // `resolved_default_query_for` above. Same "adapt, don't crash" error-handling
+    // philosophy, extended with a preset name in the status banner and a fallback to
+    // `default_query` when the active preset can no longer be resolved.
+
+    #[test]
+    fn resolved_query_for_uses_the_active_presets_query_when_one_is_set() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "default_query = \"sort:created\"\n\n\
+             [[filter_presets]]\nname = \"Urgent\"\nquery = \"priority:>=2 sort:-priority\"\n",
+        )
+        .unwrap();
+        let mut app = plugin::app::App::new();
+        app.enter_selected_menu_option();
+        app.set_active_preset(Some(plugin::app::ActivePreset {
+            index: 0,
+            name: "Urgent".to_string(),
+        }));
+
+        let parsed = resolved_query_for(&mut app, Some(dir.path()));
+
+        // The active preset's query wins over `default_query` entirely — not merged.
+        assert_eq!(
+            parsed.filters,
+            vec![plugin::query::FilterTerm::Priority {
+                op: plugin::query::PriorityOp::Ge,
+                value: plugin::query::Priority::new(2).unwrap(),
+            }]
+        );
+        assert_eq!(
+            parsed.sort_keys,
+            vec![plugin::query::SortKey {
+                field: plugin::query::SortField::Priority,
+                ascending: false,
+            }]
+        );
+        assert!(app.status().is_none());
+    }
+
+    #[test]
+    fn resolved_query_for_delegates_to_default_query_when_no_preset_is_active() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "default_query = \"sort:created\"\n\n\
+             [[filter_presets]]\nname = \"Urgent\"\nquery = \"priority:>=2\"\n",
+        )
+        .unwrap();
+        let mut app = plugin::app::App::new();
+        app.enter_selected_menu_option();
+
+        let parsed = resolved_query_for(&mut app, Some(dir.path()));
+
+        // `App::new()` starts with no active preset — TF-647's AC: unchanged
+        // `default_query`-only behavior when no preset has been cycled to.
+        assert!(parsed.filters.is_empty());
+        assert_eq!(
+            parsed.sort_keys,
+            vec![plugin::query::SortKey {
+                field: plugin::query::SortField::Created,
+                ascending: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn resolved_query_for_surfaces_unrecognized_terms_in_the_active_preset_with_its_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[[filter_presets]]\nname = \"Urgent\"\nquery = \"priority:notanumber\"\n",
+        )
+        .unwrap();
+        let mut app = plugin::app::App::new();
+        app.enter_selected_menu_option();
+        app.set_active_preset(Some(plugin::app::ActivePreset {
+            index: 0,
+            name: "Urgent".to_string(),
+        }));
+
+        let parsed = resolved_query_for(&mut app, Some(dir.path()));
+
+        assert!(parsed.filters.is_empty());
+        let status = app.status().expect("a rejected term should set a status");
+        assert!(status.is_error());
+        assert!(status.text().contains("Urgent"));
+        assert!(status.text().contains("priority:notanumber"));
+    }
+
+    #[test]
+    fn resolved_query_for_falls_back_to_default_query_when_the_active_presets_index_is_out_of_range(
+    ) {
+        // The preset list shrank since this index was activated (e.g. `config.toml`
+        // edited via `c` mid-session) — fall back to `default_query` rather than fetch
+        // with an undefined query, and clear the now-invalid active preset.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "default_query = \"priority:>=2\"\n\n\
+             [[filter_presets]]\nname = \"Only One Left\"\nquery = \"sort:created\"\n",
+        )
+        .unwrap();
+        let mut app = plugin::app::App::new();
+        app.enter_selected_menu_option();
+        app.set_active_preset(Some(plugin::app::ActivePreset {
+            index: 5,
+            name: "Stale".to_string(),
+        }));
+
+        let parsed = resolved_query_for(&mut app, Some(dir.path()));
+
+        assert_eq!(
+            parsed.filters,
+            vec![plugin::query::FilterTerm::Priority {
+                op: plugin::query::PriorityOp::Ge,
+                value: plugin::query::Priority::new(2).unwrap(),
+            }]
+        );
+        assert_eq!(app.active_preset(), None);
+        // Review fix: this used to fall back silently — the doc comment on
+        // `resolved_query_for` already claimed a status banner appears here, but no
+        // `set_status` call actually existed. The user has no other way to learn why
+        // their active preset's name just vanished from the title.
+        let status = app.status().expect("a removed preset should set a status");
+        assert!(status.is_error());
+        assert!(status.text().contains("Stale"));
+    }
+
+    #[test]
+    fn resolved_query_for_refreshes_the_active_presets_stale_name_when_the_list_is_reordered() {
+        // Review fix: `config.toml` reordered — not shrunk — since "Urgent" (index 0) was
+        // activated. `index` alone is no longer proof this is the same preset the user
+        // meant; the query actually applied is whatever now lives at that index, and the
+        // title (driven by `app.active_preset()`) must say so rather than keep showing
+        // the stale "Urgent" label over a different query.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[[filter_presets]]\nname = \"In Review\"\nquery = \"sort:created\"\n\n\
+             [[filter_presets]]\nname = \"Urgent\"\nquery = \"priority:>=2\"\n",
+        )
+        .unwrap();
+        let mut app = plugin::app::App::new();
+        app.enter_selected_menu_option();
+        app.set_active_preset(Some(plugin::app::ActivePreset {
+            index: 0,
+            name: "Urgent".to_string(),
+        }));
+
+        let parsed = resolved_query_for(&mut app, Some(dir.path()));
+
+        // The query actually applied is "In Review"'s (whatever now sits at index 0), not
+        // a merge and not the stale "Urgent" query.
+        assert_eq!(
+            parsed.sort_keys,
+            vec![plugin::query::SortKey {
+                field: plugin::query::SortField::Created,
+                ascending: true,
+            }]
+        );
+        assert!(parsed.filters.is_empty());
+        // And the displayed name is corrected to match what was actually applied.
+        assert_eq!(
+            app.active_preset(),
+            Some(&plugin::app::ActivePreset {
+                index: 0,
+                name: "In Review".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn resolved_query_for_leaves_the_active_preset_untouched_when_its_name_still_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[[filter_presets]]\nname = \"Urgent\"\nquery = \"priority:>=2\"\n",
+        )
+        .unwrap();
+        let mut app = plugin::app::App::new();
+        app.enter_selected_menu_option();
+        app.set_active_preset(Some(plugin::app::ActivePreset {
+            index: 0,
+            name: "Urgent".to_string(),
+        }));
+
+        resolved_query_for(&mut app, Some(dir.path()));
+
+        assert_eq!(
+            app.active_preset(),
+            Some(&plugin::app::ActivePreset {
+                index: 0,
+                name: "Urgent".to_string(),
+            })
+        );
+    }
+
+    // TF-647 review fix: `apply_cycle_preset` — the pure core of `Action::CyclePreset`'s
+    // event_loop handling, extracted so it's directly testable without driving the
+    // terminal-coupled event loop itself.
+
+    #[test]
+    fn apply_cycle_preset_clears_a_stale_active_preset_when_the_list_becomes_empty() {
+        // The bug this closes: cycling used to be gated on `!presets.is_empty()`, so once
+        // a preset's last remaining config.toml entry was deleted, `p` did nothing at
+        // all — the stale `active_preset` (and its bracketed name in the title) was stuck
+        // forever, with no in-app way to clear it short of leaving and re-entering the view.
+        let mut app = plugin::app::App::new();
+        app.set_active_preset(Some(plugin::app::ActivePreset {
+            index: 0,
+            name: "Urgent".to_string(),
+        }));
+
+        let refetch =
+            apply_cycle_preset(&mut app, &plugin::config::ResolvedFilterPresets::default());
+
+        assert!(refetch, "clearing a stale preset must trigger a refetch");
+        assert_eq!(app.active_preset(), None);
+    }
+
+    #[test]
+    fn apply_cycle_preset_is_a_silent_no_op_when_nothing_is_configured() {
+        // TF-647's AC: zero `[[filter_presets]]` entries (none dropped either) → `p` does
+        // nothing, no status, no refetch.
+        let mut app = plugin::app::App::new();
+
+        let refetch =
+            apply_cycle_preset(&mut app, &plugin::config::ResolvedFilterPresets::default());
+
+        assert!(!refetch);
+        assert_eq!(app.active_preset(), None);
+        assert!(app.status().is_none());
+    }
+
+    #[test]
+    fn apply_cycle_preset_surfaces_a_status_when_every_configured_entry_was_malformed() {
+        // Distinct from the "nothing configured" case above: entries exist but all got
+        // dropped (blank name/query, likely a typo) — telling the two apart is the whole
+        // point of `ResolvedFilterPresets::dropped`.
+        let mut app = plugin::app::App::new();
+        let resolved = plugin::config::ResolvedFilterPresets {
+            presets: Vec::new(),
+            dropped: 2,
+        };
+
+        let refetch = apply_cycle_preset(&mut app, &resolved);
+
+        assert!(!refetch);
+        let status = app.status().expect("malformed entries should set a status");
+        assert!(status.is_error());
+        assert!(status.text().contains('2'));
+    }
+
+    #[test]
+    fn apply_cycle_preset_advances_to_the_next_preset_and_reports_a_refetch() {
+        let mut app = plugin::app::App::new();
+        let resolved = plugin::config::ResolvedFilterPresets {
+            presets: vec![crate::plugin::config::FilterPreset {
+                name: "Urgent".to_string(),
+                query: "priority:>=2".to_string(),
+            }],
+            dropped: 0,
+        };
+
+        let refetch = apply_cycle_preset(&mut app, &resolved);
+
+        assert!(refetch);
+        assert_eq!(
+            app.active_preset(),
+            Some(&plugin::app::ActivePreset {
+                index: 0,
+                name: "Urgent".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn resolved_query_for_surfaces_malformed_toml_for_filter_presets_as_a_status_banner() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), "this is [invalid toml\n").unwrap();
+        let mut app = plugin::app::App::new();
+        app.enter_selected_menu_option();
+        app.set_active_preset(Some(plugin::app::ActivePreset {
+            index: 0,
+            name: "Urgent".to_string(),
+        }));
+
+        let parsed = resolved_query_for(&mut app, Some(dir.path()));
+
+        assert!(parsed.filters.is_empty());
+        assert!(parsed.sort_keys.is_empty());
+        let status = app
+            .status()
+            .expect("malformed config.toml should set a status");
+        assert!(status.is_error());
+        assert!(status.text().contains("filter presets"));
+    }
+
     /// A `herdr` fake script that dispatches on `$1 $2` so [`implement_one`]'s whole
     /// `tab_create` → `pane_run` → `agent_wait` → `agent_rename` → `agent_prompt` sequence can be
     /// driven from a single process, each branch supplying its own canned `echo '{...}'; exit N`.
@@ -2102,10 +3891,37 @@ exit 1
             r#"
 case "$1 $2" in
   "tab create") {tab_create} ;;
+  "agent get") echo '{{"result":{{"agent":{{"agent":"claude"}}}}}}'; exit 0 ;;
   "pane run") {pane_run} ;;
   "agent wait") {agent_wait} ;;
   "agent rename") {agent_rename} ;;
   "agent prompt") echo '{{"result":{{}}}}'; exit 0 ;;
+  "agent read") echo 'Implement Linear Issue TF-579 using a new git worktree'; exit 0 ;;
+  *)
+    echo '{{"error":{{"message":"unexpected herdr call: $1 $2"}}}}'
+    exit 1
+    ;;
+esac
+"#
+        ))
+    }
+
+    /// A sibling of [`write_dispatching_herdr_script`] (TF-669) for scripting `agent get`'s
+    /// response explicitly — everything else behaves like a normal successful run (`pane run`,
+    /// `agent wait --until idle`, `agent rename`, `agent prompt` all succeed; `agent read` reports
+    /// the prompt landed), so tests using this only need to describe the one behavior under test.
+    fn write_dispatching_herdr_script_with_agent_get(
+        agent_get: &str,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        write_fake_herdr_script(&format!(
+            r#"
+case "$1 $2" in
+  "tab create")
+    echo '{{"result":{{"tab":{{"tab_id":"t1","label":"TF-579"}},"root_pane":{{"pane_id":"p1"}}}}}}'
+    exit 0
+    ;;
+  "agent get") {agent_get} ;;
+  "pane run"|"agent wait"|"agent rename"|"agent prompt") echo '{{"result":{{}}}}'; exit 0 ;;
   "agent read") echo 'Implement Linear Issue TF-579 using a new git worktree'; exit 0 ;;
   *)
     echo '{{"error":{{"message":"unexpected herdr call: $1 $2"}}}}'
@@ -2269,8 +4085,17 @@ esac
         let client = herdr_linear::LinearClient::new("lin_api_test_key").unwrap();
         let issue = sample_issue("TF-579");
         let command = plugin::implement::ValidatedAgentCommand::parse("hr".to_string()).unwrap();
+        let (notify_tx, _notify_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let outcome = implement_one(script.to_str().unwrap(), &client, &issue, &command).await;
+        let outcome = implement_one(
+            script.to_str().unwrap(),
+            &client,
+            &issue,
+            &command,
+            &notify_tx,
+            |_| {},
+        )
+        .await;
 
         let ImplementOutcome::Failed(message) = outcome else {
             panic!("expected Failed, got {outcome:?}");
@@ -2297,8 +4122,17 @@ esac
         let client = herdr_linear::LinearClient::new("lin_api_test_key").unwrap();
         let issue = sample_issue("TF-579");
         let command = plugin::implement::ValidatedAgentCommand::parse("hr".to_string()).unwrap();
+        let (notify_tx, _notify_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let outcome = implement_one(script.to_str().unwrap(), &client, &issue, &command).await;
+        let outcome = implement_one(
+            script.to_str().unwrap(),
+            &client,
+            &issue,
+            &command,
+            &notify_tx,
+            |_| {},
+        )
+        .await;
 
         let ImplementOutcome::Failed(message) = outcome else {
             panic!("expected Failed, got {outcome:?}");
@@ -2310,6 +4144,56 @@ esac
         assert!(
             !message.contains("an empty"),
             "must not assert the tab is definitely empty: {message}"
+        );
+    }
+
+    /// TF-669 regression test: `implement_one` must confirm herdr recognizes a real, stable agent
+    /// in the pane (`agent_wait_for_start`) *before* it goes on to `agent_wait(..., "idle", ...)`
+    /// and the prompt-send dance — otherwise a multi-stage `agent_command` wrapper (like the `hr`
+    /// alias this ticket was filed against) can get the prompt injected into its own pre-agent
+    /// bootstrap output. Exercises the error-tolerance-exhausted path at the `implement_one`
+    /// integration level (message content and that the outcome is `Failed` at all — a dropped or
+    /// bypassed guard would let this script's otherwise-all-succeeding `agent_wait`/`agent_rename`/
+    /// `agent_prompt` stubs run instead, producing a non-`Failed` outcome and panicking the `let
+    /// else` below). The *exact* poll-count boundary for this same path is pinned directly and
+    /// fast by
+    /// `agent_wait_for_start_propagates_a_non_agent_not_found_error_after_the_tolerance_is_exhausted`
+    /// in `herdr_cli.rs`, and the full timeout path (a persistent `agent_not_found` rather than a
+    /// persistent error) by `agent_wait_for_start_times_out_when_no_agent_is_ever_recognized`
+    /// there too — this test doesn't need to re-pin either, so it stays quick: three
+    /// non-`agent_not_found` errors in a row exhaust `AGENT_START_POLL_ERROR_TOLERANCE` well
+    /// before any timeout would.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn implement_one_fails_when_the_agent_never_gets_recognized() {
+        let (_dir, script) = write_dispatching_herdr_script_with_agent_get(
+            r#"echo '{"error":{"message":"boom"}}' >&2; exit 1"#,
+        );
+        let client = herdr_linear::LinearClient::new("lin_api_test_key").unwrap();
+        let issue = sample_issue("TF-579");
+        let command = plugin::implement::ValidatedAgentCommand::parse("hr".to_string()).unwrap();
+        let (notify_tx, _notify_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let outcome = implement_one(
+            script.to_str().unwrap(),
+            &client,
+            &issue,
+            &command,
+            &notify_tx,
+            |_| {},
+        )
+        .await;
+
+        let ImplementOutcome::Failed(message) = outcome else {
+            panic!("expected Failed, got {outcome:?}");
+        };
+        assert!(
+            message.contains("herdr never confirmed the agent started") && message.contains("boom"),
+            "unexpected message: {message}"
+        );
+        assert!(
+            message.contains("Implement Linear Issue TF-579 using a new git worktree"),
+            "failure message should tell the user how to run the prompt manually: {message}"
         );
     }
 
@@ -2344,8 +4228,17 @@ esac
         );
         let issue = sample_issue("TF-579");
         let command = plugin::implement::ValidatedAgentCommand::parse("hr".to_string()).unwrap();
+        let (notify_tx, _notify_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let outcome = implement_one(script.to_str().unwrap(), &client, &issue, &command).await;
+        let outcome = implement_one(
+            script.to_str().unwrap(),
+            &client,
+            &issue,
+            &command,
+            &notify_tx,
+            |_| {},
+        )
+        .await;
 
         let ImplementOutcome::StartedWithWarnings(message) = outcome else {
             panic!("expected StartedWithWarnings, got {outcome:?}");
@@ -2370,8 +4263,9 @@ esac
         // load-bearing token this branch changed — TF-624), dropped the `--timeout` budget, or
         // renamed/reordered the wrong pane would pass every one of them while silently breaking
         // Implement-on-`<Enter>` against real herdr. This captures every call's full argv
-        // instead, exactly like `open_config_in_herdr_pane_threads_the_editor_cmd_and_cwd_into_
-        // the_cli_calls` does for the `c` keybinding.
+        // instead, mirroring `run_editor_command_passes_the_editor_command_and_config_path_to_
+        // spawn`'s identical "assert the exact call, not just that a call happened" discipline
+        // for the `c` keybinding's own (now herdr-free) editor hand-off.
         //
         // The workflow-state lookup is mocked to fail so the flow lands on
         // `StartedWithWarnings` without a live Linear endpoint — it issues no `herdr` call
@@ -2403,6 +4297,10 @@ case "$1 $2" in
     echo '{{"result":{{"tab":{{"tab_id":"t2","label":"TF-579"}},"root_pane":{{"pane_id":"p9"}}}}}}'
     exit 0
     ;;
+  "agent get")
+    echo '{{"result":{{"agent":{{"agent":"claude"}}}}}}'
+    exit 0
+    ;;
   "agent read")
     echo 'Implement Linear Issue TF-579 using a new git worktree'
     exit 0
@@ -2421,8 +4319,17 @@ esac
         ));
         let issue = sample_issue("TF-579");
         let command = plugin::implement::ValidatedAgentCommand::parse("hr".to_string()).unwrap();
+        let (notify_tx, _notify_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let outcome = implement_one(script.to_str().unwrap(), &client, &issue, &command).await;
+        let outcome = implement_one(
+            script.to_str().unwrap(),
+            &client,
+            &issue,
+            &command,
+            &notify_tx,
+            |_| {},
+        )
+        .await;
 
         let ImplementOutcome::StartedWithWarnings(message) = outcome else {
             panic!("expected StartedWithWarnings, got {outcome:?}");
@@ -2455,6 +4362,14 @@ esac
             rest,
             vec![
                 "CALL: pane run p9 hr",
+                // TF-669: `agent_wait_for_start` confirms the same agent identity on
+                // `AGENT_START_CONFIRM_POLLS` (3) consecutive polls before `implement_one` trusts
+                // `agent_wait`'s "idle" status enough to start the prompt-send dance — this
+                // script's `agent get` always answers "claude" immediately, so the count here is
+                // exactly that constant, not a timing-dependent range.
+                "CALL: agent get p9",
+                "CALL: agent get p9",
+                "CALL: agent get p9",
                 "CALL: agent wait p9 --until idle --timeout 30000",
                 "CALL: agent rename p9 hr--tf-579",
                 "CALL: agent prompt p9 Implement Linear Issue TF-579 using a new git worktree",
@@ -2464,6 +4379,320 @@ esac
         assert!(
             calls.contains(&"CALL: agent read p9 --source visible --lines 60"),
             "expected the prompt-stability poll to read the same pane: {captured}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn implement_one_forwards_on_prompt_attempt_through_a_resend() {
+        // Review gap: every other `implement_one` test above passes a no-op `|_| {}`, and the
+        // one test that exercises `send_prompt_until_visible_with`'s `on_attempt` hook directly
+        // (`send_prompt_until_visible_resends_after_an_attempt_times_out`) calls that function
+        // directly, bypassing `implement_one` entirely — so nothing actually proved
+        // `implement_one`'s own forwarding closure (which wraps a caller's `on_progress` into
+        // `send_prompt_until_visible`'s `|attempt, attempts| on_progress(PromptAttempt { .. })`)
+        // passes a caller's real callback through unmodified. A regression that dropped the
+        // forward, or swapped the argument order, would compile and pass every other test here.
+        //
+        // This drives `implement_one` through a genuine resend (the fake script's `agent read`
+        // only reports the prompt landed once `agent prompt` has been called twice) and asserts
+        // the caller's callback saw both attempts, in order, with the correct total — using real
+        // `PROMPT_SEND_*` timing (via `send_prompt_until_visible`, not `_with`), since
+        // `implement_one` has no way to inject faster test constants. Attempt 1 burns the full
+        // `PROMPT_SEND_ATTEMPT_TIMEOUT` before giving up, so this test takes several real seconds
+        // — mirroring `implement_one_threads_the_expected_flags_into_every_herdr_cli_call`'s own
+        // "just over 2s" acceptance of real stability-window timing above.
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({"data": null, "errors": [{"message": "workflow states unavailable"}]})
+                    .to_string(),
+            )
+            .create_async()
+            .await;
+        let client = herdr_linear::LinearClient::with_endpoint(
+            "lin_api_test",
+            format!("{}/graphql", server.url()),
+        )
+        .unwrap();
+        let (_dir, script) = write_fake_herdr_script(
+            r#"
+case "$1 $2" in
+  "tab create")
+    echo '{"result":{"tab":{"tab_id":"t9","label":"TF-579"},"root_pane":{"pane_id":"p9"}}}'
+    exit 0
+    ;;
+  "agent get")
+    echo '{"result":{"agent":{"agent":"claude"}}}'
+    exit 0
+    ;;
+  "pane run"|"agent wait"|"agent rename")
+    echo '{"result":{}}'
+    exit 0
+    ;;
+  "agent prompt")
+    script_dir=$(dirname "$0")
+    count_file="$script_dir/send_count"
+    n=0
+    [ -f "$count_file" ] && n=$(cat "$count_file")
+    echo $((n + 1)) > "$count_file"
+    echo '{"result":{}}'
+    exit 0
+    ;;
+  "agent read")
+    script_dir=$(dirname "$0")
+    count_file="$script_dir/send_count"
+    n=0
+    [ -f "$count_file" ] && n=$(cat "$count_file")
+    if [ "$n" -ge 2 ]; then
+      echo 'Implement Linear Issue TF-579 using a new git worktree'
+    else
+      echo '(waiting for the agent to start...)'
+    fi
+    exit 0
+    ;;
+  *)
+    echo '{"error":{"message":"unexpected herdr call: $1 $2"}}'
+    exit 1
+    ;;
+esac
+"#,
+        );
+        let issue = sample_issue("TF-579");
+        let command = plugin::implement::ValidatedAgentCommand::parse("hr".to_string()).unwrap();
+        let seen_attempts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_attempts_for_callback = std::sync::Arc::clone(&seen_attempts);
+        let (notify_tx, _notify_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let outcome = implement_one(
+            script.to_str().unwrap(),
+            &client,
+            &issue,
+            &command,
+            &notify_tx,
+            move |progress| {
+                if let ImplementProgress::PromptAttempt { attempt, attempts } = progress {
+                    seen_attempts_for_callback
+                        .lock()
+                        .unwrap()
+                        .push((attempt, attempts));
+                }
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, ImplementOutcome::StartedWithWarnings(_)),
+            "expected StartedWithWarnings (the mocked workflow-state failure), got {outcome:?}"
+        );
+        // Asserted against the whole vector, not just first()/get(1) — stronger than checking
+        // each position individually, since it also catches a spurious extra callback (e.g. a
+        // duplicate forward) that per-index checks alone would miss.
+        assert_eq!(
+            *seen_attempts.lock().unwrap(),
+            vec![(1, PROMPT_SEND_ATTEMPTS), (2, PROMPT_SEND_ATTEMPTS)],
+            "implement_one must forward the caller's callback for both attempt 1 and the resend \
+             (attempt 2), in order, proving it's the caller's real closure and not a \
+             dropped/no-op forward"
+        );
+    }
+
+    /// [`close_tab_once_agent_has_exited`] is tested directly (awaited to completion) rather than
+    /// through [`spawn_tab_close_when_agent_has_exited`]'s `tokio::spawn` — a fire-and-forget task
+    /// spawned from a synchronous tail with no further `.await` in between (as `implement_one`'s
+    /// call site is) has no guaranteed opportunity to actually run before a `#[tokio::test]`'s
+    /// single-threaded runtime tears down at the end of the test function, making it an unreliable
+    /// thing to assert on directly (TF-649).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn close_tab_once_agent_has_exited_closes_the_tab_once_the_agent_is_gone() {
+        let capture_dir = tempfile::tempdir().unwrap();
+        let close_args_file = capture_dir.path().join("close_args.txt");
+        let (_dir, script) = write_fake_herdr_script(&format!(
+            r#"
+case "$1 $2" in
+  "tab create")
+    echo '{{"result":{{"tab":{{"tab_id":"t1","label":"TF-649"}},"root_pane":{{"pane_id":"p1"}}}}}}'
+    exit 0
+    ;;
+  "agent get")
+    echo '{{"error":{{"code":"agent_not_found","message":"agent target p1 not found"}}}}' >&2
+    exit 1
+    ;;
+  "tab close")
+    printf '%s\n' "$@" > "{}"
+    echo '{{"result":{{}}}}'
+    exit 0
+    ;;
+  *)
+    echo '{{"error":{{"message":"unexpected herdr call: $1 $2"}}}}'
+    exit 1
+    ;;
+esac
+"#,
+            close_args_file.display()
+        ));
+
+        let tab = plugin::herdr_cli::tab_create(
+            script.to_str().unwrap(),
+            std::path::Path::new("/tmp"),
+            "TF-649",
+        )
+        .await
+        .expect("tab_create should succeed");
+
+        let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel();
+        close_tab_once_agent_has_exited(
+            script.to_str().unwrap(),
+            "TF-649",
+            &tab,
+            5_000,
+            std::time::Duration::from_millis(5),
+            &notify_tx,
+        )
+        .await;
+
+        let captured = std::fs::read_to_string(&close_args_file)
+            .expect("close_tab_once_agent_has_exited should have closed the tab");
+        let args: Vec<&str> = captured.lines().collect();
+        assert_eq!(args, vec!["tab", "close", "t1"]);
+
+        // TF-653: closing the tab must be paired with a notice `event_loop` can turn into a
+        // status banner — otherwise this is exactly TF-641/TF-642's silent-disappearance bug.
+        assert_eq!(
+            notify_rx.try_recv(),
+            Ok(tab_auto_closed_status("TF-649")),
+            "a successful auto-close must notify so the plugin can show it happened"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn close_tab_once_agent_has_exited_leaves_the_tab_open_when_the_exit_poll_fails() {
+        let capture_dir = tempfile::tempdir().unwrap();
+        let close_marker = capture_dir.path().join("tab_close_was_called");
+        let (_dir, script) = write_fake_herdr_script(&format!(
+            r#"
+case "$1 $2" in
+  "tab create")
+    echo '{{"result":{{"tab":{{"tab_id":"t1","label":"TF-649"}},"root_pane":{{"pane_id":"p1"}}}}}}'
+    exit 0
+    ;;
+  "agent get")
+    echo '{{"error":{{"message":"pane not found"}}}}'
+    exit 1
+    ;;
+  "tab close")
+    touch "{}"
+    echo '{{"result":{{}}}}'
+    exit 0
+    ;;
+  *)
+    echo '{{"error":{{"message":"unexpected herdr call: $1 $2"}}}}'
+    exit 1
+    ;;
+esac
+"#,
+            close_marker.display()
+        ));
+
+        let tab = plugin::herdr_cli::tab_create(
+            script.to_str().unwrap(),
+            std::path::Path::new("/tmp"),
+            "TF-649",
+        )
+        .await
+        .expect("tab_create should succeed");
+
+        // The exit poll fails on its very first attempt: "pane not found" doesn't carry the
+        // `agent_not_found` code, so `agent_wait_for_exit` propagates it immediately instead of
+        // treating it as "the agent exited" — see `herdr_cli.rs`'s own tests for that
+        // classification. This exercises the fail-open path without burning the timeout budget.
+        let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel();
+        close_tab_once_agent_has_exited(
+            script.to_str().unwrap(),
+            "TF-649",
+            &tab,
+            5_000,
+            std::time::Duration::from_millis(5),
+            &notify_tx,
+        )
+        .await;
+
+        assert!(
+            !close_marker.exists(),
+            "tab close must never run once the exit poll has failed (fail-open, TF-649)"
+        );
+        // TF-653: the fail-open path must stay silent — a notice here would falsely claim
+        // "finished" for a tab that's actually still open because nothing closed it.
+        assert!(
+            notify_rx.try_recv().is_err(),
+            "the exit poll failing must not send an auto-closed notice"
+        );
+    }
+
+    /// The other half of `close_tab_once_agent_has_exited`'s fail-open contract: the agent really
+    /// did exit, but the subsequent `tab_close` call itself fails (already closed, herdr
+    /// restarted mid-wait, ...). Must not panic — the failure is swallowed (logged at `debug!`,
+    /// per the function's own doc), leaving the tab exactly as it is, same as the exit-poll-fails
+    /// case above.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn close_tab_once_agent_has_exited_does_not_panic_when_tab_close_fails_after_the_agent_exits(
+    ) {
+        let (_dir, script) = write_fake_herdr_script(
+            r#"
+case "$1 $2" in
+  "tab create")
+    echo '{"result":{"tab":{"tab_id":"t1","label":"TF-649"},"root_pane":{"pane_id":"p1"}}}'
+    exit 0
+    ;;
+  "agent get")
+    echo '{"error":{"code":"agent_not_found","message":"agent target p1 not found"}}' >&2
+    exit 1
+    ;;
+  "tab close")
+    echo '{"error":{"message":"no such tab"}}'
+    exit 1
+    ;;
+  *)
+    echo '{"error":{"message":"unexpected herdr call: $1 $2"}}'
+    exit 1
+    ;;
+esac
+"#,
+        );
+
+        let tab = plugin::herdr_cli::tab_create(
+            script.to_str().unwrap(),
+            std::path::Path::new("/tmp"),
+            "TF-649",
+        )
+        .await
+        .expect("tab_create should succeed");
+
+        // Reaching this line at all (rather than the test process aborting on an unwind through
+        // an `.await` point, or a `#[tokio::test]` failure from a panicking task) is the
+        // assertion: a `tab_close` error after the agent has genuinely exited must be swallowed,
+        // not propagated or panicked on.
+        let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel();
+        close_tab_once_agent_has_exited(
+            script.to_str().unwrap(),
+            "TF-649",
+            &tab,
+            5_000,
+            std::time::Duration::from_millis(5),
+            &notify_tx,
+        )
+        .await;
+        // TF-653: `tab_close` failing must stay silent too — the tab is still open, so a
+        // "finished, tab closed" notice would be actively wrong.
+        assert!(
+            notify_rx.try_recv().is_err(),
+            "a failed tab_close must not send an auto-closed notice"
         );
     }
 
@@ -2571,11 +4800,18 @@ esac
             .map(|i| sample_issue(&format!("TF-{i}")))
             .collect();
         let command = plugin::implement::ValidatedAgentCommand::parse("hr".to_string()).unwrap();
+        let (notify_tx, _notify_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let started = std::time::Instant::now();
         let results = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            implement_many(script.to_str().unwrap(), &client, issues, &command),
+            implement_many(
+                script.to_str().unwrap(),
+                &client,
+                issues,
+                &command,
+                &notify_tx,
+            ),
         )
         .await
         .expect("implement_many hung");
@@ -2686,8 +4922,13 @@ esac
             .await
             .expect("stub tab_create must succeed");
 
-        let outcome =
-            send_prompt_until_visible(script.to_str().unwrap(), &tab.root_pane_id, &prompt).await;
+        let outcome = send_prompt_until_visible(
+            script.to_str().unwrap(),
+            &tab.root_pane_id,
+            &prompt,
+            |_, _| {},
+        )
+        .await;
 
         assert_eq!(
             outcome,
@@ -2797,8 +5038,21 @@ esac
         // Review gap: send_prompt_until_visible's cross-attempt retry logic (does a timed-out
         // attempt actually trigger a resend, and can a later attempt succeed?) had no test at
         // all. `write_prompt_send_lands_on_attempt_script` switches on the `agent prompt` count
-        // rather than the `agent read` count so this isn't sensitive to how many polls either
-        // attempt actually takes.
+        // rather than the `agent read` count so which text a given poll sees isn't sensitive to
+        // how many polls either attempt actually takes.
+        //
+        // The *durations* below still are, though — unlike the other `wait_for_prompt_stable`/
+        // `send_prompt_until_visible_with` tests in this file, this is the one case that needs
+        // attempt 2 to actually *reach* `stability_duration` (not just eventually time out),
+        // which means enough real reads have to land inside `attempt_timeout` — and each read is
+        // a genuine subprocess spawn (`write_fake_herdr_script`'s `sh`), not a free poll. The
+        // original `5ms`/`20ms`/`30ms` gave a real CI runner under load essentially no margin for
+        // that spawn latency: observed flaking in CI (`Test (beta)`, not reproducible locally)
+        // with `attempt 2: ... appeared but then disappeared before it stuck` — the generic
+        // `TimedOut`-with-`ever_landed` message, meaning attempt 2's own reads never accumulated
+        // a full unbroken `stability_duration` before its own `attempt_timeout` cut it off, not
+        // that the prompt actually flickered. Widened with real headroom for subprocess spawn
+        // jitter under load, while staying well under a second overall.
         let prompt = plugin::implement::build_implement_prompt("TF-579");
         let landed = format!("❯ {prompt}\n");
         let empty = "❯ \n";
@@ -2807,14 +5061,29 @@ esac
             .await
             .expect("stub tab_create must succeed");
 
+        // Also captures every `on_attempt` call — this is the one test in this group that
+        // actually reaches a second attempt, so it's the natural seam to confirm the progress
+        // hook fires once per (re)send, with the right (attempt, attempts) pair each time,
+        // rather than only being exercised indirectly through `implement_one`'s forwarding.
+        let seen_attempts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_attempts_for_callback = std::sync::Arc::clone(&seen_attempts);
+
         let outcome = send_prompt_until_visible_with(
             script.to_str().unwrap(),
             &tab.root_pane_id,
             &prompt,
-            2,
-            std::time::Duration::from_millis(5),
-            std::time::Duration::from_millis(20),
-            std::time::Duration::from_millis(30),
+            PromptSendPolicy {
+                attempts: 2,
+                poll_interval: std::time::Duration::from_millis(10),
+                stability_duration: std::time::Duration::from_millis(50),
+                attempt_timeout: std::time::Duration::from_millis(150),
+            },
+            move |attempt, attempts| {
+                seen_attempts_for_callback
+                    .lock()
+                    .unwrap()
+                    .push((attempt, attempts));
+            },
         )
         .await;
 
@@ -2822,6 +5091,11 @@ esac
             outcome,
             Ok(()),
             "attempt 2 must succeed after attempt 1 times out"
+        );
+        assert_eq!(
+            *seen_attempts.lock().unwrap(),
+            vec![(1, 2), (2, 2)],
+            "on_attempt must fire once per (re)send, in order, before that attempt's own send"
         );
     }
 
@@ -2843,10 +5117,13 @@ esac
             script.to_str().unwrap(),
             &tab.root_pane_id,
             &prompt,
-            2,
-            std::time::Duration::from_millis(5),
-            std::time::Duration::from_millis(20),
-            std::time::Duration::from_millis(30),
+            PromptSendPolicy {
+                attempts: 2,
+                poll_interval: std::time::Duration::from_millis(5),
+                stability_duration: std::time::Duration::from_millis(20),
+                attempt_timeout: std::time::Duration::from_millis(30),
+            },
+            |_, _| {},
         )
         .await;
 
@@ -2854,5 +5131,57 @@ esac
             outcome,
             Err("attempt 2: the implement command never appeared in the pane".to_string())
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[should_panic(expected = "PromptSendPolicy::attempts must be at least 1")]
+    async fn send_prompt_until_visible_with_asserts_attempts_is_at_least_one() {
+        // Review gap: the `debug_assert!`s guarding `PromptSendPolicy`'s invariants (added
+        // alongside the `const _: () = assert!(...)` right after the `PROMPT_SEND_*` constants,
+        // which covers the one real call site unconditionally) had nothing proving they actually
+        // fire — a typo in either condition would have passed every other test in this file.
+        let (dir, script) = write_prompt_read_always_script("echo '❯ \n'; exit 0");
+        let tab = plugin::herdr_cli::tab_create(script.to_str().unwrap(), dir.path(), "TF-579")
+            .await
+            .expect("stub tab_create must succeed");
+
+        let _ = send_prompt_until_visible_with(
+            script.to_str().unwrap(),
+            &tab.root_pane_id,
+            "irrelevant — must panic before ever sending it",
+            PromptSendPolicy {
+                attempts: 0,
+                poll_interval: std::time::Duration::from_millis(5),
+                stability_duration: std::time::Duration::from_millis(20),
+                attempt_timeout: std::time::Duration::from_millis(30),
+            },
+            |_, _| {},
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[should_panic(expected = "PromptSendPolicy::attempt_timeout must exceed stability_duration")]
+    async fn send_prompt_until_visible_with_asserts_attempt_timeout_exceeds_stability_duration() {
+        let (dir, script) = write_prompt_read_always_script("echo '❯ \n'; exit 0");
+        let tab = plugin::herdr_cli::tab_create(script.to_str().unwrap(), dir.path(), "TF-579")
+            .await
+            .expect("stub tab_create must succeed");
+
+        let _ = send_prompt_until_visible_with(
+            script.to_str().unwrap(),
+            &tab.root_pane_id,
+            "irrelevant — must panic before ever sending it",
+            PromptSendPolicy {
+                attempts: 2,
+                poll_interval: std::time::Duration::from_millis(5),
+                stability_duration: std::time::Duration::from_millis(30),
+                attempt_timeout: std::time::Duration::from_millis(30),
+            },
+            |_, _| {},
+        )
+        .await;
     }
 }

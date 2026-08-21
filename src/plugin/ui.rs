@@ -2,9 +2,10 @@
 //! message with a retry hint, or a two-pane issue list + detail view.
 
 use crate::plugin::app::{
-    matching_issue_indices, App, HelpOverlayState, HelpTab, Screen, Status, ViewKind, ViewState,
-    MENU_OPTIONS,
+    matching_issue_indices, ActivePreset, App, CommentState, HelpOverlayState, HelpTab, Screen,
+    Status, ViewKind, ViewState, MENU_OPTIONS,
 };
+use crate::Issue;
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
@@ -17,7 +18,9 @@ use unicode_width::UnicodeWidthChar;
 pub fn draw(frame: &mut Frame, app: &App) {
     match app.screen() {
         Screen::Menu { selected } => draw_menu(frame, *selected),
-        Screen::View(kind, view_state) => draw_view(frame, *kind, view_state, app.status()),
+        Screen::View(kind, view_state) => {
+            draw_view(frame, *kind, view_state, app.status(), app.active_preset())
+        }
     }
     if let Some(overlay) = app.help_overlay() {
         draw_help_overlay(frame, overlay);
@@ -88,6 +91,14 @@ const STATUS_BANNER_MAX_HEIGHT: u16 = 10;
 /// for one short message, not TF-590's multi-issue failure banner, which can carry one
 /// `"<identifier>: <message>"` segment per failed issue.
 fn status_banner_height(text: &str, width: u16) -> u16 {
+    estimated_banner_lines(text, width).clamp(STATUS_BANNER_MIN_HEIGHT, STATUS_BANNER_MAX_HEIGHT)
+}
+
+/// The unclamped estimate `status_banner_height` clamps into `[STATUS_BANNER_MIN_HEIGHT,
+/// STATUS_BANNER_MAX_HEIGHT]`, exposed separately so a caller that deliberately wants a taller
+/// banner than that range — see [`comment_banner_height`] — can still size against the same
+/// conservative estimate rather than reimplementing it.
+fn estimated_banner_lines(text: &str, width: u16) -> u16 {
     if width == 0 {
         return STATUS_BANNER_MIN_HEIGHT;
     }
@@ -97,11 +108,29 @@ fn status_banner_height(text: &str, width: u16) -> u16 {
     // otherwise wrap `as u16` around to a small number and *under*-estimate, which is exactly
     // the failure mode this function's own doc says it deliberately avoids.
     let chars = text.chars().count().min(u16::MAX as usize) as u16;
-    let estimated = chars.div_ceil(width).saturating_add(2);
-    estimated.clamp(STATUS_BANNER_MIN_HEIGHT, STATUS_BANNER_MAX_HEIGHT)
+    chars.div_ceil(width).saturating_add(2)
 }
 
-fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState, status: Option<&Status>) {
+/// Like [`status_banner_height`], but for the comment-draft banner specifically (PR #53
+/// review fix): a comment is free-form user text the user is actively typing, not a short
+/// status/error message, so clamping it to `STATUS_BANNER_MAX_HEIGHT` (10 rows) silently
+/// scrolled the live cursor off-screen past ~a few sentences — the opposite of what a text
+/// composer needs. Grows up to roughly half the terminal height instead (still leaving the
+/// list/detail panes below their own `Constraint::Min(3)` floor), and `draw_view`'s caller
+/// additionally scrolls the `Paragraph` for the rare draft that's still too long even for
+/// that generous cap, rather than relying on height alone.
+fn comment_banner_height(text: &str, width: u16, terminal_height: u16) -> u16 {
+    let generous_max = (terminal_height / 2).max(STATUS_BANNER_MIN_HEIGHT);
+    estimated_banner_lines(text, width).clamp(STATUS_BANNER_MIN_HEIGHT, generous_max)
+}
+
+fn draw_view(
+    frame: &mut Frame,
+    kind: ViewKind,
+    view_state: &ViewState,
+    status: Option<&Status>,
+    active_preset: Option<&ActivePreset>,
+) {
     match view_state {
         ViewState::Loading => {
             let paragraph = Paragraph::new("Loading issues...")
@@ -125,8 +154,61 @@ fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState, status: 
             selected,
             marked,
             filter,
+            comment,
+            detail_scroll,
         } => {
-            let area = if let Some(status) = status {
+            // `selected` indexes this filtered subset, not `issues` directly — see
+            // `matching_issue_indices`'s doc comment and `App::selected_issue`, which the
+            // detail pane below mirrors exactly so the two can never disagree about which
+            // issue is highlighted. Computed once, up here, rather than at each call site,
+            // so there's exactly one place that answers "which issue is selected". The
+            // comment-draft banner (TF-648) deliberately does *not* read from this — see
+            // `CommentState::Editing`'s doc — it renders whichever issue its own draft was
+            // captured against instead, precisely so it can't be swayed by this.
+            let matched_indices = matching_issue_indices(issues, &filter.query);
+            let selected_issue = matched_indices
+                .get(*selected)
+                .and_then(|&index| issues.get(index));
+
+            let area = if let CommentState::Editing { issue, body } = comment {
+                // TF-648: while composing a comment, the banner area shows the live
+                // draft instead of any stale `status` — the same live-cursor (`▏`)
+                // convention the `/`-filter uses in the list title below, just in the
+                // banner rather than the title, since (unlike the filter query) the
+                // draft has no live effect on the list itself to show inline. `issue`
+                // is the target captured once when `m` was pressed
+                // (`App::start_commenting`) and read from the draft itself rather than
+                // re-resolved from `selected_issue` — so this banner (and what
+                // `App::confirm_comment` actually posts to) can never disagree with
+                // each other, even if some input path moves the selection afterward
+                // (PR #53 review: this used to be possible via the mouse wheel).
+                let draft = format!(
+                    "Comment on {} (Enter to send, Esc to cancel): {body}▏",
+                    issue.identifier
+                );
+                // Comment drafts are free-form text, not a short status message, so this
+                // grows well past `STATUS_BANNER_MAX_HEIGHT` (see `comment_banner_height`'s
+                // doc) — and, for the rare draft that's still too long even for that
+                // generous cap, scrolls so the tail (including the live cursor) stays
+                // visible instead of silently rendering off the bottom of the banner
+                // (PR #53 review fix for the original hard-clipped, unscrolled banner).
+                let banner_height =
+                    comment_banner_height(&draft, frame.area().width, frame.area().height);
+                let total_lines = estimated_banner_lines(&draft, frame.area().width);
+                let scroll_y = total_lines.saturating_sub(banner_height);
+                let outer = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(3), Constraint::Length(banner_height)])
+                    .split(frame.area());
+                frame.render_widget(
+                    Paragraph::new(draft)
+                        .style(Style::default().fg(Color::Cyan))
+                        .wrap(Wrap { trim: false })
+                        .scroll((scroll_y, 0)),
+                    outer[1],
+                );
+                outer[0]
+            } else if let Some(status) = status {
                 let banner_height = status_banner_height(status.text(), frame.area().width);
                 let outer = Layout::default()
                     .direction(Direction::Vertical)
@@ -158,18 +240,39 @@ fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState, status: 
                 .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .split(area);
 
-            // `selected` indexes this filtered subset, not `issues` directly — see
-            // `matching_issue_indices`'s doc comment and `App::selected_issue`, which the
-            // detail pane below mirrors exactly so the two panes never disagree about
-            // which issue is highlighted.
-            let matched_indices = matching_issue_indices(issues, &filter.query);
-
             // `▏` marks the live cursor position while editing, so it's visually
             // distinct from a confirmed-but-inactive filter shown without one.
-            let list_title = match (filter.editing, filter.query.is_empty()) {
-                (true, _) => format!("{} — filter: {}▏", kind.label(), filter.query),
-                (false, true) => kind.label().to_string(),
-                (false, false) => format!("{} — filter: {}", kind.label(), filter.query),
+            let list_title = {
+                // TF-647: the active named filter preset's name, folded into the label
+                // right next to the view name — the same visibility the `/`-filter query
+                // text already gets below, just for the *other* way a fetch's query can
+                // differ from the plain (unnamed, never shown) `default_query`.
+                let label = match active_preset {
+                    Some(preset) => format!("{} [{}]", kind.label(), preset.name),
+                    None => kind.label().to_string(),
+                };
+                let base = match (filter.editing, filter.query.is_empty()) {
+                    (true, _) => format!("{label} — filter: {}▏", filter.query),
+                    (false, true) => label,
+                    (false, false) => format!("{label} — filter: {}", filter.query),
+                };
+                // TF-617 review fix: `matching_issue_indices` silently falls back to a
+                // free-text search for a recognized-but-malformed `key:value` term (e.g.
+                // `priority:notanumber`) — `ParsedQuery::rejected` exists precisely to
+                // surface that, but had no caller before this. Re-parsing `filter.query`
+                // here (cheap — same pure function `matching_issue_indices` itself just
+                // ran, on a short string) lets a typo be visible in the title instead of
+                // just producing a quietly-wrong match list.
+                let rejected = if filter.query.is_empty() {
+                    Vec::new()
+                } else {
+                    crate::plugin::query::parse_query(&filter.query).rejected
+                };
+                if rejected.is_empty() {
+                    base
+                } else {
+                    format!("{base} (⚠ not recognized: {})", rejected.join(", "))
+                }
             };
 
             let items: Vec<ListItem> = if matched_indices.is_empty() && !issues.is_empty() {
@@ -207,9 +310,6 @@ fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState, status: 
             let detail_area = detail_block.inner(chunks[1]);
             frame.render_widget(detail_block, chunks[1]);
 
-            let selected_issue = matched_indices
-                .get(*selected)
-                .and_then(|&index| issues.get(index));
             if let Some(issue) = selected_issue {
                 // Header (identifier/title/Status/Assignee/Project) and body
                 // (the Markdown description) are rendered as one continuous
@@ -221,36 +321,7 @@ fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState, status: 
                 // without depending on ratatui's unstable line-counting API.
                 // A single scrollable block sidesteps that entirely: nothing
                 // downstream of the title can be clipped by it.
-                let assignee = issue
-                    .assignee
-                    .as_ref()
-                    .map(|user| user.name.as_str())
-                    .unwrap_or("Unassigned");
-                let project = issue
-                    .project
-                    .as_ref()
-                    .map(|project| project.name.as_str())
-                    .unwrap_or("None");
-
-                let mut lines = vec![
-                    Line::from(issue.identifier.as_str()),
-                    Line::from(""),
-                    Line::from(issue.title.as_str()),
-                    Line::from(""),
-                    Line::from(format!("Status: {}", issue.state.name)),
-                    Line::from(format!("Assignee: {assignee}")),
-                    Line::from(format!("Project: {project}")),
-                    Line::from(""),
-                ];
-
-                let description = issue.description.as_deref().unwrap_or_default();
-                let options = tui_markdown::Options::new(MarkdownStyleSheet);
-                let markdown_lines =
-                    tui_markdown::from_str_with_options(description, &options).lines;
-                lines.extend(harden_list_item_wrapping(
-                    &markdown_lines,
-                    detail_area.width as usize,
-                ));
+                let lines = build_detail_lines(issue, detail_area.width as usize);
 
                 let sections = Layout::default()
                     .direction(Direction::Vertical)
@@ -262,7 +333,13 @@ fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState, status: 
                 // indented code — `trim: true` would strip it and flatten that
                 // structure away. The header lines above have no leading
                 // whitespace to begin with, so this is harmless for them.
-                let body = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+                // `.scroll` applies `App::detail_scroll` — moved by the `j`/`k`
+                // keybindings in `handle_key` — so a description too long for
+                // `sections[0]` is reachable instead of being silently clipped
+                // past the bottom.
+                let body = Paragraph::new(Text::from(lines))
+                    .wrap(Wrap { trim: false })
+                    .scroll((*detail_scroll, 0));
                 frame.render_widget(body, sections[0]);
 
                 let footer = Paragraph::new(format!("URL: {}", issue.url));
@@ -270,6 +347,87 @@ fn draw_view(frame: &mut Frame, kind: ViewKind, view_state: &ViewState, status: 
             }
         }
     }
+}
+
+/// Builds the Detail pane's full line list for `issue` — header fields
+/// (identifier, title, Status/Assignee/Project) followed by its Markdown
+/// description, rewrapped for `width` columns (see
+/// [`harden_list_item_wrapping`]). Shared by `draw_view`'s real render (called
+/// with the pane's actual, dynamic width) and [`detail_line_count`] (called with
+/// [`DETAIL_CONSERVATIVE_WRAP_WIDTH`] instead), so the two can never drift out
+/// of sync with each other — see `detail_line_count`'s own doc for why a
+/// narrower-than-real assumed width there is the safe direction.
+fn build_detail_lines(issue: &Issue, width: usize) -> Vec<Line<'static>> {
+    let assignee = issue
+        .assignee
+        .as_ref()
+        .map(|user| user.name.as_str())
+        .unwrap_or("Unassigned");
+    let project = issue
+        .project
+        .as_ref()
+        .map(|project| project.name.as_str())
+        .unwrap_or("None");
+
+    let mut lines = vec![
+        Line::from(issue.identifier.clone()),
+        Line::from(""),
+        Line::from(issue.title.clone()),
+        Line::from(""),
+        Line::from(format!("Status: {}", issue.state.name)),
+        Line::from(format!("Assignee: {assignee}")),
+        Line::from(format!("Project: {project}")),
+        Line::from(""),
+    ];
+
+    let description = issue.description.as_deref().unwrap_or_default();
+    let options = tui_markdown::Options::new(MarkdownStyleSheet);
+    let markdown_lines = tui_markdown::from_str_with_options(description, &options).lines;
+    lines.extend(harden_list_item_wrapping(&markdown_lines, width));
+    lines
+}
+
+/// The *rendered* row count of the Detail pane's content for `issue` — the number of
+/// terminal rows [`build_detail_lines`]'s output will actually occupy once `draw_view`
+/// wraps it with `Wrap { trim: false }`, not just the number of logical lines. Lets
+/// `App::detail_scroll_down` clamp the stored scroll offset against what will really be
+/// on screen, mirroring [`content_line_count`]'s identical role for the help overlay —
+/// see that function's doc for the full "narrower-than-real is the safe over-counting
+/// direction" rationale, which applies here unchanged. `App` stays deliberately unaware
+/// of terminal size, so this uses [`DETAIL_CONSERVATIVE_WRAP_WIDTH`] rather than the
+/// Detail pane's real, dynamic width.
+pub(crate) fn detail_line_count(issue: &Issue) -> usize {
+    build_detail_lines(issue, DETAIL_CONSERVATIVE_WRAP_WIDTH)
+        .iter()
+        .map(|line| word_wrapped_row_count(&line_plain_text(line), DETAIL_CONSERVATIVE_WRAP_WIDTH))
+        .sum()
+}
+
+/// Assumed content width (columns) used only to keep [`detail_line_count`]'s scroll-clamp
+/// ceiling from running out ahead of the real, wrapped render — see that function's doc
+/// for why a narrower-than-real assumption is the safe direction. The Detail pane is the
+/// right half of a 50/50 horizontal split (`draw_view`'s `chunks`), minus 2 columns for
+/// its bordered `Block`; even an unusually narrow 44-column terminal still leaves
+/// `44 / 2 - 2 = 20` columns of real content width. Review fix (PR #44): the first cut of
+/// this constant was set to exactly `20` — equal to, not below, that floor, so it carried
+/// *zero* actual margin despite its own doc claiming one; any terminal narrower than 44
+/// columns would silently violate the "narrower-than-real is safe" invariant
+/// `detail_line_count` depends on. `18` restores a genuine 2-column buffer below the
+/// 44-column floor (down to a 40-column terminal), mirroring the sibling
+/// `CONSERVATIVE_WRAP_WIDTH`'s own real 2-column margin (`30` real vs. `28` assumed) —
+/// see the `detail_line_count_estimate_stays_at_or_below_the_real_wrapped_row_count_at_a_
+/// narrow_width` test below, which pins the margin down directly rather than relying on
+/// this comment's arithmetic staying honest on its own.
+const DETAIL_CONSERVATIVE_WRAP_WIDTH: usize = 18;
+
+/// The plain text of `line`, ignoring styling — its spans' `content` concatenated in
+/// order. [`word_wrapped_row_count`] only needs the text, not [`build_detail_lines`]'s
+/// per-span styling (bold headings, code, etc. from [`MarkdownStyleSheet`]).
+fn line_plain_text(line: &Line) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
 }
 
 /// Bullet substituted for `tui-markdown`'s literal `-` unordered-list marker
@@ -667,8 +825,8 @@ fn about_lines() -> Vec<String> {
 /// (the single source of truth — see that module's doc comment), grouped under a
 /// heading each time `context` changes. Relies on `KEYBINDINGS` grouping same-context
 /// entries contiguously (an invariant that table's own tests guard) rather than
-/// re-sorting, so the table's declared order (Menu, View, Filtering, Error screen,
-/// Global) is what's shown, not an alphabetized one.
+/// re-sorting, so the table's declared order (Menu, View, Filtering, Commenting, Error
+/// screen, Global) is what's shown, not an alphabetized one.
 ///
 /// Cached in a `OnceLock` for the same reason as [`about_lines`]: `KEYBINDINGS` is a
 /// `static` table that never changes within a running process, so recomputing this on
@@ -877,12 +1035,26 @@ fn settings_lines_from(
     let team_id_display = summary.team_id.as_deref().unwrap_or("Not set");
     lines.push(format!("team_id          = {team_id_display}"));
 
+    let default_query_display = summary.default_query.as_deref().unwrap_or("Not set");
+    lines.push(format!("default_query    = {default_query_display}"));
+
     if summary.project_overrides.is_empty() {
         lines.push("project_overrides: (none)".to_string());
     } else {
         lines.push("project_overrides:".to_string());
         for (repo, project_id) in &summary.project_overrides {
             lines.push(format!("  {repo:<15} = {project_id}"));
+        }
+    }
+
+    // TF-647: named filter presets, in declaration order — mirrors project_overrides'
+    // list-or-"(none)" shape just above.
+    if summary.filter_presets.is_empty() {
+        lines.push("filter_presets: (none)".to_string());
+    } else {
+        lines.push("filter_presets:".to_string());
+        for preset in &summary.filter_presets {
+            lines.push(format!("  {:<15} = {}", preset.name, preset.query));
         }
     }
 
@@ -1062,7 +1234,6 @@ fn centered_rect(
 mod tests {
     use super::*;
     use crate::plugin::app::{handle_key, App};
-    use crate::Issue;
     use crossterm::event::{KeyCode, KeyModifiers};
     use ratatui::{backend::TestBackend, layout::Alignment, Terminal};
     use serde_json::json;
@@ -1191,6 +1362,23 @@ mod tests {
             .content
             .iter()
             .map(|cell| (cell.symbol().to_string(), cell.modifier))
+            .collect()
+    }
+
+    /// Like [`rendered_cells_with_size`], but keeps each cell's foreground [`Color`]
+    /// instead of its [`Modifier`] — needed to verify the comment-draft banner's distinct
+    /// `Color::Cyan` styling (PR #53 review), which neither `rendered_text_with_size` nor
+    /// `rendered_cells_with_size` can represent.
+    fn rendered_fg_colors_with_size(app: &App, width: u16, height: u16) -> Vec<(String, Color)> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| (cell.symbol().to_string(), cell.fg))
             .collect()
     }
 
@@ -1375,6 +1563,62 @@ mod tests {
         let text = rendered_text(&app);
         assert!(text.contains("ENG-1"));
         assert!(text.contains("Title for ENG-1"));
+    }
+
+    #[test]
+    fn renders_the_comment_draft_banner_while_commenting() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        handle_key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+        for c in "lgtm".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+
+        let text = rendered_text(&app);
+        assert!(text.contains("Comment on ENG-1"));
+        assert!(text.contains("lgtm"));
+    }
+
+    #[test]
+    fn comment_draft_banner_takes_precedence_over_a_stale_status_banner() {
+        // A leftover `status` from a previous action (e.g. a prior implement run) must
+        // not bleed into view while a comment draft is open — the banner area can only
+        // show one or the other, and TF-648's draft is deliberately the one shown.
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        app.set_status(Status::Ok("ENG-1: tab opened.".to_string()));
+        handle_key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+
+        let text = rendered_text(&app);
+        assert!(text.contains("Comment on ENG-1"));
+        assert!(!text.contains("tab opened."));
+    }
+
+    #[test]
+    fn comment_draft_banner_renders_in_cyan() {
+        // PR #53 review: `renders_the_comment_draft_banner_while_commenting` only
+        // asserts the banner's *text* (via `rendered_text`, which flattens styling
+        // away). A regression that silently dropped the draft `Paragraph`'s
+        // `Style::default().fg(Color::Cyan)` — the whole point of which is to visually
+        // distinguish "you're composing" from a normal `Status::Ok`/`Status::Error`
+        // banner — would still pass that test. Assert the actual rendered cell color
+        // instead.
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        handle_key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+        for c in "lgtm".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+
+        let cells = rendered_fg_colors_with_size(&app, 60, 15);
+        let symbols: Vec<String> = cells.iter().map(|(symbol, _)| symbol.clone()).collect();
+        let needle = "Comment on ENG-1";
+        let start = find_cell_run(&symbols, needle)
+            .expect("the draft banner's text should be in the rendered buffer");
+
+        for (symbol, fg) in &cells[start..start + needle.chars().count()] {
+            assert_eq!(*fg, Color::Cyan, "expected {symbol:?} to be styled Cyan");
+        }
     }
 
     #[test]
@@ -1887,6 +2131,56 @@ mod tests {
     }
 
     #[test]
+    fn shows_the_active_presets_name_in_the_list_title() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        app.set_active_preset(Some(ActivePreset {
+            index: 0,
+            name: "Urgent".to_string(),
+        }));
+
+        let text = rendered_text(&app);
+
+        assert!(text.contains("My Issues [Urgent]"));
+    }
+
+    #[test]
+    fn omits_the_preset_bracket_when_no_preset_is_active() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+
+        let text = rendered_text(&app);
+
+        assert!(text.contains("My Issues"));
+        // No `[...]` bracket directly appended to the title — `[ ]`/`[x]` multi-select
+        // markers on the issue rows themselves are unrelated and expected.
+        assert!(!text.contains("My Issues ["));
+    }
+
+    #[test]
+    fn shows_both_the_active_presets_name_and_the_live_filter_query() {
+        // TF-647 AC: presets are independent of the live `/`-filter — it still layers on
+        // top of whichever (preset or default_query) is active.
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        app.set_active_preset(Some(ActivePreset {
+            index: 0,
+            name: "Urgent".to_string(),
+        }));
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        for c in "eng".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        // Wider than the default 60 columns — "My Issues [Urgent] — filter: eng" doesn't
+        // fit the default-size list pane and the title would get truncated by the border.
+        let text = rendered_text_with_size(&app, 100, 20);
+
+        assert!(text.contains("My Issues [Urgent] — filter: eng"));
+    }
+
+    #[test]
     fn shows_the_confirmed_filter_query_without_a_cursor_marker() {
         let mut app = app_in_my_issues_view();
         app.set_issues(vec![sample_issue("ENG-1")]);
@@ -2021,6 +2315,122 @@ mod tests {
         assert!(
             wrapped_rows > 1,
             "expected wrapping to inflate the row count beyond the raw entry count of 1"
+        );
+    }
+
+    /// Mirrors [`content_line_count_accounts_for_wrapping_of_a_long_line`]'s guard, for
+    /// the Detail pane: a single long description paragraph must inflate
+    /// [`detail_line_count`]'s estimate well beyond a short one, not just contribute the
+    /// same one row regardless of length.
+    #[test]
+    fn detail_line_count_accounts_for_wrapping_of_a_long_description() {
+        let short = sample_issue_with_description("ENG-1", "short");
+        let long_description = "word ".repeat(80); // far wider than any realistic pane width
+        let long = sample_issue_with_description("ENG-1", &long_description);
+
+        assert!(
+            detail_line_count(&long) > detail_line_count(&short),
+            "a long description must inflate the row count beyond a short one"
+        );
+    }
+
+    #[test]
+    fn detail_line_count_counts_the_fixed_header_lines_even_with_an_empty_description() {
+        let issue = sample_issue("ENG-1");
+
+        // identifier, blank, title, blank, Status, Assignee, Project, blank — 8 header
+        // lines, each contributing at least one row even before any description content.
+        assert!(detail_line_count(&issue) >= 8);
+    }
+
+    /// Regression test (PR #44 review): pins down `DETAIL_CONSERVATIVE_WRAP_WIDTH`'s own
+    /// "narrower-than-real is safe" margin directly, rather than trusting its doc comment's
+    /// arithmetic to stay honest on its own — which is exactly how the original `20`
+    /// (zero margin below its claimed 44-column/20-column floor) shipped unnoticed. At a
+    /// 40-column terminal (real Detail-pane content width `40 / 2 - 2 = 18`, narrower than
+    /// the 44-column terminal the doc calls out), `detail_line_count`'s estimate — built
+    /// from the fixed conservative width, oblivious to the real one — must still be at
+    /// least as large as what a real render at that narrower width actually needs. A
+    /// constant equal to or wider than the real floor would under-count here instead,
+    /// exactly the "`j`/wheel clamps short of the true end" failure this invariant exists
+    /// to prevent.
+    #[test]
+    fn detail_line_count_estimate_stays_at_or_above_the_real_wrapped_row_count_at_a_narrow_width() {
+        const NARROWEST_SUPPORTED_REAL_WIDTH: usize = 18; // a 40-column terminal's Detail pane
+
+        let long_description = "word ".repeat(80); // forces real wrapping at either width
+        let issue = sample_issue_with_description("ENG-1", &long_description);
+
+        let estimate = detail_line_count(&issue);
+        let real_rows: usize = build_detail_lines(&issue, NARROWEST_SUPPORTED_REAL_WIDTH)
+            .iter()
+            .map(|line| {
+                word_wrapped_row_count(&line_plain_text(line), NARROWEST_SUPPORTED_REAL_WIDTH)
+            })
+            .sum();
+
+        assert!(
+            estimate >= real_rows,
+            "estimate ({estimate}) must stay at or above the real render's row count \
+             ({real_rows}) at the narrowest supported terminal width"
+        );
+    }
+
+    /// Regression test (PR #44 review): every other `App::detail_scroll` test asserts on
+    /// `App` state alone, never on what actually reaches the screen — so a wiring break in
+    /// `draw_view` (a swapped `.scroll((0, *detail_scroll))` instead of
+    /// `.scroll((*detail_scroll, 0))`, or the `.scroll(...)` call dropped entirely) would
+    /// pass every one of them undetected despite the Detail pane silently never actually
+    /// scrolling for the user. Renders a description long enough that its first and last
+    /// paragraphs can't both fit on screen at once, and confirms scrolling to the real
+    /// rendered end moves the *rendered* content, not just the stored offset.
+    ///
+    /// Scrolls by the *real* row count at the render's actual width (60 columns → a
+    /// 28-column Detail pane), not `detail_line_count`'s conservative estimate (built for
+    /// a narrower, unrelated assumed width — see `detail_line_count_estimate_stays_at_or_
+    /// above_the_real_wrapped_row_count_at_a_narrow_width` for that invariant on its own).
+    /// Scrolling to the *estimate*'s max here would overshoot past this test's real,
+    /// wider-than-assumed content, landing on blank space past the end rather than on the
+    /// last real line — `Paragraph::scroll` doesn't clamp an offset past its own content,
+    /// it just renders nothing.
+    #[test]
+    fn detail_scroll_offset_reaches_the_rendered_detail_pane() {
+        let mut app = app_in_my_issues_view();
+        let filler = "filler paragraph\n\n".repeat(28);
+        let description = format!("ALPHA-TOP-MARKER\n\n{filler}ZULU-BOTTOM-MARKER");
+        app.set_issues(vec![sample_issue_with_description("ENG-1", &description)]);
+
+        let before = rendered_text_with_size(&app, 60, 15);
+        assert!(
+            before.contains("ALPHA-TOP-MARKER"),
+            "the first description paragraph must be visible before any scrolling"
+        );
+        assert!(
+            !before.contains("ZULU-BOTTOM-MARKER"),
+            "the last description paragraph must not already be visible before scrolling"
+        );
+
+        // The Detail pane's real content width at a 60-column terminal: half the frame
+        // (a 50/50 split, even so no ceil/floor asymmetry) minus 2 columns for its
+        // bordered `Block` — mirrors `DETAIL_CONSERVATIVE_WRAP_WIDTH`'s own formula.
+        const REAL_DETAIL_WIDTH: usize = 60 / 2 - 2;
+        let issue = app.selected_issue().unwrap();
+        let real_row_count: usize = build_detail_lines(issue, REAL_DETAIL_WIDTH)
+            .iter()
+            .map(|line| word_wrapped_row_count(&line_plain_text(line), REAL_DETAIL_WIDTH))
+            .sum();
+        for _ in 0..real_row_count {
+            app.detail_scroll_down(real_row_count);
+        }
+
+        let after = rendered_text_with_size(&app, 60, 15);
+        assert!(
+            !after.contains("ALPHA-TOP-MARKER"),
+            "the first description paragraph must have scrolled out of view"
+        );
+        assert!(
+            after.contains("ZULU-BOTTOM-MARKER"),
+            "scrolling to the clamped end must bring the last description paragraph into view"
         );
     }
 
@@ -2190,6 +2600,8 @@ mod tests {
             team_id: None,
             editor: None,
             project_overrides: std::collections::BTreeMap::new(),
+            default_query: None,
+            filter_presets: Vec::new(),
         };
 
         let lines = settings_lines_from(&summary, false).join("\n");
@@ -2197,6 +2609,7 @@ mod tests {
         assert!(lines.contains("no file found, using defaults"));
         assert!(lines.contains("✗ Not set"));
         assert!(lines.contains("(default)"));
+        assert!(lines.contains("default_query    = Not set"));
     }
 
     /// Follow-up review fix (TF-585): `settings_lines()` used to collapse "LINEAR_API_KEY
@@ -2214,6 +2627,8 @@ mod tests {
             team_id: None,
             editor: None,
             project_overrides: std::collections::BTreeMap::new(),
+            default_query: None,
+            filter_presets: Vec::new(),
         };
 
         let unset = settings_lines_from(&summary, false).join("\n");
@@ -2237,6 +2652,11 @@ mod tests {
             team_id: Some("team-123".to_string()),
             editor: Some("vim".to_string()),
             project_overrides,
+            default_query: Some("priority:>=2".to_string()),
+            filter_presets: vec![crate::plugin::config::FilterPreset {
+                name: "Urgent".to_string(),
+                query: "priority:>=2".to_string(),
+            }],
         };
 
         let lines = settings_lines_from(&summary, false).join("\n");
@@ -2247,8 +2667,31 @@ mod tests {
         assert!(lines.contains("my-agent"));
         assert!(lines.contains("editor           = vim"));
         assert!(lines.contains("team-123"));
+        assert!(lines.contains("default_query    = priority:>=2"));
         assert!(lines.contains("herdr-linear"));
         assert!(lines.contains("proj-1"));
+        assert!(lines.contains("filter_presets:"));
+        assert!(lines.contains("Urgent"));
+        assert!(lines.contains("priority:>=2"));
+    }
+
+    #[test]
+    fn settings_lines_from_found_shows_none_for_no_filter_presets() {
+        let summary = crate::plugin::config::ResolvedConfigSummary {
+            path: "/fake/config.toml".to_string(),
+            status: crate::plugin::config::ConfigFileStatus::Found,
+            api_key_set: true,
+            agent_command: None,
+            team_id: None,
+            editor: None,
+            project_overrides: std::collections::BTreeMap::new(),
+            default_query: None,
+            filter_presets: Vec::new(),
+        };
+
+        let lines = settings_lines_from(&summary, false).join("\n");
+
+        assert!(lines.contains("filter_presets: (none)"));
     }
 
     #[test]
@@ -2261,6 +2704,8 @@ mod tests {
             team_id: None,
             editor: None,
             project_overrides: std::collections::BTreeMap::new(),
+            default_query: None,
+            filter_presets: Vec::new(),
         };
 
         let lines = settings_lines_from(&summary, false).join("\n");
@@ -2367,7 +2812,12 @@ mod tests {
         handle_key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
         handle_key(&mut app, KeyCode::Char('2'), KeyModifiers::NONE); // -> Keybindings
 
-        let text = rendered_text_with_size(&app, 100, 40);
+        // Tall enough that the whole registry renders without scrolling — bumped from 40
+        // to 60 by TF-648, which added a new context (`Commenting`, the table's 4th,
+        // inserted between `Filtering` and `ErrorScreen` — 4 entries plus a heading and
+        // a separator) on top of a new `m` binding in `View`. Bump again, generously,
+        // next time this starts failing rather than shaving off the minimum.
+        let text = rendered_text_with_size(&app, 100, 60);
 
         assert!(text.contains("Keybindings"));
         for binding in crate::plugin::keybindings::KEYBINDINGS {
