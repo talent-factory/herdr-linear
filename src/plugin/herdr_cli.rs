@@ -719,7 +719,7 @@ fn agent_identity(result: &serde_json::Value) -> Option<String> {
 
 /// TF-669: waits until herdr recognizes `pane_id` as hosting a real, *stable* coding agent — i.e.
 /// `herdr agent get <pane_id>` reports the same non-blank `agent` identity on
-/// [`AGENT_START_CONFIRM_POLLS`] consecutive polls — before the caller trusts the pane enough to
+/// `AGENT_START_CONFIRM_POLLS` consecutive polls — before the caller trusts the pane enough to
 /// start sending it input.
 ///
 /// Exists because neither `agent_wait(..., "idle", ...)`'s status nor a purely text-based
