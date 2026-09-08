@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Documented that the plugin's cwd-resolution guarantees (`<Enter>` on an issue) only
+  apply to tabs this plugin opens itself — a plain terminal tab opened via herdr's own
+  tab-bar `+` button is unaffected and may land in the wrong directory. That's a
+  `herdr`-host-level limitation, not a bug in this plugin (TF-793).
+
 ## [0.3.0] - 2026-08-21
 
 Phase 2a (query DSL / server-side filtering) and Phase 2b (comments, named
