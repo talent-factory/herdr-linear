@@ -695,8 +695,11 @@ async fn send_prompt_until_visible_with(
             // pane foreground process" guard) retried instantly, burning the whole `attempts`
             // budget in well under 50ms total and giving the underlying condition no real
             // chance to resolve before giving up. `wait_for_prompt_stable`'s own read-error
-            // branch already backs off the same way, for the same reason — see its doc. Skipped
-            // on the last attempt: there's nothing left to wait for.
+            // branch (see its doc) already backs off for the same reason — though
+            // unconditionally, since it has no `attempt`/`attempts` context of its own to skip
+            // the wait on what it can't know is the last one. This branch does have that
+            // context, so — unlike that one — it skips the sleep on the last attempt here:
+            // there's nothing left to wait for.
             if attempt < attempts {
                 tokio::time::sleep(poll_interval).await;
             }
@@ -723,7 +726,13 @@ async fn send_prompt_until_visible_with(
         }
     }
 
-    Err(last_err.unwrap_or_else(|| "failed to send implement command".to_string()))
+    // TF-806: previously the only trace of this failure was `attempts` separate `debug!` lines
+    // above, indistinguishable in a log from a single attempt's transient retry — reconstructing
+    // "the whole operation gave up" required manually counting matching timestamps. One `warn!`
+    // here marks the terminal outcome at a severity a log search can actually filter on.
+    let err = last_err.unwrap_or_else(|| "failed to send implement command".to_string());
+    tracing::warn!("send_prompt_until_visible: gave up after {attempts} attempt(s) ({err})");
+    Err(err)
 }
 
 /// Outcome of running the "implement this issue" flow for a single issue ([`implement_one`]),
@@ -4071,6 +4080,16 @@ esac
         error_message: &str,
         landed_text: &str,
     ) -> (tempfile::TempDir, std::path::PathBuf) {
+        // `error_message` is interpolated into a single-quoted shell string below; a literal `'`
+        // would prematurely close it and corrupt the generated script. No caller needs one today
+        // (the herdr error messages this helper models are plain prose), so this asserts the
+        // constraint instead of adding shell-escaping machinery the helper doesn't otherwise
+        // need.
+        debug_assert!(
+            !error_message.contains('\''),
+            "error_message must not contain a single quote — it's interpolated into a \
+             single-quoted shell string"
+        );
         let (dir, script) = write_fake_herdr_script(&format!(
             r#"
 case "$1 $2" in
@@ -5207,16 +5226,18 @@ esac
     #[tokio::test]
     async fn send_prompt_until_visible_backs_off_before_resending_after_a_failed_agent_prompt_call()
     {
-        // TF-806: live `/tmp/herdr-linear.log` traces (6+ occurrences across 3 days, always
-        // 5/5 attempts) showed every attempt failing within single-digit milliseconds of each
-        // other whenever `agent prompt` itself errors (herdr's live-observed "agent ... is no
-        // longer the pane foreground process" guard, among others) — the whole `attempts`
-        // budget burned in well under 50ms total, giving that condition no real chance to
-        // resolve before giving up. `wait_for_prompt_stable`'s own Err branch already sleeps
-        // `poll_interval` before returning, specifically so "the caller's resend loop" doesn't
-        // "burn through every attempt back-to-back with no backoff" — the `agent_prompt`
-        // failure branch just above it in this function had no equivalent. Pins that a resend
-        // after a failed `agent_prompt` call waits at least one `poll_interval` first.
+        // TF-806: live `/tmp/herdr-linear.log` traces (see the ticket for the excerpts; an
+        // ephemeral local file, not a durable invariant of this test) repeatedly showed every
+        // attempt failing back-to-back with no observed delay between them whenever `agent
+        // prompt` itself errors (herdr's live-observed "agent ... is no longer the pane
+        // foreground process" guard, among others) — the whole `attempts` budget burned in well
+        // under 50ms total, giving that condition no real chance to resolve before giving up.
+        // `wait_for_prompt_stable`'s own Err branch already sleeps `poll_interval` before
+        // returning, specifically so "the caller's resend loop" doesn't "burn through every
+        // attempt back-to-back with no backoff" — the `agent_prompt` failure branch just above
+        // the `wait_for_prompt_stable` call in `send_prompt_until_visible_with` (the function
+        // under test here, not `wait_for_prompt_stable` itself) had no equivalent. Pins that a
+        // resend after a failed `agent_prompt` call waits at least one `poll_interval` first.
         let prompt = plugin::implement::build_implement_prompt("TF-579");
         let landed = format!("❯ {prompt}\n");
         let (dir, script) = write_prompt_send_fails_then_succeeds_script(
@@ -5270,6 +5291,118 @@ esac
             "expected at least one poll_interval backoff before resending after a failed \
              agent_prompt call, took {elapsed:?} instead (baseline subprocess overhead alone is \
              well under 400ms — see this test's own doc comment)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_prompt_until_visible_skips_the_final_backoff_when_every_attempt_fails() {
+        // TF-806 review gap: the sibling test above only exercises the `attempt < attempts`
+        // guard's "there IS a next attempt" side (fail once, succeed on attempt 2) — it never
+        // proves the guard's actual point, that the sleep is skipped once the *last* attempt's
+        // `agent_prompt` call fails too. A regression here (e.g. dropping the `attempt <
+        // attempts` condition so every failure sleeps unconditionally) would sleep once more
+        // than it should and go unnoticed by that test. With 3 attempts all failing, the correct
+        // backoff count is 2 (after attempts 1 and 2, not after attempt 3); the window below
+        // distinguishes 2 backoffs (~1000ms + subprocess overhead) from both 0 backoffs (~150-
+        // 200ms, a full regression) and 3 backoffs (~1500ms + overhead, the last-attempt guard
+        // silently dropped).
+        let prompt = plugin::implement::build_implement_prompt("TF-579");
+        let landed = format!("❯ {prompt}\n");
+        let (dir, script) = write_prompt_send_fails_then_succeeds_script(
+            3,
+            "agent w1:p1 is no longer the pane foreground process",
+            &landed,
+        );
+        let tab = plugin::herdr_cli::tab_create(script.to_str().unwrap(), dir.path(), "TF-579")
+            .await
+            .expect("stub tab_create must succeed");
+
+        let started = std::time::Instant::now();
+        let outcome = send_prompt_until_visible_with(
+            script.to_str().unwrap(),
+            &tab.root_pane_id,
+            &prompt,
+            PromptSendPolicy {
+                attempts: 3,
+                poll_interval: std::time::Duration::from_millis(500),
+                stability_duration: std::time::Duration::ZERO,
+                attempt_timeout: std::time::Duration::from_millis(800),
+            },
+            |_, _| {},
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            outcome.is_err(),
+            "all 3 attempts' agent_prompt calls fail, so the whole send must fail"
+        );
+        assert_eq!(
+            send_call_count(&dir),
+            3,
+            "agent_prompt must have been called exactly once per attempt, not looped internally"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(700),
+            "expected 2 poll_interval backoffs (after attempts 1 and 2), took {elapsed:?} \
+             instead — looks like the backoff was dropped entirely"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(1400),
+            "expected the backoff to be skipped after the last (3rd) attempt's failure, took \
+             {elapsed:?} instead — looks like the `attempt < attempts` guard was dropped and a \
+             3rd, pointless backoff was added after the final failure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_prompt_until_visible_with_a_single_attempt_fails_immediately_with_no_backoff() {
+        // TF-806 review gap: `attempts: 1` is the guard's most extreme case — the loop's only
+        // iteration IS the last one, so `attempt < attempts` (`1 < 1`) is false from the very
+        // first failure and the function must return immediately, with no test anywhere in this
+        // file (nor any `PromptSendPolicy` construction outside it) covering `attempts: 1`.
+        let prompt = plugin::implement::build_implement_prompt("TF-579");
+        let landed = format!("❯ {prompt}\n");
+        let (dir, script) = write_prompt_send_fails_then_succeeds_script(
+            1,
+            "agent w1:p1 is no longer the pane foreground process",
+            &landed,
+        );
+        let tab = plugin::herdr_cli::tab_create(script.to_str().unwrap(), dir.path(), "TF-579")
+            .await
+            .expect("stub tab_create must succeed");
+
+        let started = std::time::Instant::now();
+        let outcome = send_prompt_until_visible_with(
+            script.to_str().unwrap(),
+            &tab.root_pane_id,
+            &prompt,
+            PromptSendPolicy {
+                attempts: 1,
+                poll_interval: std::time::Duration::from_millis(500),
+                stability_duration: std::time::Duration::ZERO,
+                attempt_timeout: std::time::Duration::from_millis(800),
+            },
+            |_, _| {},
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            outcome.is_err(),
+            "the only attempt's agent_prompt call fails, so the send must fail"
+        );
+        assert_eq!(
+            send_call_count(&dir),
+            1,
+            "agent_prompt must have been called exactly once"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(300),
+            "expected no backoff at all with a single attempt (nothing left to wait for), took \
+             {elapsed:?} instead — looks like the last-attempt guard failed for attempts == 1"
         );
     }
 
