@@ -199,8 +199,15 @@ fn output_error(
             .and_then(|c| c.as_str())
         {
             if code == "agent_not_found" {
-                let target = error_message.clone().unwrap_or_default();
+                let target = error_message.unwrap_or_default();
                 return Some(Error::AgentNotFound(target));
+            }
+            // TF-811: herdr's `agent prompt` rejects a submission with this code when its
+            // pre-send guards aren't satisfied yet — see `Error::AgentNotReady`'s doc for what
+            // it covers and why retrying uniformly is fine.
+            if code == "agent_not_ready" {
+                let message = error_message.unwrap_or_default();
+                return Some(Error::AgentNotReady(message));
             }
         }
 
@@ -239,6 +246,14 @@ fn is_missing_result_response(error: &Error) -> bool {
 /// process and identify it as a coding agent, so `agent_wait` polls on this error.
 fn is_agent_not_found_response(error: &Error) -> bool {
     matches!(error, Error::AgentNotFound(_))
+}
+
+/// True if `error` is herdr's `agent_not_ready` response (TF-811): `agent prompt` rejected the
+/// submission because one of its pre-send guards isn't satisfied yet — see
+/// [`Error::AgentNotReady`]'s doc for the three conditions this one code covers. [`agent_prompt`]
+/// retries on this rather than surfacing it as a one-shot failure.
+fn is_agent_not_ready_response(error: &Error) -> bool {
+    matches!(error, Error::AgentNotReady(_))
 }
 
 /// Wall-clock ceiling for `herdr` subprocess calls that don't carry their own `--timeout`
@@ -848,14 +863,118 @@ pub async fn agent_wait_for_start(
     }
 }
 
+/// Extra attempts [`agent_prompt`] makes in place when herdr rejects a submission with its
+/// `agent_not_ready` response code (TF-811) — e.g. the live-observed "agent ... is no longer the
+/// pane foreground process" — see [`Error::AgentNotReady`]'s doc for what that code covers and
+/// why retrying is worth it. Combined with [`AGENT_NOT_READY_POLL_INTERVAL`], this budgets ~10s
+/// of in-place sleeping before giving up and letting the error propagate to the caller
+/// (`main.rs::send_prompt_until_visible_with`'s own TF-806 resend/backoff loop) as an ordinary
+/// attempt failure — instead of the ~1s that loop's own backoff previously gave this condition
+/// (`PROMPT_SEND_ATTEMPTS - 1` = 4 sleeps of `PROMPT_SEND_POLL_INTERVAL`, since it skips the
+/// sleep after the last attempt; live-traced in TF-811 to still be failing identically at the end
+/// of that window). [`AGENT_NOT_READY_RETRY_DEADLINE_SLACK`] additionally bounds this by real
+/// wall-clock time, not just attempt count — see its own doc for why that matters.
+const AGENT_NOT_READY_MAX_RETRIES: u32 = 20;
+
+/// Pause between [`agent_prompt`]'s in-place retries on `agent_not_ready`. Reuses
+/// [`AGENT_NOT_FOUND_POLL_INTERVAL`]'s value rather than introducing a second "how often is it
+/// reasonable to ask herdr again" magic number for what's the same kind of wait — give herdr a
+/// beat to let the pane's real state settle before asking again. (If this value ever changes,
+/// recheck [`AGENT_NOT_READY_MAX_RETRIES`]'s "~10s" budget claim, which assumes it.)
+const AGENT_NOT_READY_POLL_INTERVAL: Duration = AGENT_NOT_FOUND_POLL_INTERVAL;
+
+/// Extra wall-clock slack folded on top of `AGENT_NOT_READY_MAX_RETRIES *
+/// AGENT_NOT_READY_POLL_INTERVAL`'s nominal ~10s sleep total to form
+/// [`agent_prompt_with_retry_policy`]'s real deadline (TF-811 review gap: the loop originally only
+/// counted attempts, not real elapsed time, so a `herdr` that answered slowly-but-genuinely
+/// — each `run()` call bounded by its own [`DEFAULT_CLI_TIMEOUT`], not by this loop — could in
+/// principle stretch the loop's real duration well past the documented "~10s". Chosen generously
+/// enough that ordinary subprocess overhead (including in tests, which drive this loop with
+/// millisecond-scale [`AGENT_NOT_READY_POLL_INTERVAL`]-equivalents) never trips the deadline on
+/// its own; it only kicks in once a call has genuinely run slow, at which point continuing to
+/// retry stops being worth the wait. Mirrors [`AGENT_WAIT_CALL_TIMEOUT_BUFFER`]'s "give the real
+/// call room, but don't let it run unbounded" rationale.
+const AGENT_NOT_READY_RETRY_DEADLINE_SLACK: Duration = Duration::from_secs(5);
+
 /// `herdr agent prompt <pane_id> <text>` (herdr 0.8.0 replaced the old `agent send` subcommand
 /// with `agent prompt`, which additionally supports `--wait`/`--until`/`--timeout` options this
 /// plugin doesn't need — it does its own stability polling via `agent_read` instead, see
 /// `main.rs`'s `send_prompt_until_visible`).
+///
+/// Retries in place, up to `AGENT_NOT_READY_MAX_RETRIES` times with
+/// `AGENT_NOT_READY_POLL_INTERVAL` between attempts, when herdr responds `agent_not_ready`
+/// (TF-811) — the same "quirk retried transparently inside the herdr_cli wrapper" convention
+/// [`agent_wait`] already uses for its own missing-`result` workaround, so this call's only
+/// caller (`main.rs::send_prompt_until_visible_with`) doesn't need to know herdr can reject a
+/// send outright and retry that itself; it only ever sees this fail after the condition has had a
+/// real chance to clear, or genuinely persisted through the whole budget. Thin wrapper around
+/// `agent_prompt_with_retry_policy` (module-private, so not directly linkable from this public
+/// doc) supplying the real constants — split out purely so tests can drive the retry loop with
+/// millisecond-scale values, the same reason `main.rs`'s
+/// `send_prompt_until_visible`/`send_prompt_until_visible_with` split.
 pub async fn agent_prompt(herdr_bin: &str, pane_id: &PaneId, text: &str) -> Result<()> {
-    run(herdr_bin, &["agent", "prompt", pane_id.as_str(), text])
-        .await
-        .map(|_| ())
+    agent_prompt_with_retry_policy(
+        herdr_bin,
+        pane_id,
+        text,
+        AGENT_NOT_READY_MAX_RETRIES,
+        AGENT_NOT_READY_POLL_INTERVAL,
+    )
+    .await
+}
+
+/// See [`agent_prompt`]. `max_retries`/`poll_interval` parameterize the `agent_not_ready` retry
+/// loop so tests can exercise it (including the "persists through the whole budget" case) without
+/// actually waiting out the real multi-second worst case.
+///
+/// Bounded two ways, not just one: `attempt < max_retries` caps the *count* of retries, and a
+/// `deadline` of `max_retries * poll_interval` plus [`AGENT_NOT_READY_RETRY_DEADLINE_SLACK`]
+/// additionally caps the *real wall-clock time* spent — see that constant's doc for why the count
+/// alone doesn't already guarantee that. Once either bound is hit, or the underlying error isn't
+/// `agent_not_ready` at all, the loop gives up: it logs a `tracing::warn!` (mirroring `main.rs`'s
+/// TF-806 `send_prompt_until_visible_with` giving up after exhausting its own attempts — see that
+/// function's doc) and returns the error enriched with how many retries and how much real time
+/// were spent, so a caller/log reader can tell a one-shot failure apart from one that persisted
+/// through the whole budget.
+async fn agent_prompt_with_retry_policy(
+    herdr_bin: &str,
+    pane_id: &PaneId,
+    text: &str,
+    max_retries: u32,
+    poll_interval: Duration,
+) -> Result<()> {
+    let start = std::time::Instant::now();
+    let deadline = poll_interval
+        .saturating_mul(max_retries)
+        .saturating_add(AGENT_NOT_READY_RETRY_DEADLINE_SLACK);
+    let mut attempt = 0;
+    loop {
+        match run(herdr_bin, &["agent", "prompt", pane_id.as_str(), text]).await {
+            Err(err)
+                if is_agent_not_ready_response(&err)
+                    && attempt < max_retries
+                    && start.elapsed() < deadline =>
+            {
+                attempt += 1;
+                tracing::debug!(
+                    "agent_prompt: {pane_id} not ready yet (attempt {attempt}/{max_retries}: \
+                     {err}), retrying"
+                );
+                tokio::time::sleep(poll_interval).await;
+            }
+            Err(err) if is_agent_not_ready_response(&err) => {
+                let elapsed_ms = start.elapsed().as_millis();
+                tracing::warn!(
+                    "agent_prompt: {pane_id} still not ready after {attempt} retries \
+                     (~{elapsed_ms}ms), giving up ({err})"
+                );
+                return Err(Error::AgentNotReady(format!(
+                    "{err} (gave up after {attempt} retries, ~{elapsed_ms}ms)"
+                )));
+            }
+            result => return result.map(|_| ()),
+        }
+    }
 }
 
 /// `herdr agent read <pane_id> --source <source> --lines <lines>` — the pane's rendered
@@ -974,6 +1093,23 @@ mod tests {
     }
 
     #[test]
+    fn interpret_output_surfaces_agent_not_ready_as_distinct_variant() {
+        // TF-811: the live-observed "no longer the pane foreground process" wording, exactly as
+        // herdr's `queue_agent_prompt` formats it — see `Error::AgentNotReady`'s doc for the
+        // caveat on which herdr version this was actually confirmed against.
+        let body = r#"{"error":{"code":"agent_not_ready","message":"agent wY:p7Z is no longer the pane foreground process"},"id":"cli:agent:prompt"}"#;
+        for (stdout, stderr) in [(body, ""), ("", body)] {
+            let err = interpret_output("herdr agent prompt wY:p7Z hi", false, stdout, stderr)
+                .unwrap_err();
+
+            assert!(
+                matches!(err, Error::AgentNotReady(_)),
+                "expected AgentNotReady (stdout={stdout:?}, stderr={stderr:?}), got: {err:?}"
+            );
+        }
+    }
+
+    #[test]
     fn interpret_output_hints_at_upgrading_herdr_when_cwd_flag_is_unsupported() {
         // TF-604: an installed `herdr` binary older than the version that added `--cwd` support
         // to `tab create` rejects it with this exact wording. The raw message alone
@@ -1084,6 +1220,42 @@ mod tests {
         assert!(!is_missing_result_response(&failed));
         assert!(!is_missing_result_response(&unparseable));
         assert!(!is_missing_result_response(&spawn_failed));
+    }
+
+    #[test]
+    fn is_agent_not_ready_response_matches_the_agent_not_ready_error() {
+        let err = interpret_output(
+            "herdr agent prompt wY:p7Z hi",
+            false,
+            r#"{"error":{"code":"agent_not_ready","message":"agent wY:p7Z is no longer the pane foreground process"}}"#,
+            "",
+        )
+        .unwrap_err();
+
+        assert!(is_agent_not_ready_response(&err));
+    }
+
+    #[test]
+    fn is_agent_not_ready_response_does_not_match_other_internal_errors() {
+        let not_found = interpret_output(
+            "herdr agent prompt bogus hi",
+            false,
+            r#"{"error":{"code":"agent_not_found","message":"agent target bogus not found"}}"#,
+            "",
+        )
+        .unwrap_err();
+        let generic = interpret_output(
+            "herdr agent prompt wY:p7Z hi",
+            false,
+            r#"{"error":{"message":"agent wY:p7Z is blocked and requires interactive input"}}"#,
+            "",
+        )
+        .unwrap_err();
+        let spawn_failed = Error::Internal("Failed to run `herdr`: no such file".to_string());
+
+        assert!(!is_agent_not_ready_response(&not_found));
+        assert!(!is_agent_not_ready_response(&generic));
+        assert!(!is_agent_not_ready_response(&spawn_failed));
     }
 
     /// Writes an executable fake `herdr` shell script (`#!/bin/sh` — Unix only, matching the
@@ -1265,6 +1437,240 @@ exit 1
             err.to_string().contains("timed out"),
             "expected timeout error, got: {err}"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_prompt_retries_in_place_through_agent_not_ready_until_success() {
+        // TF-811: a fake script rejects `agent prompt` with `agent_not_ready` twice — mirroring
+        // the live-observed "no longer the pane foreground process" wording — then succeeds.
+        // `agent_prompt` (not `send_prompt_until_visible_with`) must absorb this itself, the same
+        // way `agent_wait_polls_through_agent_not_found_until_success` above proves `agent_wait`
+        // absorbs `agent_not_found`.
+        let counter_dir = tempfile::tempdir().unwrap();
+        let counter_file = counter_dir.path().join("count.txt");
+        std::fs::write(&counter_file, "0").unwrap();
+        let (_dir, script) = write_fake_herdr_script(&format!(
+            r#"
+count_file="{}"
+count=$(cat "$count_file")
+next=$((count + 1))
+echo "$next" > "$count_file"
+if [ "$next" -le 2 ]; then
+  echo '{{"error":{{"code":"agent_not_ready","message":"agent wY:p7Z is no longer the pane foreground process"}},"id":"cli:agent:prompt"}}' >&2
+  exit 1
+fi
+echo '{{"result":{{}},"id":"cli:agent:prompt"}}'
+"#,
+            counter_file.display()
+        ));
+
+        agent_prompt_with_retry_policy(
+            script.to_str().unwrap(),
+            &PaneId("wY:p7Z".to_string()),
+            "hi",
+            5,
+            Duration::from_millis(1),
+        )
+        .await
+        .expect("agent_prompt should retry through agent_not_ready and succeed");
+
+        let final_count = std::fs::read_to_string(&counter_file).unwrap();
+        assert_eq!(
+            final_count.trim(),
+            "3",
+            "expected three calls before success"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_prompt_gives_up_once_agent_not_ready_exhausts_its_retry_budget() {
+        // TF-811 review gap: the sibling test above only exercises the "condition clears before
+        // the budget runs out" side. This pins the other side of the `attempt < max_retries`
+        // guard — with `max_retries: 2`, the script must be called exactly 3 times (the initial
+        // attempt plus 2 retries) before `agent_prompt` gives up and returns the herdr error
+        // as-is, rather than looping forever or silently swallowing it.
+        let counter_dir = tempfile::tempdir().unwrap();
+        let counter_file = counter_dir.path().join("count.txt");
+        std::fs::write(&counter_file, "0").unwrap();
+        let (_dir, script) = write_fake_herdr_script(&format!(
+            r#"
+count_file="{}"
+count=$(cat "$count_file")
+next=$((count + 1))
+echo "$next" > "$count_file"
+echo '{{"error":{{"code":"agent_not_ready","message":"agent wY:p7Z is no longer the pane foreground process"}},"id":"cli:agent:prompt"}}' >&2
+exit 1
+"#,
+            counter_file.display()
+        ));
+
+        let err = agent_prompt_with_retry_policy(
+            script.to_str().unwrap(),
+            &PaneId("wY:p7Z".to_string()),
+            "hi",
+            2,
+            Duration::from_millis(1),
+        )
+        .await
+        .expect_err("agent_prompt should give up once the retry budget is exhausted");
+
+        assert!(
+            matches!(err, Error::AgentNotReady(_)),
+            "expected the underlying AgentNotReady error to still be an AgentNotReady, got: {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("no longer the pane foreground process"),
+            "expected the original herdr message to survive, got: {message}"
+        );
+        assert!(
+            message.contains("gave up after 2 retries"),
+            "expected the retry count to be folded into the error, got: {message}"
+        );
+        let final_count = std::fs::read_to_string(&counter_file).unwrap();
+        assert_eq!(
+            final_count.trim(),
+            "3",
+            "expected exactly 1 initial attempt + 2 retries, not more"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_prompt_does_not_retry_a_non_agent_not_ready_error() {
+        // TF-811 review gap: both sibling tests above only ever feed the loop `agent_not_ready`
+        // errors. This pins the guard's other half — `is_agent_not_ready_response(&err) &&`
+        // — so a regression that weakens or drops that clause (e.g. retrying on any error) would
+        // fail this test: with a script that always fails `agent_not_found`, the call must return
+        // immediately after exactly one attempt, not loop.
+        let counter_dir = tempfile::tempdir().unwrap();
+        let counter_file = counter_dir.path().join("count.txt");
+        std::fs::write(&counter_file, "0").unwrap();
+        let (_dir, script) = write_fake_herdr_script(&format!(
+            r#"
+count_file="{}"
+count=$(cat "$count_file")
+next=$((count + 1))
+echo "$next" > "$count_file"
+echo '{{"error":{{"code":"agent_not_found","message":"agent target wY:p7Z not found"}},"id":"cli:agent:prompt"}}' >&2
+exit 1
+"#,
+            counter_file.display()
+        ));
+
+        let err = agent_prompt_with_retry_policy(
+            script.to_str().unwrap(),
+            &PaneId("wY:p7Z".to_string()),
+            "hi",
+            5,
+            Duration::from_millis(1),
+        )
+        .await
+        .expect_err("a non-agent_not_ready error should propagate, not retry");
+
+        assert!(
+            matches!(err, Error::AgentNotFound(_)),
+            "expected the original AgentNotFound error to propagate unchanged, got: {err:?}"
+        );
+        let final_count = std::fs::read_to_string(&counter_file).unwrap();
+        assert_eq!(
+            final_count.trim(),
+            "1",
+            "a non-agent_not_ready error must not be retried"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_prompt_with_zero_max_retries_fails_immediately_after_one_attempt() {
+        // Boundary case for `attempt < max_retries`: with `max_retries: 0` the loop must never
+        // retry at all, mirroring `main.rs`'s analogous
+        // `send_prompt_until_visible_with_a_single_attempt_fails_immediately_with_no_backoff`.
+        let counter_dir = tempfile::tempdir().unwrap();
+        let counter_file = counter_dir.path().join("count.txt");
+        std::fs::write(&counter_file, "0").unwrap();
+        let (_dir, script) = write_fake_herdr_script(&format!(
+            r#"
+count_file="{}"
+count=$(cat "$count_file")
+next=$((count + 1))
+echo "$next" > "$count_file"
+echo '{{"error":{{"code":"agent_not_ready","message":"agent wY:p7Z is no longer the pane foreground process"}},"id":"cli:agent:prompt"}}' >&2
+exit 1
+"#,
+            counter_file.display()
+        ));
+
+        let err = agent_prompt_with_retry_policy(
+            script.to_str().unwrap(),
+            &PaneId("wY:p7Z".to_string()),
+            "hi",
+            0,
+            Duration::from_millis(1),
+        )
+        .await
+        .expect_err("agent_prompt should give up immediately with max_retries: 0");
+
+        assert!(
+            err.to_string().contains("gave up after 0 retries"),
+            "expected the zero-retry case to be reflected in the message, got: {err}"
+        );
+        let final_count = std::fs::read_to_string(&counter_file).unwrap();
+        assert_eq!(final_count.trim(), "1", "expected exactly one attempt");
+    }
+
+    #[test]
+    fn agent_not_ready_retry_constants_match_the_documented_ten_second_budget() {
+        // Pins the two numbers `AGENT_NOT_READY_MAX_RETRIES`'s doc and `CHANGELOG.md`'s prose
+        // both rely on — a silent change to either constant would otherwise only be caught by
+        // re-reading the doc comment, not by any test.
+        assert_eq!(AGENT_NOT_READY_MAX_RETRIES, 20);
+        assert_eq!(AGENT_NOT_READY_POLL_INTERVAL, Duration::from_millis(500));
+        assert_eq!(
+            AGENT_NOT_READY_POLL_INTERVAL.saturating_mul(AGENT_NOT_READY_MAX_RETRIES),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_prompt_retries_through_a_real_agent_not_ready_response_end_to_end() {
+        // TF-811 review gap: the tests above all drive `agent_prompt_with_retry_policy` with
+        // test-scale parameters. This exercises the actual public `agent_prompt` — what
+        // `main.rs::send_prompt_until_visible_with` really calls — through the real
+        // `AGENT_NOT_READY_POLL_INTERVAL` (500ms), so the wiring between `agent_prompt` and its
+        // parameterized policy function is proven end-to-end too, not just the policy function in
+        // isolation. Fails once (one real 500ms sleep) then succeeds, to keep this fast.
+        let counter_dir = tempfile::tempdir().unwrap();
+        let counter_file = counter_dir.path().join("count.txt");
+        std::fs::write(&counter_file, "0").unwrap();
+        let (_dir, script) = write_fake_herdr_script(&format!(
+            r#"
+count_file="{}"
+count=$(cat "$count_file")
+next=$((count + 1))
+echo "$next" > "$count_file"
+if [ "$next" -le 1 ]; then
+  echo '{{"error":{{"code":"agent_not_ready","message":"agent wY:p7Z is no longer the pane foreground process"}},"id":"cli:agent:prompt"}}' >&2
+  exit 1
+fi
+echo '{{"result":{{}},"id":"cli:agent:prompt"}}'
+"#,
+            counter_file.display()
+        ));
+
+        agent_prompt(
+            script.to_str().unwrap(),
+            &PaneId("wY:p7Z".to_string()),
+            "hi",
+        )
+        .await
+        .expect("the public agent_prompt wrapper should retry through agent_not_ready too");
+
+        let final_count = std::fs::read_to_string(&counter_file).unwrap();
+        assert_eq!(final_count.trim(), "2", "expected two calls before success");
     }
 
     #[cfg(unix)]
