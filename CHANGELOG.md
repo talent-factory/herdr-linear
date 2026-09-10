@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Implement-flow: `agent_prompt` now retries in place, for up to ~10s (20 attempts × 500ms),
+  when herdr rejects a submission with its `agent_not_ready` response code — e.g. "agent ... is
+  no longer the pane foreground process". Verified against herdr v0.9.0's own source: this is a
+  live OS-level check (the pane's pty foreground process momentarily diverging from the tracked
+  agent) that re-evaluates fresh on every call, so retrying is worth it. TF-806's backoff between
+  outer resend attempts was working correctly but only gave this specific condition ~1.3s total
+  to clear (5 attempts × one `poll_interval` apart) before falling through to "run manually" —
+  live traces showed it still failing identically at the end of that window (TF-811).
+
 ## [0.3.1] - 2026-09-10
 
 ### Fixed
