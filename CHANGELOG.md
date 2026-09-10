@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Implement-flow: a resend after a failed `agent prompt` call (herdr rejecting the send
+  outright — e.g. "agent ... is no longer the pane foreground process") now waits one
+  `poll_interval` before retrying, instead of burning the whole attempt budget in under 50ms
+  with no real chance for the underlying condition to resolve. Mirrors the backoff
+  `wait_for_prompt_stable` already applies to its own read-error path (TF-806).
+
 ### Changed
 
 - Documented that the plugin's cwd-resolution guarantees (`<Enter>` on an issue) only
