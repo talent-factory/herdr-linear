@@ -57,6 +57,22 @@ pub enum Error {
     /// (especially when the command is a shell alias/wrapper).
     #[error("{0}")]
     AgentNotFound(String),
+
+    /// herdr's `agent_not_ready` response code from `agent prompt` — e.g. "agent ... is no
+    /// longer the pane foreground process" (TF-811). herdr's own `queue_agent_prompt` reuses this
+    /// one code for three distinct pre-send guards (no known agent identity yet, a managed
+    /// agent's launch still pending, or — the live-observed case — the pane's OS-level pty
+    /// foreground process having momentarily diverged from the agent herdr already confirmed for
+    /// it); this variant doesn't distinguish which fired. All three are herdr saying "not yet",
+    /// not a terminal failure — the foreground check in particular re-evaluates fresh on every
+    /// call (read against herdr v0.9.0's source, `src/app/agents.rs::runtime_hosts_agent`; not
+    /// independently confirmed against this plugin's actual minimum-supported herdr version,
+    /// 0.8.0). Matches on this variant rather than a substring of the formatted message, same
+    /// rationale as [`Error::MissingResultField`] above. Distinct from [`Error::Internal`] so
+    /// [`crate::plugin::herdr_cli::agent_prompt`] can retry in place instead of surfacing a
+    /// one-shot failure — see that function's doc for the retry policy and its rationale.
+    #[error("{0}")]
+    AgentNotReady(String),
 }
 
 /// Helper function to create GraphQL error responses
