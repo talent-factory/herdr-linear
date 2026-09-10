@@ -38,6 +38,7 @@ Thumbs.db
 .headroom/
 .serena/
 .claude/
+graphify-out/
 skills-lock.json
 
 # Per-task git worktrees (implement-task workflow)
