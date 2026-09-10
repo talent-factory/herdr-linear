@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Implement-flow: a resend after a failed `agent prompt` call (herdr rejecting the send
+  outright — e.g. "agent ... is no longer the pane foreground process") now waits one
+  `poll_interval` before retrying, instead of burning the whole attempt budget in under 50ms
+  with no real chance for the underlying condition to resolve. Skipped on the last attempt,
+  since there's nothing left to wait for. Also logs a `warn!` when every attempt is exhausted,
+  so the failure is visible at a glance instead of only as a run of per-attempt `debug!` lines
+  (TF-806).
+
 ### Changed
 
 - Documented that the plugin's cwd-resolution guarantees (`<Enter>` on an issue) only
