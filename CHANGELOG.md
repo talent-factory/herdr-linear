@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-10
+
 ### Fixed
 
 - Implement-flow: a resend after a failed `agent prompt` call (herdr rejecting the send
