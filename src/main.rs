@@ -353,14 +353,21 @@ async fn ensure_loaded(
 }
 
 /// How many times [`send_prompt_until_visible`] will (re)send the implement prompt before
-/// giving up. Combined with [`PROMPT_SEND_ATTEMPT_TIMEOUT`], this bounds the worst case (every
-/// attempt timing out) at `PROMPT_SEND_ATTEMPTS` × `PROMPT_SEND_ATTEMPT_TIMEOUT` = 30s per issue
-/// — up from the ~6.5s worst case of the two-fixed-point check this replaced. The TUI's event
+/// giving up. Combined with [`PROMPT_SEND_ATTEMPT_TIMEOUT`], this bounds the "landed but then
+/// vanished" failure mode's worst case (every attempt timing out) at `PROMPT_SEND_ATTEMPTS` ×
+/// `PROMPT_SEND_ATTEMPT_TIMEOUT` = 30s per issue — up from the ~6.5s worst case of the
+/// two-fixed-point check this replaced. TF-811 added a second, larger failure mode on top of
+/// that: each attempt's own `plugin::herdr_cli::agent_prompt` call can now itself retry in place
+/// for up to ~15s (its own ~10s sleep budget plus a 5s wall-clock slack — see
+/// `agent_prompt_with_retry_policy`'s doc) before this loop even sees a failure and moves on to
+/// resend, so the true worst case across every attempt hitting *that* failure mode is closer to
+/// `PROMPT_SEND_ATTEMPTS` × (~15s + `PROMPT_SEND_POLL_INTERVAL`) ≈ 76s, not 30s. The TUI's event
 /// loop `.await`s [`send_prompt_until_visible`] inline (`Action::Implement`/
 /// `Action::ImplementMany`), so the UI is unresponsive for the full duration of a worst-case run;
 /// a genuinely broken target is expected to be rare enough that trading UI responsiveness for a
 /// wider stability-confirmation window (see [`PROMPT_SEND_STABILITY_DURATION`]) is the right
-/// default, but this is the number to revisit first if that tradeoff stops holding.
+/// default, but this — and `agent_prompt`'s own retry budget — are the numbers to revisit first
+/// if that tradeoff stops holding.
 const PROMPT_SEND_ATTEMPTS: u32 = 5;
 
 /// How often [`wait_for_prompt_stable`] re-reads the pane while confirming a sent prompt.
@@ -690,16 +697,22 @@ async fn send_prompt_until_visible_with(
                 "send_prompt_until_visible: attempt {attempt} failed to send ({err}), retrying"
             );
             last_err = Some(format!("failed to send implement command ({err})"));
-            // TF-806: without this, a resend after a failed `agent_prompt` call (herdr
-            // rejecting the send outright — e.g. the live-observed "agent ... is no longer the
-            // pane foreground process" guard) retried instantly, burning the whole `attempts`
-            // budget in well under 50ms total and giving the underlying condition no real
-            // chance to resolve before giving up. `wait_for_prompt_stable`'s own read-error
-            // branch (see its doc) already backs off for the same reason — though
-            // unconditionally, since it has no `attempt`/`attempts` context of its own to skip
-            // the wait on what it can't know is the last one. This branch does have that
-            // context, so — unlike that one — it skips the sleep on the last attempt here:
-            // there's nothing left to wait for.
+            // TF-806: without this, a resend after a failed `agent_prompt` call retried
+            // instantly, burning the whole `attempts` budget in well under 50ms total and giving
+            // the underlying condition no real chance to resolve before giving up.
+            // `wait_for_prompt_stable`'s own read-error branch (see its doc) already backs off
+            // for the same reason — though unconditionally, since it has no `attempt`/`attempts`
+            // context of its own to skip the wait on what it can't know is the last one. This
+            // branch does have that context, so — unlike that one — it skips the sleep on the
+            // last attempt here: there's nothing left to wait for.
+            //
+            // TF-811: `agent_prompt` itself now absorbs the specific herdr-rejects-the-send-
+            // outright case (e.g. the live-observed "agent ... is no longer the pane foreground
+            // process" guard) with its own in-place retry before ever returning an error here —
+            // see `plugin::herdr_cli::agent_prompt`'s doc. This branch (and the backoff below)
+            // now mainly covers other, less specific `agent_prompt` failures (e.g. a subprocess
+            // spawn error) plus whatever's left of that original guard after `agent_prompt`'s own
+            // budget is exhausted.
             if attempt < attempts {
                 tokio::time::sleep(poll_interval).await;
             }

@@ -63,13 +63,14 @@ pub enum Error {
     /// one code for three distinct pre-send guards (no known agent identity yet, a managed
     /// agent's launch still pending, or — the live-observed case — the pane's OS-level pty
     /// foreground process having momentarily diverged from the agent herdr already confirmed for
-    /// it). All three are herdr saying "not yet", not a terminal failure, and the foreground
-    /// check in particular is a live check that re-evaluates fresh on every call — verified
-    /// against herdr v0.9.0's own source (`src/app/agents.rs::runtime_hosts_agent`), not just
-    /// inferred from the message. Distinct from [`Error::Internal`] so
+    /// it); this variant doesn't distinguish which fired. All three are herdr saying "not yet",
+    /// not a terminal failure — the foreground check in particular re-evaluates fresh on every
+    /// call (read against herdr v0.9.0's source, `src/app/agents.rs::runtime_hosts_agent`; not
+    /// independently confirmed against this plugin's actual minimum-supported herdr version,
+    /// 0.8.0). Matches on this variant rather than a substring of the formatted message, same
+    /// rationale as [`Error::MissingResultField`] above. Distinct from [`Error::Internal`] so
     /// [`crate::plugin::herdr_cli::agent_prompt`] can retry in place instead of surfacing a
-    /// one-shot failure straight to the user after a single `poll_interval` backoff (which TF-806
-    /// added but which live traces showed giving this condition only ~1.3s total to clear).
+    /// one-shot failure — see that function's doc for the retry policy and its rationale.
     #[error("{0}")]
     AgentNotReady(String),
 }
