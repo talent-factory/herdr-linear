@@ -1217,6 +1217,13 @@ pub fn handle_key(
                 app.move_selection_up();
                 None
             }
+            // Space stays a literal query character (multi-word substring filters need
+            // it), so marking while editing gets its own key instead — Tab, matching the
+            // fzf-style convention of Tab-to-mark/Enter-to-confirm.
+            KeyCode::Tab => {
+                app.toggle_mark();
+                None
+            }
             KeyCode::Char(c) => {
                 app.push_filter_char(c);
                 None
@@ -2965,6 +2972,22 @@ mod tests {
 
         assert_eq!(action, None);
         assert!(app.is_filtering());
+    }
+
+    #[test]
+    fn tab_while_filtering_marks_the_selected_issue_instead_of_appending_to_the_query() {
+        // Space stays a literal filter character (multi-word substring queries need it),
+        // so marking while editing needs its own key — Tab, not Space.
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1")]);
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+
+        let action = handle_key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+
+        assert_eq!(action, None);
+        assert!(app.is_filtering());
+        assert!(app.is_marked(0));
+        assert_eq!(app.marked_issues().len(), 1);
     }
 
     #[test]

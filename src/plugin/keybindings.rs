@@ -143,6 +143,11 @@ pub static KEYBINDINGS: &[KeyBinding] = &[
         context: BindingContext::Filtering,
     },
     KeyBinding {
+        keys: "Tab",
+        action: "Mark/unmark selected issue",
+        context: BindingContext::Filtering,
+    },
+    KeyBinding {
         keys: "(any character)",
         action: "Add to filter query",
         context: BindingContext::Filtering,

@@ -563,8 +563,10 @@ terminal and herdr's `mouse_capture` config), `/` to filter it — free text mat
 identifier, or use the same `priority:`/`state:`/`label:`/`sort:` query DSL described
 under "Configure" above (type to narrow, `↑`/`↓` still navigate the narrowed list live,
 `<Enter>` confirms and keeps the filter applied, `Esc` cancels and restores the full
-list), `o` to open the selected issue in your browser, `<Space>` to mark/unmark the
-selected issue (shown with a `[x]`/`[ ]`
+list, `Tab` marks/unmarks the selected issue — `<Space>` stays a literal filter
+character instead, so multi-word queries keep working), `o` to open the selected issue
+in your browser, `<Space>` to mark/unmark the selected issue outside filtering (shown
+with a `[x]`/`[ ]`
 checkbox prefix — independent of the active filter, so a mark survives narrowing and
 clearing the filter), `<Enter>` to implement it — with no issues marked, implements just
 the selected one; with one or more marked, implements every marked issue in list order,
