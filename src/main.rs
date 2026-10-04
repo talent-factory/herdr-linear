@@ -356,12 +356,14 @@ async fn ensure_loaded(
 /// giving up. Combined with [`PROMPT_SEND_ATTEMPT_TIMEOUT`], this bounds the "landed but then
 /// vanished" failure mode's worst case (every attempt timing out) at `PROMPT_SEND_ATTEMPTS` ×
 /// `PROMPT_SEND_ATTEMPT_TIMEOUT` = 30s per issue — up from the ~6.5s worst case of the
-/// two-fixed-point check this replaced. TF-811 added a second, larger failure mode on top of
-/// that: each attempt's own `plugin::herdr_cli::agent_prompt` call can now itself retry in place
-/// for up to ~15s (its own ~10s sleep budget plus a 5s wall-clock slack — see
-/// `agent_prompt_with_retry_policy`'s doc) before this loop even sees a failure and moves on to
-/// resend, so the true worst case across every attempt hitting *that* failure mode is closer to
-/// `PROMPT_SEND_ATTEMPTS` × (~15s + `PROMPT_SEND_POLL_INTERVAL`) ≈ 76s, not 30s. The TUI's event
+/// two-fixed-point check this replaced. TF-811 added a second failure mode on top of that: each
+/// attempt's own `plugin::herdr_cli::agent_prompt` call can now itself retry in place for ~10-15s
+/// (its ~10s sleep budget plus a 5s deadline slack, overrunnable by one slow herdr call — see
+/// `agent_prompt_with_retry_policy`'s doc). If that budget runs out, this loop stops instead of
+/// resending, so that path adds one such budget, not `PROMPT_SEND_ATTEMPTS` of them. The
+/// pathological mixed case — every attempt's `agent_prompt` succeeding only late in its retry
+/// budget and the prompt then never holding stable — still costs up to roughly
+/// `PROMPT_SEND_ATTEMPTS` × (~15s + `PROMPT_SEND_ATTEMPT_TIMEOUT`) ≈ 105s. The TUI's event
 /// loop `.await`s [`send_prompt_until_visible`] inline (`Action::Implement`/
 /// `Action::ImplementMany`), so the UI is unresponsive for the full duration of a worst-case run;
 /// a genuinely broken target is expected to be rare enough that trading UI responsiveness for a
@@ -697,6 +699,12 @@ async fn send_prompt_until_visible_with(
                 "send_prompt_until_visible: attempt {attempt} failed to send ({err}), retrying"
             );
             last_err = Some(format!("failed to send implement command ({err})"));
+            // TF-811: an `AgentNotReady` here means `agent_prompt` already retried in place for
+            // its whole ~10-15s budget, so resending would only rerun that exhausted budget up to
+            // `attempts - 1` more times, multiplying the UI freeze without new information.
+            if matches!(err, herdr_linear::Error::AgentNotReady(_)) {
+                break;
+            }
             // TF-806: without this, a resend after a failed `agent_prompt` call retried
             // instantly, burning the whole `attempts` budget in well under 50ms total and giving
             // the underlying condition no real chance to resolve before giving up.
@@ -710,9 +718,8 @@ async fn send_prompt_until_visible_with(
             // outright case (e.g. the live-observed "agent ... is no longer the pane foreground
             // process" guard) with its own in-place retry before ever returning an error here —
             // see `plugin::herdr_cli::agent_prompt`'s doc. This branch (and the backoff below)
-            // now mainly covers other, less specific `agent_prompt` failures (e.g. a subprocess
-            // spawn error) plus whatever's left of that original guard after `agent_prompt`'s own
-            // budget is exhausted.
+            // now only covers other, less specific `agent_prompt` failures (e.g. a subprocess
+            // spawn error); an exhausted `agent_not_ready` budget already broke out above.
             if attempt < attempts {
                 tokio::time::sleep(poll_interval).await;
             }
@@ -4088,6 +4095,13 @@ esac
     /// finding the prompt. `agent prompt` fails with `error_message` for the first `fail_count`
     /// calls, then succeeds; `agent read` always reports `landed_text` immediately so a test can
     /// isolate the resend backoff itself without also timing `wait_for_prompt_stable`'s polling.
+    ///
+    /// The error body deliberately omits herdr's `"code"`, so it maps to `Error::Internal` and
+    /// bypasses `agent_prompt`'s TF-811 in-place retry (real herdr sends that message with
+    /// `"code":"agent_not_ready"`). Don't add the code here: `agent_prompt` would then loop
+    /// internally and stop the outer loop once its budget is spent, breaking these tests'
+    /// once-per-attempt call counts. [`write_prompt_send_not_ready_then_succeeds_script`] covers
+    /// the coded case.
     fn write_prompt_send_fails_then_succeeds_script(
         fail_count: u32,
         error_message: &str,
@@ -4145,10 +4159,57 @@ esac
     /// How many `agent prompt` calls a script written by
     /// [`write_prompt_send_fails_then_succeeds_script`] has actually served so far.
     fn send_call_count(dir: &tempfile::TempDir) -> u32 {
-        std::fs::read_to_string(dir.path().join("send_count"))
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0)
+        match std::fs::read_to_string(dir.path().join("send_count")) {
+            Ok(s) => s.trim().parse().expect("send_count must hold a number"),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(err) => panic!("send_count unreadable: {err}"),
+        }
+    }
+
+    /// Like [`write_prompt_send_fails_then_succeeds_script`], but the first `fail_count`
+    /// `agent prompt` calls fail with herdr's real `agent_not_ready` code (TF-811), so
+    /// `agent_prompt`'s in-place retry handles them instead of the outer resend loop.
+    fn write_prompt_send_not_ready_then_succeeds_script(
+        fail_count: u32,
+        landed_text: &str,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let (dir, script) = write_fake_herdr_script(&format!(
+            r#"
+case "$1 $2" in
+  "tab create")
+    echo '{{"result":{{"tab":{{"tab_id":"t1","label":"TF-579"}},"root_pane":{{"pane_id":"p1"}}}}}}'
+    exit 0
+    ;;
+  "agent prompt")
+    script_dir=$(dirname "$0")
+    count_file="$script_dir/send_count"
+    n=0
+    [ -f "$count_file" ] && n=$(cat "$count_file")
+    n=$((n + 1))
+    echo "$n" > "$count_file"
+    if [ "$n" -le {fail_count} ]; then
+      echo '{{"error":{{"code":"agent_not_ready","message":"agent w1:p1 is no longer the pane foreground process"}}}}'
+      exit 1
+    fi
+    echo '{{"result":{{}}}}'
+    exit 0
+    ;;
+  "agent read")
+    cat "$(dirname "$0")/landed.txt"
+    exit 0
+    ;;
+  *)
+    echo '{{"error":{{"message":"unexpected herdr call: $1 $2"}}}}'
+    exit 1
+    ;;
+esac
+"#
+        ));
+
+        // herdr >= 0.8.0's `agent read` prints raw terminal text, not a JSON envelope (TF-624).
+        std::fs::write(dir.path().join("landed.txt"), landed_text).unwrap();
+
+        (dir, script)
     }
 
     /// A sibling of [`write_prompt_send_read_sequence_script`] for [`wait_for_prompt_stable`]
@@ -5331,7 +5392,7 @@ esac
             .await
             .expect("stub tab_create must succeed");
 
-        let started = std::time::Instant::now();
+        let mut attempt_starts = Vec::new();
         let outcome = send_prompt_until_visible_with(
             script.to_str().unwrap(),
             &tab.root_pane_id,
@@ -5342,10 +5403,10 @@ esac
                 stability_duration: std::time::Duration::ZERO,
                 attempt_timeout: std::time::Duration::from_millis(800),
             },
-            |_, _| {},
+            |_, _| attempt_starts.push(std::time::Instant::now()),
         )
         .await;
-        let elapsed = started.elapsed();
+        let returned_at = std::time::Instant::now();
 
         assert!(
             outcome.is_err(),
@@ -5356,16 +5417,28 @@ esac
             3,
             "agent_prompt must have been called exactly once per attempt, not looped internally"
         );
-        assert!(
-            elapsed >= std::time::Duration::from_millis(700),
-            "expected 2 poll_interval backoffs (after attempts 1 and 2), took {elapsed:?} \
-             instead — looks like the backoff was dropped entirely"
+        // Measure the gaps that matter, not the total: subprocess-spawn jitter on a loaded CI
+        // runner only shrinks the margin of a total-elapsed bound, while each gap below is one
+        // backoff (>= poll_interval) or one fake-herdr call (far under poll_interval).
+        assert_eq!(
+            attempt_starts.len(),
+            3,
+            "on_attempt must fire once per attempt"
         );
+        for pair in attempt_starts.windows(2) {
+            let gap = pair[1] - pair[0];
+            assert!(
+                gap >= std::time::Duration::from_millis(500),
+                "expected a poll_interval backoff between attempts, got {gap:?} — looks like \
+                 the backoff was dropped"
+            );
+        }
+        let after_last = returned_at - attempt_starts[2];
         assert!(
-            elapsed < std::time::Duration::from_millis(1400),
+            after_last < std::time::Duration::from_millis(500),
             "expected the backoff to be skipped after the last (3rd) attempt's failure, took \
-             {elapsed:?} instead — looks like the `attempt < attempts` guard was dropped and a \
-             3rd, pointless backoff was added after the final failure"
+             {after_last:?} after it started — looks like the `attempt < attempts` guard was \
+             dropped and a pointless backoff was added after the final failure"
         );
     }
 
@@ -5387,21 +5460,21 @@ esac
             .await
             .expect("stub tab_create must succeed");
 
-        let started = std::time::Instant::now();
+        let mut attempt_starts = Vec::new();
         let outcome = send_prompt_until_visible_with(
             script.to_str().unwrap(),
             &tab.root_pane_id,
             &prompt,
             PromptSendPolicy {
                 attempts: 1,
-                poll_interval: std::time::Duration::from_millis(500),
+                poll_interval: std::time::Duration::from_secs(2),
                 stability_duration: std::time::Duration::ZERO,
-                attempt_timeout: std::time::Duration::from_millis(800),
+                attempt_timeout: std::time::Duration::from_secs(3),
             },
-            |_, _| {},
+            |_, _| attempt_starts.push(std::time::Instant::now()),
         )
         .await;
-        let elapsed = started.elapsed();
+        let elapsed = attempt_starts[0].elapsed();
 
         assert!(
             outcome.is_err(),
@@ -5413,9 +5486,93 @@ esac
             "agent_prompt must have been called exactly once"
         );
         assert!(
-            elapsed < std::time::Duration::from_millis(300),
+            elapsed < std::time::Duration::from_secs(2),
             "expected no backoff at all with a single attempt (nothing left to wait for), took \
              {elapsed:?} instead — looks like the last-attempt guard failed for attempts == 1"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_prompt_until_visible_lets_agent_prompt_absorb_agent_not_ready_within_one_attempt()
+    {
+        // TF-811 review gap: the TF-806 tests above use a code-less error on purpose, so no test
+        // drove herdr's real `agent_not_ready` response through this loop. One rejection must be
+        // absorbed by `agent_prompt`'s in-place retry: the send succeeds on attempt 1 without
+        // spending an outer attempt.
+        let prompt = plugin::implement::build_implement_prompt("TF-579");
+        let landed = format!("❯ {prompt}\n");
+        let (dir, script) = write_prompt_send_not_ready_then_succeeds_script(1, &landed);
+        let tab = plugin::herdr_cli::tab_create(script.to_str().unwrap(), dir.path(), "TF-579")
+            .await
+            .expect("stub tab_create must succeed");
+
+        let mut attempts_seen = 0;
+        let outcome = send_prompt_until_visible_with(
+            script.to_str().unwrap(),
+            &tab.root_pane_id,
+            &prompt,
+            PromptSendPolicy {
+                attempts: 2,
+                poll_interval: std::time::Duration::from_millis(50),
+                stability_duration: std::time::Duration::ZERO,
+                attempt_timeout: std::time::Duration::from_millis(800),
+            },
+            |_, _| attempts_seen += 1,
+        )
+        .await;
+
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(
+            attempts_seen, 1,
+            "agent_not_ready must not cost an outer attempt"
+        );
+        assert_eq!(
+            send_call_count(&dir),
+            2,
+            "expected the rejected call plus one in-place retry"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_prompt_until_visible_does_not_resend_after_agent_prompt_exhausts_agent_not_ready()
+    {
+        // TF-811 review finding: once `agent_prompt` has spent its whole in-place retry budget
+        // on `agent_not_ready`, resending would only rerun that budget. The loop must stop after
+        // the first attempt. Takes ~10s: the public `agent_prompt` uses its real budget.
+        let prompt = plugin::implement::build_implement_prompt("TF-579");
+        let landed = format!("❯ {prompt}\n");
+        let (dir, script) = write_prompt_send_not_ready_then_succeeds_script(u32::MAX, &landed);
+        let tab = plugin::herdr_cli::tab_create(script.to_str().unwrap(), dir.path(), "TF-579")
+            .await
+            .expect("stub tab_create must succeed");
+
+        let mut attempts_seen = 0;
+        let outcome = send_prompt_until_visible_with(
+            script.to_str().unwrap(),
+            &tab.root_pane_id,
+            &prompt,
+            PromptSendPolicy {
+                attempts: 3,
+                poll_interval: std::time::Duration::from_millis(50),
+                stability_duration: std::time::Duration::ZERO,
+                attempt_timeout: std::time::Duration::from_millis(800),
+            },
+            |_, _| attempts_seen += 1,
+        )
+        .await;
+
+        let err = outcome.expect_err("an exhausted agent_not_ready budget must fail the send");
+        assert!(
+            err.contains("gave up after"),
+            "expected agent_prompt's give-up detail in the error, got: {err}"
+        );
+        assert_eq!(attempts_seen, 1, "the outer loop must not resend");
+        assert_eq!(
+            send_call_count(&dir),
+            21,
+            "expected one agent_prompt budget (1 call + 20 retries), not one per outer attempt"
         );
     }
 
