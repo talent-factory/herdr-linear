@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Tab` marks/unmarks the selected issue while the `/`-filter is being typed. `<Space>` stays a
+  literal filter character there, so multi-word queries keep working; outside filtering,
+  `<Space>` still marks as before.
+
 ## [0.3.1] - 2026-10-04
 
 ### ⚠️ Breaking changes (semver, library)
