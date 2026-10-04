@@ -16,8 +16,9 @@
 //! implementations aren't kept in sync automatically; treat this as a starting point, not a
 //! guarantee, if `herdr-file-viewer` changes its side later.
 //!
-//! **Scope (TF-793):** this module only covers tabs/panes *this plugin* creates itself via
-//! [`crate::plugin::herdr_cli::tab_create`] (the "implement this issue" flow). A plain terminal
+//! **Scope (TF-793):** the cwd guarantee for *new tabs* only covers tabs/panes *this plugin*
+//! creates itself via [`crate::plugin::herdr_cli::tab_create`] (the "implement this issue" flow);
+//! [`resolve_cwd`]'s other caller, repo detection, never creates a tab. A plain terminal
 //! tab opened through herdr's own tab-bar `+` button is not spawned by this plugin at all, so
 //! none of the above runs for it. Such a tab has been observed inheriting the directory the
 //! `herdr` host process itself was originally started from, rather than the active space's
