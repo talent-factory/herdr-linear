@@ -1217,9 +1217,10 @@ pub fn handle_key(
                 app.move_selection_up();
                 None
             }
-            // Space stays a literal query character (multi-word substring filters need
-            // it), so marking while editing gets its own key instead — Tab, matching the
-            // fzf-style convention of Tab-to-mark/Enter-to-confirm.
+            // Space stays a literal query character (multi-word free text and multi-term DSL
+            // queries like `priority:>=2 sort:-updated` need it), so marking while editing gets its
+            // own key: Tab, borrowed from fzf's Tab-to-mark. Unlike fzf, Tab doesn't move the cursor,
+            // and Enter here only confirms the filter; a second Enter implements.
             KeyCode::Tab => {
                 app.toggle_mark();
                 None
@@ -2975,9 +2976,8 @@ mod tests {
     }
 
     #[test]
-    fn tab_while_filtering_marks_the_selected_issue_instead_of_appending_to_the_query() {
-        // Space stays a literal filter character (multi-word substring queries need it),
-        // so marking while editing needs its own key — Tab, not Space.
+    fn tab_while_filtering_toggles_the_mark_on_the_selected_issue() {
+        // Space is reserved for query text while filtering (see `handle_key`); Tab marks there.
         let mut app = app_in_my_issues_view();
         app.set_issues(vec![sample_issue("ENG-1")]);
         handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
@@ -2986,8 +2986,116 @@ mod tests {
 
         assert_eq!(action, None);
         assert!(app.is_filtering());
-        assert!(app.is_marked(0));
-        assert_eq!(app.marked_issues().len(), 1);
+        assert_eq!(app.marked_issues(), vec![sample_issue("ENG-1")]);
+
+        handle_key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+
+        assert!(app.is_filtering());
+        assert!(
+            app.marked_issues().is_empty(),
+            "a second Tab must unmark again"
+        );
+    }
+
+    /// Types `text` into an open `/`-filter one key at a time.
+    fn type_filter(app: &mut App, text: &str) {
+        for c in text.chars() {
+            handle_key(app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+    }
+
+    #[test]
+    fn tab_while_filtering_marks_the_matching_issue_not_the_same_raw_index() {
+        // Under a narrowed filter, `selected` indexes the *filtered* list; the mark must land
+        // on the matching issue's raw index (ENG-3, raw 2), not on raw index 0 or 1.
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![
+            sample_issue("ENG-1"),
+            sample_issue("ENG-2"),
+            sample_issue("ENG-3"),
+        ]);
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        type_filter(&mut app, "ENG-3");
+
+        handle_key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+
+        assert!(app.is_marked(2));
+        assert!(!app.is_marked(0));
+        assert_eq!(app.marked_issues(), vec![sample_issue("ENG-3")]);
+    }
+
+    #[test]
+    fn space_while_filtering_is_typed_into_the_query_not_a_mark_toggle() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+
+        type_filter(&mut app, "issue eng-2");
+
+        assert!(app.is_filtering());
+        assert!(
+            app.marked_issues().is_empty(),
+            "Space must not mark while filtering"
+        );
+        assert_eq!(app.selected_issue(), Some(&sample_issue("ENG-2")));
+        match &app.screen {
+            Screen::View(_, ViewState::Loaded { filter, .. }) => {
+                assert_eq!(filter.query, "issue eng-2");
+            }
+            other => panic!("expected a loaded view, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn marks_made_with_tab_while_filtering_survive_confirm_and_drive_implement_many() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![
+            sample_issue("ENG-1"),
+            sample_issue("ENG-2"),
+            sample_issue("ENG-3"),
+        ]);
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        type_filter(&mut app, "ENG-2");
+        handle_key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+
+        // The first Enter only confirms the filter; it must not implement yet.
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+            None
+        );
+        assert!(!app.is_filtering());
+        assert!(app.is_marked(1));
+
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+            Some(Action::ImplementMany(vec![sample_issue("ENG-2")]))
+        );
+    }
+
+    #[test]
+    fn esc_cancelling_the_filter_keeps_marks_made_while_filtering() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        type_filter(&mut app, "ENG-2");
+        handle_key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+        assert!(!app.is_filtering());
+        assert_eq!(app.marked_issues(), vec![sample_issue("ENG-2")]);
+    }
+
+    #[test]
+    fn tab_while_filtering_with_no_matches_marks_nothing() {
+        let mut app = app_in_my_issues_view();
+        app.set_issues(vec![sample_issue("ENG-1"), sample_issue("ENG-2")]);
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        type_filter(&mut app, "zzz");
+
+        assert_eq!(handle_key(&mut app, KeyCode::Tab, KeyModifiers::NONE), None);
+        assert!(app.is_filtering());
+        assert!(app.marked_issues().is_empty());
     }
 
     #[test]

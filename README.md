@@ -564,7 +564,7 @@ identifier, or use the same `priority:`/`state:`/`label:`/`sort:` query DSL desc
 under "Configure" above (type to narrow, `↑`/`↓` still navigate the narrowed list live,
 `<Enter>` confirms and keeps the filter applied, `Esc` cancels and restores the full
 list, `Tab` marks/unmarks the selected issue — `<Space>` stays a literal filter
-character instead, so multi-word queries keep working), `o` to open the selected issue
+character instead, so multi-word and multi-term queries keep working), `o` to open the selected issue
 in your browser, `<Space>` to mark/unmark the selected issue outside filtering (shown
 with a `[x]`/`[ ]`
 checkbox prefix — independent of the active filter, so a mark survives narrowing and

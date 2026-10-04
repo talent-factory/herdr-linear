@@ -144,7 +144,7 @@ pub static KEYBINDINGS: &[KeyBinding] = &[
     },
     KeyBinding {
         keys: "Tab",
-        action: "Mark/unmark selected issue",
+        action: "Mark/unmark selected issue (Space types a space here)",
         context: BindingContext::Filtering,
     },
     KeyBinding {
