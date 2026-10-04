@@ -607,6 +607,16 @@ elsewhere, or closes it if it's already focused.
 > (an unreadable process directory), `<Enter>` sets an actionable status instead of
 > silently starting the agent nowhere in particular.
 
+> [!NOTE]
+> The correct-cwd behavior above only applies to tabs **this plugin** opens for you via
+> `<Enter>` — it does not extend to a plain terminal tab you open yourself through herdr's
+> own tab-bar `+` button (not this plugin's menu). That tab isn't spawned by this plugin at
+> all, so none of the above runs for it; as of writing, it appears to inherit whatever
+> directory the `herdr` host process itself was originally started from, rather than your
+> active space's tracked working directory. That's a `herdr`-host-level behavior, outside
+> this plugin's code — there's no fix for it here. Workaround: `cd` manually once the tab
+> opens, or use `<Enter>` on an issue instead, which does resolve the cwd correctly.
+
 To see what the plugin is doing internally (e.g. while debugging a cwd-resolution or
 `herdr` CLI issue), set `HERDR_LINEAR_LOG_FILE` to a file path before launching herdr —
 the plugin writes its `tracing` diagnostics there instead of to stdout, which would
