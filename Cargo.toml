@@ -29,6 +29,11 @@ unicode-width = { version = "0.2", optional = true }
 # clipboard-copy fallback (remote-session browser-open) can encode into it.
 base64 = { version = "0.22", optional = true }
 
+# herdr-linear-gui only (enabled via the `gui` feature): OAuth PKCE sign-in.
+sha2 = { version = "0.10", optional = true }
+getrandom = { version = "0.3", optional = true }
+url = { version = "2", optional = true }
+
 [dev-dependencies]
 mockito = "1.2"
 tempfile = "3"
@@ -37,11 +42,18 @@ criterion = { version = "0.7", features = ["async_tokio"] }
 [features]
 default = []
 plugin = ["ratatui", "crossterm", "toml", "open", "tui-markdown", "unicode-width", "base64"]
+gui = ["open", "base64", "sha2", "getrandom", "url"]
 
 [[bin]]
 name = "herdr-linear"
 path = "src/main.rs"
 required-features = ["plugin"]
+
+# JSON bridge for the Herdr desktop app's `linear` side panel (see src/bin/herdr-linear-gui.rs).
+[[bin]]
+name = "herdr-linear-gui"
+path = "src/bin/herdr-linear-gui.rs"
+required-features = ["gui"]
 
 # `harness = false` swaps out libtest for criterion's own runner. Without
 # it, cargo falls back to the default libtest harness, which generates its

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `herdr-linear-gui`: a JSON bridge for the Herdr desktop app's Linear side panel. Connects any
+  number of workspaces, through Linear OAuth (PKCE, refreshed automatically) or personal API keys.
+  Commands: `workspaces`, `list`, `search`, `issue`, `lookup` (routed to the workspace that owns
+  each issue), `login`, `logout`. Build and install it with `just install-gui`.
+
 ## [0.3.1] - 2026-10-04
 
 ### ⚠️ Breaking changes (semver, library)
