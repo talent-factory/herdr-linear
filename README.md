@@ -628,9 +628,10 @@ export HERDR_LINEAR_LOG_FILE=/tmp/herdr-linear.log
 
 ## Herdr desktop app panel (`herdr-linear-gui`)
 
-The Herdr desktop app (`herdr-app`) draws side panels from JavaScript mods; its `linear` mod
-gets Linear data from `herdr-linear-gui`, a small JSON bridge built on this crate's client. The
-mod runs one subcommand per request and reads one JSON document from stdout.
+The Herdr desktop app (`herdr-app`) draws side panels from JavaScript mods. The `linear` mod in
+[`herdr-app/mods/linear`](herdr-app/mods/linear) (setup: [`herdr-app/README.md`](herdr-app/README.md),
+`just install-mod`) gets Linear data from `herdr-linear-gui`, a small JSON bridge built on this
+crate's client. The mod runs one subcommand per request and reads one JSON document from stdout.
 
 ```bash
 just install-gui                       # build and copy to ~/.local/bin/herdr-linear-gui
