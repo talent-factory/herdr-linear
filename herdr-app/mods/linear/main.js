@@ -14,7 +14,7 @@
 // The panel's "Open in Linear" hands the issue URL to the browser.
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, TextView } from "gpui-base";
-import { exec, hc, run, focused, panes, spaces, theme, layout, settings, shared, setShared, notify, checking, props as blockProps } from "herdr";
+import { exec, hc, run, focused, spaces, theme, layout, settings, shared, setShared, notify, checking, props as blockProps } from "herdr";
 import * as L from "./linear.js";
 
 const PANEL = "linear-panel"; // the layout node the toggle shows and hides
@@ -160,7 +160,7 @@ export default class Linear extends View {
     this.stack = []; // { id, q, ws }: issues shown over the list, newest last
     this.issues = new Map(); // "<ws>|<q>" -> { issue?, error?, loading?, at? }
     this.openSeen = 0; this.wasHidden = true; this.workspacesAt = 0;
-    this.input = InputState.new({ placeholder: "Search issues, or CON-12 / issue URL" });
+    this.input = InputState.new({ placeholder: "Search issues, or paste an issue ID / URL" });
     this.input.on("submit", (_e, cx) => this.submit(cx));
     if (checking()) return;
     this.loadWorkspaces(cx);

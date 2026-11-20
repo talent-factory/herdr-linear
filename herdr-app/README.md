@@ -3,12 +3,19 @@
 A side panel for [Herdr](https://herdr.dev)'s desktop app (`herdr-app`): your Linear issues
 beside your terminals, in the right workspace for the repo you're in.
 
+![An issue opened from a terminal selection](preview.png)
+
+![Assigned issues, with workspace chips](list.png)
+
+*Screenshots use made-up demo workspaces.* To build the mod from scratch, see
+[RECIPE.md](RECIPE.md).
+
 - **Lists:** Assigned, Created, On screen (issues the focused terminal mentions), and search.
-  Typing `CON-12` or an issue URL in the search box opens that issue.
+  Typing `ENG-12` or an issue URL in the search box opens that issue.
 - **Issues in full:** status, priority, assignee, project, cycle, labels, parent, description,
   sub-issues, linked PRs and comments, with Open in Linear (browser) and copy link / ID /
   branch name.
-- **Terminal links:** select an issue code in any terminal (double-click `CON-12`, or
+- **Terminal links:** select an issue code in any terminal (double-click `ENG-12`, or
   triple-click a line holding one) and the panel opens it. The link button in the panel
   header turns this off.
 - **Several workspaces:** connect each one with **+**. The lists follow the focused
