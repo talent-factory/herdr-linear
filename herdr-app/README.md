@@ -64,3 +64,9 @@ instead opens a terminal that asks for a personal API key.
 
 Icons: [Lucide](https://lucide.dev) (ISC), and the Linear mark from
 [Simple Icons](https://simpleicons.org) (CC0).
+
+## Notice
+
+The Branch, All, comments, actions, worktree and settings features are adapted from
+[Branch Issue](https://github.com/munza/herdr-mods), Copyright 2026 Tawsif Aqib, Apache-2.0.
+Adapted files carry that attribution in their header.

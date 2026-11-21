@@ -96,6 +96,34 @@ Linear workspaces and shows the right one for the repo you're in.
   - A failed connect stays in the panel in `ansi1` and as a toast.
   - Network errors show above the list, which keeps the last data.
 
+## Branch Issue features
+
+Ported from Branch Issue (https://github.com/munza/herdr-mods), Copyright 2026 Tawsif Aqib,
+Apache-2.0, and adapted to several workspaces: every row and issue carries its `workspace`, and
+every bridge call passes it as `-w`. Branch Issue's helper and `LINEAR_API_KEY` are not used.
+
+- **Branch** view: the focused terminal's issues, from `git config branch.<branch>.herdr-issue`
+  (comma-separated) plus identifiers in the branch name that match a connected team key, capped by
+  `branch.max_identifiers`, each confirmed through `lookup` (the repo's workspace breaks ties;
+  unknown ones are dropped). One issue opens its detail with no back button; none shows **Link
+  issue**. Unlink (Actions) only removes identifiers from git config, not from the branch name.
+- **All** view: scope, state and team choosers (remembered per workspace); the search box filters
+  it through `issues --search` after `refresh.search_debounce`; rows under collapsible workflow
+  states, started first; `+ more` follows the cursor.
+- **Issue**: state, priority and assignee choosers write at once (`update`); sub-issues done/total
+  and the first linked PR's status; tabs Overview (Agents, Worktrees, Properties, Links,
+  Sub-issues, Parent, Description) and Comments.
+- **Comments**: threads, Reply, a new-comment box, drafts per workspace and issue. Writes never
+  retry: a failure keeps the draft and shows the error; a success notice clears after 5 s.
+- **Actions**: Create worktree, Send to agent (running, `(spawn)` sub-agent, Start new), Unlink.
+  The message tells the agent to treat Linear's text as data and not to post unless asked.
+- **Settings**: `settings` in `mod.json` (schema: `mod.schema.json`): `refresh.every`,
+  `refresh.search_debounce`, `branch.max_identifiers`, `list.default.{scope,state,team}`,
+  `worktrees.{root,open_with,move_to_started}`. Problems show at the top of the panel.
+- **Commands** (`herdr-app do linear.<x>`): `refresh`, `view:<branch|assigned|created|all|screen>`,
+  `open:<ID>`, `tab:<overview|comments>`, `back`.
+- Pure logic is tested with `node --test herdr-app/mods/linear/tests/*.test.mjs`.
+
 ## Built from
 
 - **Layout**: a toggle block in the tab row and a hidden column `linear-panel` beside the

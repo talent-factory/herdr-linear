@@ -1,1 +1,6 @@
-{ "place": "none", "title": "Linear" }
+{
+  "$schema": "./mod.schema.json",
+  "place": "none",
+  "title": "Linear",
+  "settings": {}
+}

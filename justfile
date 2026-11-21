@@ -33,7 +33,7 @@ install-gui:
 [group('build')]
 install-mod:
     mkdir -p ~/.config/herdr-app/mods/linear
-    rsync -a --delete --exclude gpui-kit.d.ts --exclude jsconfig.json --exclude .gitignore herdr-app/mods/linear/ ~/.config/herdr-app/mods/linear/
+    rsync -a --delete --exclude gpui-kit.d.ts --exclude jsconfig.json --exclude .gitignore --exclude tests herdr-app/mods/linear/ ~/.config/herdr-app/mods/linear/
 
 # Watch for changes and rebuild (+ run lib tests)
 [group('build')]
