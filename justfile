@@ -24,6 +24,17 @@ setup:
 build:
     cargo build --release
 
+# Build the Herdr desktop app's Linear panel bridge and install it to ~/.local/bin
+[group('build')]
+install-gui:
+    cargo install --force --path . --features gui --bin herdr-linear-gui --root ~/.local
+
+# Install the Linear panel mod into the Herdr desktop app (it reloads by itself)
+[group('build')]
+install-mod:
+    mkdir -p ~/.config/herdr-app/mods/linear
+    rsync -a --delete --exclude gpui-kit.d.ts --exclude jsconfig.json --exclude .gitignore --exclude tests herdr-app/mods/linear/ ~/.config/herdr-app/mods/linear/
+
 # Watch for changes and rebuild (+ run lib tests)
 [group('build')]
 watch:

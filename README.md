@@ -626,6 +626,39 @@ otherwise corrupt the TUI:
 export HERDR_LINEAR_LOG_FILE=/tmp/herdr-linear.log
 ```
 
+## Herdr desktop app panel (`herdr-linear-gui`)
+
+The Herdr desktop app (`herdr-app`) draws side panels from JavaScript mods. The `linear` mod in
+[`herdr-app/mods/linear`](herdr-app/mods/linear) (setup: [`herdr-app/README.md`](herdr-app/README.md),
+`just install-mod`) gets Linear data from `herdr-linear-gui`, a small JSON bridge built on this
+crate's client. The mod runs one subcommand per request and reads one JSON document from stdout.
+
+```bash
+just install-gui                       # build and copy to ~/.local/bin/herdr-linear-gui
+herdr-linear-gui login                 # connect a workspace: Linear OAuth in the browser
+herdr-linear-gui login --key           # or a personal API key (hidden prompt)
+herdr-linear-gui workspaces            # connected workspaces: viewer, team keys
+herdr-linear-gui list assigned -w ws   # or `created`: open issues in workspace `ws`
+herdr-linear-gui search "release" -w ws
+herdr-linear-gui issue CON-12          # one issue in full; also an issue URL or UUID
+herdr-linear-gui lookup CON-1 FFL-2    # many issues, from whichever workspaces own them
+herdr-linear-gui logout ws             # revoke and forget a workspace
+```
+
+`ws` is a workspace's URL key (`linear.app/<ws>/…`). Connect each workspace you use (run `login`
+again and pick another workspace on Linear's consent screen). An issue URL goes to its own
+workspace; a bare identifier goes to the workspace that owns its team key.
+
+Sign-in uses the authorization-code flow with PKCE, so no client secret ships. The code returns
+to `http://127.0.0.1:47821/callback`, which must be one of the OAuth app's redirect URIs.
+Credentials are kept in `~/.config/herdr-linear/accounts.json` (mode 0600; `$HERDR_LINEAR_CONFIG_DIR`
+moves it). Access tokens are refreshed automatically, and concurrent processes share one refresh.
+`LINEAR_API_KEY`, if set, adds its workspace.
+
+It signs in through the public "Herdr Issues" OAuth app; `HERDR_LINEAR_CLIENT_ID` swaps in another one (its redirect URIs must include the callback above). Errors go to stderr
+as one line. Exit code 2 means a workspace must be connected (or reconnected); 1 means anything
+else. `HERDR_LINEAR_API_BASE` points GraphQL and token requests at another host.
+
 ## License
 
 Dual-licensed under MIT OR Apache-2.0

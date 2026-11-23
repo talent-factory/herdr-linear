@@ -1,0 +1,188 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Linear mod.json",
+  "description": "What Herdr reads from the Linear panel's mod.json, and the settings it takes.",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "This file's schema, for editors."
+    },
+    "version": {
+      "type": "string",
+      "description": "The mod's version."
+    },
+    "title": {
+      "type": "string",
+      "description": "The mod's name, as Herdr shows it."
+    },
+    "place": {
+      "enum": [
+        "left",
+        "right",
+        "top",
+        "bottom",
+        "none"
+      ],
+      "description": "Where Herdr first docks the mod. \"none\": only where a layout or another mod puts it."
+    },
+    "size": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Its first size, in pixels."
+    },
+    "focusable": {
+      "type": "boolean",
+      "description": "Lets pane.go give a shown copy the keyboard."
+    },
+    "overlay": {
+      "type": "object",
+      "description": "How mod.open shows it.",
+      "properties": {
+        "kind": {
+          "enum": [
+            "dialog",
+            "popup",
+            "window"
+          ]
+        },
+        "width": {
+          "type": "number",
+          "minimum": 0
+        },
+        "height": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "settings": {
+      "type": "object",
+      "description": "Your changes. A setting left out uses its default.",
+      "additionalProperties": false,
+      "properties": {
+        "refresh": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "every": {
+              "title": "Refresh",
+              "description": "How often a visible panel rereads Linear.",
+              "type": [
+                "string",
+                "integer"
+              ],
+              "format": "duration",
+              "pattern": "^\\s*\\d+(\\.\\d+)?\\s*(ms|s|m|h)\\s*$",
+              "default": "60s"
+            },
+            "search_debounce": {
+              "title": "Search delay",
+              "description": "How long typing pauses before a search runs.",
+              "type": [
+                "string",
+                "integer"
+              ],
+              "format": "duration",
+              "pattern": "^\\s*\\d+(\\.\\d+)?\\s*(ms|s|m|h)\\s*$",
+              "default": "450ms"
+            }
+          }
+        },
+        "branch": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "max_identifiers": {
+              "title": "Issues per branch",
+              "description": "The most issue identifiers one branch name may carry.",
+              "type": "integer",
+              "minimum": 1,
+              "default": 4
+            }
+          }
+        },
+        "list": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "default": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "scope": {
+                  "title": "First scope",
+                  "description": "The list's first scope, until a saved view exists.",
+                  "type": "string",
+                  "enum": [
+                    "mine",
+                    "cycle",
+                    "all"
+                  ],
+                  "x-labels": {
+                    "mine": "My issues",
+                    "cycle": "Active cycle",
+                    "all": "All issues"
+                  },
+                  "default": "mine"
+                },
+                "state": {
+                  "title": "First state",
+                  "description": "The list's first state filter, until a saved view exists.",
+                  "type": "string",
+                  "enum": [
+                    "active",
+                    "backlog",
+                    "started",
+                    "done",
+                    "cancelled",
+                    "all"
+                  ],
+                  "x-labels": {
+                    "active": "Active",
+                    "backlog": "Backlog",
+                    "started": "Started",
+                    "done": "Done",
+                    "cancelled": "Cancelled",
+                    "all": "All states"
+                  },
+                  "default": "active"
+                },
+                "team": {
+                  "title": "First team",
+                  "description": "A team key to filter All by at first, such as CON, until a workspace has a saved filter. Empty shows every team.",
+                  "type": "string",
+                  "default": ""
+                }
+              }
+            }
+          }
+        },
+        "worktrees": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "root": {
+              "title": "Worktree folder",
+              "description": "Where Create worktree puts new checkouts. Empty: Herdr's own worktree folder (settings.json), else ~/.herdr/worktrees.",
+              "type": "string",
+              "default": ""
+            },
+            "open_with": {
+              "title": "Open with",
+              "description": "What a new worktree opens: terminal, or an installed agent's key such as claude.",
+              "type": "string",
+              "default": "terminal"
+            },
+            "move_to_started": {
+              "title": "Move to started",
+              "description": "Preselect moving the issue to its started state when you start work.",
+              "type": "boolean",
+              "default": false
+            }
+          }
+        }
+      }
+    }
+  }
+}
