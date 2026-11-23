@@ -10,6 +10,14 @@
 //! herdr-linear-gui search <text> -w <ws>           issue search (Linear allows 30/min)
 //! herdr-linear-gui issue <ref> [-w <ws>]           one issue in full: description, sub-issues, links, comments
 //! herdr-linear-gui lookup <ref>... [-w <ws>]       many issues by identifier (terminal mentions)
+//! herdr-linear-gui issues -w <ws> [--scope mine|cycle|all] [--state active|backlog|started|done|cancelled|all]
+//!                  [--team <KEY>] [--search <text>] [--after <cursor>]
+//!                                                  one page (50) of issues by filter: { items, cursor }
+//! herdr-linear-gui comment <issueId> -w <ws> --body <text> [--parent <commentId>]
+//!                                                  post a comment, or a reply to one
+//! herdr-linear-gui uncomment <commentId> -w <ws>   delete a comment (yours, or any as an admin)
+//! herdr-linear-gui update <issueId> -w <ws> [--state <stateId>] [--assignee <userId> | --unassign]
+//!                  [--priority <0-4>]              change an issue's state, assignee or priority
 //! herdr-linear-gui login [--no-browser]            connect a workspace through Linear OAuth (PKCE)
 //! herdr-linear-gui login --key                     connect a workspace with a personal API key (hidden prompt)
 //! herdr-linear-gui logout <ws>                     revoke and forget a workspace
@@ -19,6 +27,13 @@
 //! any case), an issue URL, or an issue UUID. Every issue row carries `workspace`. Issue URLs
 //! name their workspace; a bare identifier goes to the workspace that owns its team key
 //! (`-w` breaks a tie); a UUID to `-w`, else the only workspace.
+//!
+//! `issues` defaults to every scope and the active states (triage, backlog, unstarted,
+//! started); its `--search` matches title and description, a bare number (`12`, `#12`) in any
+//! team, and an identifier (`CON-12`). `cursor` is the next page's `--after`, or null. Writes
+//! (`comment`, `update`) take the issue's UUID (the detail's `id`), run in `-w` (else the only
+//! workspace) and are sent once: no rate-limit retry. A token Linear rejects (401) is still
+//! refreshed and the write sent again, since Linear refused it before running it.
 //!
 //! Credentials live in `<config dir>/accounts.json` (mode 0600): one entry per workspace, an
 //! OAuth token pair (refreshed here; access tokens last 24h, refresh tokens rotate) or a
@@ -58,31 +73,62 @@ const LOCK_STALE: Duration = Duration::from_secs(60);
 const LIST_LIMIT: u32 = 100;
 const SEARCH_LIMIT: u32 = 30;
 const LOOKUP_LIMIT: usize = 50;
+const ISSUES_PAGE: u32 = 50;
 
 /// One list row. Inlined into each query because search results are a different GraphQL type
 /// (`IssueSearchResult`) with the same fields, so a shared `fragment on Issue` can't cover both.
-const ROW: &str = "id identifier title priority priorityLabel updatedAt url \
-    state { name type color } assignee { displayName } project { name } team { key }";
+/// Every field here exists on `IssueSearchResult` too, so search rows are full rows.
+const ROW: &str = "id identifier title priority priorityLabel createdAt updatedAt url branchName \
+    state { id name type color } assignee { id displayName } project { name } team { id key name }";
 
 const OPEN_ONLY: &str = r#"{ state: { type: { nin: ["completed", "canceled"] } } }"#;
 
 const QUERY_ME: &str = "query { viewer { id displayName email organization { id name urlKey } } \
     teams(first: 250) { nodes { id key name } } }";
 
-const QUERY_ISSUE: &str = r#"query($id: String!) { issue(id: $id) {
+/// An issue's comments, a page (100) at a time after `$after`; ordered by `createdAt`, newest
+/// first. A macro so both queries below can `concat!` it.
+macro_rules! comments_page {
+    () => {
+        "comments(first: 100, after: $after, orderBy: createdAt) { pageInfo { hasNextPage endCursor } \
+        nodes { id body url createdAt updatedAt user { id displayName } botActor { name } parent { id } } }"
+    };
+}
+
+const QUERY_ISSUE: &str = concat!(
+    r#"query($id: String!, $after: String) { issue(id: $id) {
   id identifier title description priority priorityLabel estimate dueDate url branchName createdAt updatedAt
-  state { name type color }
-  team { key name }
-  assignee { displayName }
+  state { id name type color }
+  team { id key name
+    states(first: 100) { nodes { id name type color position } }
+    members(first: 250) { nodes { id name displayName active } } }
+  assignee { id displayName }
   creator { displayName }
   project { name url }
   cycle { number name }
   labels { nodes { name color } }
-  parent { identifier title state { name type color } }
-  children(first: 100) { nodes { identifier title state { name type color } assignee { displayName } } }
-  attachments(first: 25) { nodes { title subtitle url sourceType } }
-  comments(first: 50, orderBy: createdAt) { nodes { id body createdAt url user { displayName } botActor { name } parent { id } } }
-} }"#;
+  parent { id identifier title url state { name type color } }
+  children(first: 100) { nodes { id identifier title url updatedAt state { name type color } assignee { displayName } } }
+  attachments(first: 25) { nodes { id title subtitle url sourceType metadata } }
+  "#,
+    comments_page!(),
+    "\n} }"
+);
+
+const QUERY_COMMENTS: &str = concat!(
+    "query($id: String!, $after: String) { issue(id: $id) { ",
+    comments_page!(),
+    " } }"
+);
+
+const MUTATION_COMMENT: &str = "mutation($issue: String!, $body: String!, $parent: String) { \
+    commentCreate(input: { issueId: $issue, body: $body, parentId: $parent }) { success comment { id url } } }";
+
+const MUTATION_UNCOMMENT: &str = "mutation($id: String!) { commentDelete(id: $id) { success } }";
+
+const MUTATION_UPDATE: &str = "mutation($id: String!, $input: IssueUpdateInput!) { \
+    issueUpdate(id: $id, input: $input) { success issue { \
+    id state { id name type color } assignee { id displayName } priority priorityLabel } } }";
 
 // --- failures --------------------------------------------------------------------------------
 
@@ -139,7 +185,11 @@ async fn main() -> ExitCode {
 }
 
 const USAGE: &str = "usage: herdr-linear-gui workspaces | list assigned|created -w <ws> | search <text> -w <ws> \
-    | issue <ref> [-w <ws>] | lookup <ref>... [-w <ws>] | login [--key | --no-browser] | logout <ws>";
+    | issue <ref> [-w <ws>] | lookup <ref>... [-w <ws>] \
+    | issues -w <ws> [--scope mine|cycle|all] [--state active|backlog|started|done|cancelled|all] [--team <KEY>] [--search <text>] [--after <cursor>] \
+    | comment <issueId> -w <ws> --body <text> [--parent <commentId>] | uncomment <commentId> -w <ws> \
+    | update <issueId> -w <ws> [--state <stateId>] [--assignee <userId> | --unassign] [--priority <0-4>] \
+    | login [--key | --no-browser] | logout <ws>";
 
 async fn run(mut args: Vec<String>) -> Outcome {
     let workspace = take_option(&mut args, "-w").or_else(|| take_option(&mut args, "--workspace"));
@@ -158,6 +208,10 @@ async fn run(mut args: Vec<String>) -> Outcome {
             .await
         }
         Some("lookup") => lookup(&rest, hint).await,
+        Some("issues") => issues(rest, hint).await,
+        Some("comment") => comment(rest, hint).await,
+        Some("uncomment") => uncomment(rest, hint).await,
+        Some("update") => update(rest, hint).await,
         Some("login") if rest.iter().any(|a| a == "--key") => login_key().await,
         Some("login") => login_oauth(rest.iter().any(|a| a == "--no-browser")).await,
         Some("logout") => {
@@ -175,6 +229,22 @@ fn take_option(args: &mut Vec<String>, name: &str) -> Option<String> {
     let i = args.iter().position(|a| a == name)?;
     args.remove(i);
     (i < args.len()).then(|| args.remove(i))
+}
+
+/// Removes a bare flag; whether it was there.
+fn take_flag(args: &mut Vec<String>, name: &str) -> bool {
+    let before = args.len();
+    args.retain(|a| a != name);
+    args.len() != before
+}
+
+/// The one positional argument left once the options are taken.
+fn only_arg<'a>(args: &'a [String], missing: &str) -> Result<&'a str, Failure> {
+    match args {
+        [one] if !one.trim().is_empty() => Ok(one.trim()),
+        [] | [_] => Err(fail(missing)),
+        [_, extra, ..] => Err(fail(format!("unexpected argument {extra:?}"))),
+    }
 }
 
 fn now_ms() -> i64 {
@@ -259,8 +329,8 @@ impl Account {
         json!({
             "urlKey": self.org.url_key,
             "name": self.org.name,
-            "viewer": { "displayName": self.viewer.display_name, "email": self.viewer.email },
-            "teams": self.teams.iter().map(|t| json!({ "key": t.key, "name": t.name })).collect::<Vec<_>>(),
+            "viewer": { "id": self.viewer.id, "displayName": self.viewer.display_name, "email": self.viewer.email },
+            "teams": self.teams.iter().map(|t| json!({ "id": t.id, "key": t.key, "name": t.name })).collect::<Vec<_>>(),
             "auth": match self.auth { Auth::Oauth { .. } => "oauth", Auth::Key { .. } => if self.from_env { "env" } else { "key" } },
         })
     }
@@ -436,16 +506,27 @@ fn graphql_client(auth: &Auth) -> Result<LinearClient, Failure> {
 /// Runs `query` as `account`, refreshing its OAuth token when it is about to expire or the
 /// API rejects it.
 async fn query(account: &Account, q: &str, vars: Value) -> Result<Value, Failure> {
+    send(account, q, vars, true).await
+}
+
+/// Runs a write as `account`, once: a rate-limited write is not retried. A 401 still refreshes
+/// the token and sends it again, as `query` does: Linear rejected it before running it.
+async fn mutate(account: &Account, q: &str, vars: Value) -> Result<Value, Failure> {
+    send(account, q, vars, false).await
+}
+
+async fn send(account: &Account, q: &str, vars: Value, retry: bool) -> Result<Value, Failure> {
+    let client = |auth: &Auth| graphql_client(auth).map(|c| c.with_rate_limit_retry(retry));
     let mut auth = account.auth.clone();
     if let Auth::Oauth { expires_at, .. } = &auth {
         if *expires_at - now_ms() < REFRESH_MARGIN_MS {
             auth = refresh(account, &auth).await?;
         }
     }
-    match graphql_client(&auth)?.query::<Value>(q, vars.clone()).await {
+    match client(&auth)?.query::<Value>(q, vars.clone()).await {
         Err(Error::AuthenticationFailed(_)) if matches!(auth, Auth::Oauth { .. }) => {
             let auth = refresh(account, &auth).await?;
-            Ok(graphql_client(&auth)?.query(q, vars).await?)
+            Ok(client(&auth)?.query(q, vars).await?)
         }
         Err(Error::AuthenticationFailed(_)) => Err(needs_login(format!(
             "Linear rejected the API key for {}; connect it again.",
@@ -619,6 +700,13 @@ fn tag_rows(mut rows: Value, account: &Account) -> Value {
     rows
 }
 
+/// A connection's `pageInfo` → the cursor of the page after it, if there is one.
+fn next_cursor(page_info: &Value) -> Option<String> {
+    (page_info["hasNextPage"] == true)
+        .then(|| page_info["endCursor"].as_str().map(str::to_string))
+        .flatten()
+}
+
 // --- commands --------------------------------------------------------------------------------
 
 /// Every connected workspace, re-read from Linear (viewer, name, teams) and saved back. One
@@ -713,16 +801,39 @@ async fn issue(reference: &str, hint: Option<&str>) -> Outcome {
     if issue.is_null() {
         return Err(fail(format!("{} not found in {}", r.id, account.org.name)));
     }
-    // Newest-first from the API; the panel reads them as a conversation.
-    if let Some(Value::Array(comments)) = issue.pointer_mut("/comments/nodes") {
-        comments.reverse();
-    }
-    for key in ["labels", "children", "attachments", "comments"] {
+    let id = issue["id"].as_str().unwrap_or(&r.id).to_string();
+    let first = issue["comments"].take();
+    issue["comments"] = all_comments(account, &id, first).await?;
+    for key in ["labels", "children", "attachments"] {
         let flat = nodes(&issue, &[key]);
         issue[key] = flat;
     }
+    if issue["team"].is_object() {
+        for key in ["states", "members"] {
+            let flat = nodes(&issue["team"], &[key]);
+            issue["team"][key] = flat;
+        }
+    }
     issue["workspace"] = json!(account.org.url_key);
     Ok(issue)
+}
+
+/// Every comment of issue `id`, from its first page on (fetching the rest, 100 at a time),
+/// oldest first: the panel reads them as a conversation.
+async fn all_comments(account: &Account, id: &str, mut page: Value) -> Result<Value, Failure> {
+    let mut comments = Vec::new();
+    loop {
+        if let Value::Array(items) = page["nodes"].take() {
+            comments.extend(items);
+        }
+        let Some(after) = next_cursor(&page["pageInfo"]) else {
+            break;
+        };
+        let mut data = query(account, QUERY_COMMENTS, json!({ "id": id, "after": after })).await?;
+        page = data["issue"]["comments"].take();
+    }
+    comments.sort_by(|a, b| a["createdAt"].as_str().cmp(&b["createdAt"].as_str()));
+    Ok(Value::Array(comments))
 }
 
 /// Many identifiers: per workspace, one request with an `or` of `{team key, number}` pairs.
@@ -739,7 +850,11 @@ async fn lookup(refs: &[String], hint: Option<&str>) -> Outcome {
         let Some(account) = route(&all, &r, hint) else {
             continue;
         };
-        let term = json!({ "team": { "key": { "eq": team } }, "number": { "eq": number } });
+        // Two keys in one `or` entry are OR-ed by Linear; `and` keeps them together.
+        let term = json!({ "and": [
+            { "team": { "key": { "eq": team } } },
+            { "number": { "eq": number } },
+        ] });
         match groups.iter_mut().find(|(a, _)| a.org.id == account.org.id) {
             Some((_, terms)) if !terms.contains(&term) => terms.push(term),
             Some(_) => {}
@@ -764,6 +879,202 @@ async fn lookup(refs: &[String], hint: Option<&str>) -> Outcome {
         }
     }
     Ok(Value::Array(rows))
+}
+
+/// One page of issues by filter (see `issue_filter`), most recently updated first.
+async fn issues(mut args: Vec<String>, hint: Option<&str>) -> Outcome {
+    let scope = take_option(&mut args, "--scope");
+    let state = take_option(&mut args, "--state");
+    let team = take_option(&mut args, "--team");
+    let search = take_option(&mut args, "--search");
+    let after = take_option(&mut args, "--after").filter(|a| !a.is_empty());
+    if let Some(extra) = args.first() {
+        return Err(fail(format!("unexpected argument {extra:?}")));
+    }
+    let filter = issue_filter(
+        scope.as_deref(),
+        state.as_deref(),
+        team.as_deref(),
+        search.as_deref(),
+    )
+    .map_err(fail)?;
+    let all = accounts().await?;
+    let account = pick(&all, hint)?;
+    let q = format!(
+        "query($filter: IssueFilter, $after: String) {{ issues(filter: $filter, first: {ISSUES_PAGE}, after: $after, orderBy: updatedAt) \
+        {{ pageInfo {{ hasNextPage endCursor }} nodes {{ {ROW} }} }} }}"
+    );
+    let mut data = query(account, &q, json!({ "filter": filter, "after": after })).await?;
+    let page = data["issues"].take();
+    Ok(json!({
+        "items": tag_rows(nodes(&page, &[]), account),
+        "cursor": next_cursor(&page["pageInfo"]),
+    }))
+}
+
+/// An option's value, trimmed; none when it is empty.
+fn given(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|v| !v.is_empty())
+}
+
+/// The `IssueFilter` behind `issues`: Branch Issue's `listFilter` (munza/herdr-mods,
+/// `branch-issue/helper/main.go`, Apache-2.0, (c) 2026 Tawsif Aqib), ported. An empty option is
+/// the same as none.
+fn issue_filter(
+    scope: Option<&str>,
+    state: Option<&str>,
+    team: Option<&str>,
+    search: Option<&str>,
+) -> Result<Value, String> {
+    let mut filter = serde_json::Map::new();
+    match given(scope).unwrap_or("all") {
+        "mine" => {
+            filter.insert("assignee".into(), json!({ "isMe": { "eq": true } }));
+        }
+        "cycle" => {
+            filter.insert("cycle".into(), json!({ "isActive": { "eq": true } }));
+        }
+        "all" => {}
+        other => return Err(format!("unknown scope {other:?}: mine, cycle or all")),
+    }
+    let types: &[&str] = match given(state).unwrap_or("active") {
+        "active" => &["triage", "backlog", "unstarted", "started"],
+        "backlog" => &["triage", "backlog"],
+        "started" => &["started"],
+        "done" => &["completed"],
+        "cancelled" => &["canceled"],
+        "all" => &[],
+        other => {
+            return Err(format!(
+                "unknown state {other:?}: active, backlog, started, done, cancelled or all"
+            ))
+        }
+    };
+    if !types.is_empty() {
+        filter.insert("state".into(), json!({ "type": { "in": types } }));
+    }
+    if let Some(team) = given(team) {
+        filter.insert("team".into(), json!({ "key": { "eq": team } }));
+    }
+    if let Some(q) = given(search) {
+        let mut any = vec![
+            json!({ "title": { "containsIgnoreCase": q } }),
+            json!({ "description": { "containsIgnoreCase": q } }),
+        ];
+        // A bare number can't be matched as text: it's that number in any team.
+        let bare = q.strip_prefix('#').unwrap_or(q).parse::<u64>().ok();
+        if let Some(number) = bare.filter(|n| *n > 0) {
+            any.push(json!({ "number": { "eq": number } }));
+        }
+        // Two keys in one `or` entry are OR-ed by Linear; `and` keeps them together.
+        if let Some(Ref {
+            team: Some(key),
+            number: Some(number),
+            ..
+        }) = Ref::identifier(q)
+        {
+            any.push(json!({ "and": [
+                { "team": { "key": { "eqIgnoreCase": key } } },
+                { "number": { "eq": number } },
+            ] }));
+        }
+        filter.insert("or".into(), Value::Array(any));
+    }
+    Ok(Value::Object(filter))
+}
+
+/// Posts `--body` on an issue (by UUID), as a reply when `--parent` names a comment.
+async fn comment(mut args: Vec<String>, hint: Option<&str>) -> Outcome {
+    let body = take_option(&mut args, "--body");
+    let parent = take_option(&mut args, "--parent");
+    let issue = only_arg(&args, "comment needs an issue id")?;
+    let vars = comment_vars(issue, body.as_deref(), parent.as_deref()).map_err(fail)?;
+    let all = accounts().await?;
+    let account = pick(&all, hint)?;
+    let mut data = mutate(account, MUTATION_COMMENT, vars).await?;
+    saved(data["commentCreate"].take(), "comment")
+}
+
+/// Deletes a comment (by UUID). Linear lets you delete your own; admins any.
+async fn uncomment(args: Vec<String>, hint: Option<&str>) -> Outcome {
+    let id = only_arg(&args, "uncomment needs a comment id")?;
+    let all = accounts().await?;
+    let account = pick(&all, hint)?;
+    let mut data = mutate(account, MUTATION_UNCOMMENT, json!({ "id": id })).await?;
+    saved(data["commentDelete"].take(), "deletion")
+}
+
+/// The variables for `commentCreate`, or why there are none.
+fn comment_vars(issue: &str, body: Option<&str>, parent: Option<&str>) -> Result<Value, String> {
+    let body = body
+        .filter(|b| !b.trim().is_empty())
+        .ok_or("comment needs a non-empty --body")?;
+    let parent = given(parent);
+    Ok(json!({ "issue": issue, "body": body, "parent": parent }))
+}
+
+/// Changes an issue's (by UUID) state, assignee and/or priority.
+async fn update(mut args: Vec<String>, hint: Option<&str>) -> Outcome {
+    // The flag first, so `--assignee --unassign` can't take the flag as a user id.
+    let unassign = take_flag(&mut args, "--unassign");
+    let state = take_option(&mut args, "--state");
+    let assignee = take_option(&mut args, "--assignee");
+    let priority = take_option(&mut args, "--priority");
+    let issue = only_arg(&args, "update needs an issue id")?;
+    let input = update_input(
+        state.as_deref(),
+        assignee.as_deref(),
+        unassign,
+        priority.as_deref(),
+    )
+    .map_err(fail)?;
+    let all = accounts().await?;
+    let account = pick(&all, hint)?;
+    let vars = json!({ "id": issue, "input": input });
+    let mut data = mutate(account, MUTATION_UPDATE, vars).await?;
+    saved(data["issueUpdate"].take(), "update")
+}
+
+/// The `IssueUpdateInput` for `update`, or why there is none.
+fn update_input(
+    state: Option<&str>,
+    assignee: Option<&str>,
+    unassign: bool,
+    priority: Option<&str>,
+) -> Result<Value, String> {
+    let mut input = serde_json::Map::new();
+    if let Some(state) = given(state) {
+        input.insert("stateId".into(), json!(state));
+    }
+    match (given(assignee), unassign) {
+        (Some(_), true) => return Err("pass --assignee or --unassign, not both".into()),
+        (Some(user), false) => {
+            input.insert("assigneeId".into(), json!(user));
+        }
+        (None, true) => {
+            input.insert("assigneeId".into(), Value::Null);
+        }
+        (None, false) => {}
+    }
+    if let Some(raw) = given(priority) {
+        let priority = raw.parse::<u8>().ok().filter(|p| *p <= 4).ok_or_else(|| {
+            format!("priority is 0-4 (none, urgent, high, medium, low), not {raw:?}")
+        })?;
+        input.insert("priority".into(), json!(priority));
+    }
+    if input.is_empty() {
+        return Err("nothing to update: pass --state, --assignee, --unassign or --priority".into());
+    }
+    Ok(Value::Object(input))
+}
+
+/// A mutation's payload, when Linear says it succeeded.
+fn saved(payload: Value, what: &str) -> Outcome {
+    if payload["success"] == true {
+        Ok(payload)
+    } else {
+        Err(fail(format!("Linear did not save the {what}")))
+    }
 }
 
 // --- sign-in ---------------------------------------------------------------------------------
@@ -1112,6 +1423,168 @@ mod tests {
         assert_eq!(route_to("https://linear.app/other/issue/CON-1", None), None);
         // A UUID needs a hint once there are two.
         assert_eq!(route_to("6700875a-cf0c-431d-8b79-aba3216ea814", None), None);
+    }
+
+    #[test]
+    fn summary_carries_viewer_and_team_ids() {
+        let v = account("ct", &["CON"]).summary();
+        assert_eq!(v["viewer"]["id"], "u");
+        assert_eq!(
+            v["teams"][0],
+            json!({ "id": "t-CON", "key": "CON", "name": "CON" })
+        );
+    }
+
+    fn filter(
+        scope: Option<&str>,
+        state: Option<&str>,
+        team: Option<&str>,
+        search: Option<&str>,
+    ) -> Value {
+        issue_filter(scope, state, team, search).unwrap()
+    }
+
+    #[test]
+    fn issue_filter_scopes() {
+        let active = json!({ "type": { "in": ["triage", "backlog", "unstarted", "started"] } });
+        assert_eq!(filter(None, None, None, None), json!({ "state": active }));
+        assert_eq!(
+            filter(Some("all"), None, None, None),
+            json!({ "state": active })
+        );
+        assert_eq!(
+            filter(Some(""), None, None, None),
+            json!({ "state": active })
+        );
+        assert_eq!(
+            filter(Some("mine"), None, None, None),
+            json!({ "assignee": { "isMe": { "eq": true } }, "state": active })
+        );
+        assert_eq!(
+            filter(Some("cycle"), None, None, None),
+            json!({ "cycle": { "isActive": { "eq": true } }, "state": active })
+        );
+        assert!(issue_filter(Some("theirs"), None, None, None).is_err());
+    }
+
+    #[test]
+    fn issue_filter_states() {
+        let types =
+            |state: &str| filter(None, Some(state), None, None)["state"]["type"]["in"].clone();
+        assert_eq!(
+            types("active"),
+            json!(["triage", "backlog", "unstarted", "started"])
+        );
+        assert_eq!(types("backlog"), json!(["triage", "backlog"]));
+        assert_eq!(types("started"), json!(["started"]));
+        assert_eq!(types("done"), json!(["completed"]));
+        assert_eq!(types("cancelled"), json!(["canceled"]));
+        assert_eq!(filter(None, Some("all"), None, None), json!({}));
+        assert!(issue_filter(None, Some("canceled"), None, None).is_err());
+        assert!(issue_filter(None, Some("open"), None, None).is_err());
+    }
+
+    #[test]
+    fn issue_filter_team() {
+        assert_eq!(
+            filter(None, Some("all"), Some("CON"), None),
+            json!({ "team": { "key": { "eq": "CON" } } })
+        );
+        assert_eq!(filter(None, Some("all"), Some(" "), None), json!({}));
+    }
+
+    #[test]
+    fn issue_filter_search() {
+        let text = |q: &str| {
+            vec![
+                json!({ "title": { "containsIgnoreCase": q } }),
+                json!({ "description": { "containsIgnoreCase": q } }),
+            ]
+        };
+        let or = |q: &str| filter(None, Some("all"), None, Some(q))["or"].clone();
+        assert_eq!(or(" slow query "), json!(text("slow query")));
+        let mut number = text("12");
+        number.push(json!({ "number": { "eq": 12 } }));
+        assert_eq!(or("12"), json!(number));
+        let mut hash = text("#12");
+        hash.push(json!({ "number": { "eq": 12 } }));
+        assert_eq!(or("#12"), json!(hash));
+        let mut ident = text("con-12");
+        ident.push(json!({ "and": [
+            { "team": { "key": { "eqIgnoreCase": "CON" } } },
+            { "number": { "eq": 12 } },
+        ] }));
+        assert_eq!(or("con-12"), json!(ident));
+        assert_eq!(or("#0"), json!(text("#0")));
+        assert!(filter(None, Some("all"), None, Some("  "))
+            .get("or")
+            .is_none());
+    }
+
+    #[test]
+    fn update_input_validates() {
+        let input =
+            |state, assignee, unassign, priority| update_input(state, assignee, unassign, priority);
+        assert!(input(None, None, false, None).is_err());
+        assert!(input(Some(" "), Some(""), false, Some("")).is_err());
+        for bad in ["5", "-1", "high", "2.5"] {
+            assert!(input(None, None, false, Some(bad)).is_err(), "{bad}");
+        }
+        assert!(input(None, Some("user-1"), true, None).is_err());
+        assert_eq!(
+            input(None, None, false, Some("0")).unwrap(),
+            json!({ "priority": 0 })
+        );
+        assert_eq!(
+            input(None, None, false, Some("4")).unwrap(),
+            json!({ "priority": 4 })
+        );
+        assert_eq!(
+            input(None, None, true, None).unwrap(),
+            json!({ "assigneeId": null })
+        );
+        assert_eq!(
+            input(Some("state-1"), Some("user-1"), false, Some("2")).unwrap(),
+            json!({ "stateId": "state-1", "assigneeId": "user-1", "priority": 2 })
+        );
+    }
+
+    #[test]
+    fn update_takes_the_unassign_flag_before_options() {
+        let mut args: Vec<String> = ["id", "--assignee", "--unassign"]
+            .map(String::from)
+            .to_vec();
+        assert!(take_flag(&mut args, "--unassign"));
+        assert_eq!(take_option(&mut args, "--assignee"), None);
+        assert_eq!(args, ["id"]);
+    }
+
+    #[test]
+    fn comment_needs_a_body() {
+        for bad in [None, Some(""), Some("  \n\t")] {
+            assert!(comment_vars("issue-1", bad, None).is_err(), "{bad:?}");
+        }
+        assert_eq!(
+            comment_vars("issue-1", Some(" hi "), Some("")).unwrap(),
+            json!({ "issue": "issue-1", "body": " hi ", "parent": null })
+        );
+        assert_eq!(
+            comment_vars("issue-1", Some("hi"), Some("c-1")).unwrap()["parent"],
+            "c-1"
+        );
+    }
+
+    #[test]
+    fn next_cursor_only_when_there_is_a_next_page() {
+        assert_eq!(
+            next_cursor(&json!({ "hasNextPage": true, "endCursor": "abc" })).as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            next_cursor(&json!({ "hasNextPage": false, "endCursor": "abc" })),
+            None
+        );
+        assert_eq!(next_cursor(&Value::Null), None);
     }
 
     #[test]
